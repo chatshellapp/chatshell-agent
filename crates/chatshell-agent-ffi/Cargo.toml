@@ -1,0 +1,19 @@
+[package]
+name = "chatshell-agent-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+chatshell-agent-core = { path = "../chatshell-agent-core" }
+once_cell.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uniffi = { workspace = true, features = ["cli"] }
