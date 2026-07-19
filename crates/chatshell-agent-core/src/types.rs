@@ -42,6 +42,10 @@ pub struct ChatMessageImage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatToolCall {
     pub id: String,
+    /// OpenAI Responses API call identifier. Required when replaying tool calls
+    /// back to the Responses API after client-side execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub name: String,
     pub arguments_json: String,
 }
@@ -58,10 +62,14 @@ pub struct ChatMessage {
     /// request tool execution. Empty for non-tool-call messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
-    /// Tool-call identifier. Set on `Tool`-role messages to associate a tool
-    /// result with the assistant's tool call.
+    /// Tool-call item identifier. Set on `Tool`-role messages to associate a
+    /// tool result with the assistant's tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// OpenAI Responses API `call_id` for tool results. When set, takes
+    /// precedence over `tool_call_id` when building provider requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,6 +112,7 @@ pub enum AgentEvent {
     },
     ToolCallStarted {
         id: String,
+        call_id: Option<String>,
         name: String,
         arguments_json: String,
     },

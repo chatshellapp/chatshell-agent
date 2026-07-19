@@ -43,6 +43,7 @@ pub struct ChatMessageImage {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatToolCall {
     pub id: String,
+    pub call_id: Option<String>,
     pub name: String,
     pub arguments_json: String,
 }
@@ -56,8 +57,10 @@ pub struct ChatMessage {
     pub images: Vec<ChatMessageImage>,
     /// Tool calls emitted by the assistant. Empty for non-tool-call messages.
     pub tool_calls: Vec<ChatToolCall>,
-    /// Tool-call identifier for `Tool`-role messages.
+    /// Tool-call item identifier for `Tool`-role messages.
     pub tool_call_id: Option<String>,
+    /// OpenAI Responses API `call_id` for tool results.
+    pub tool_result_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -93,6 +96,7 @@ pub enum AgentEvent {
     },
     ToolCallStarted {
         id: String,
+        call_id: Option<String>,
         name: String,
         arguments_json: String,
     },
@@ -237,11 +241,13 @@ impl From<ChatMessage> for core::ChatMessage {
                 .into_iter()
                 .map(|tc| core::ChatToolCall {
                     id: tc.id,
+                    call_id: tc.call_id,
                     name: tc.name,
                     arguments_json: tc.arguments_json,
                 })
                 .collect(),
             tool_call_id: value.tool_call_id,
+            tool_result_call_id: value.tool_result_call_id,
         }
     }
 }
@@ -274,10 +280,12 @@ impl From<core::AgentEvent> for AgentEvent {
             core::AgentEvent::ReasoningDelta { text } => Self::ReasoningDelta { text },
             core::AgentEvent::ToolCallStarted {
                 id,
+                call_id,
                 name,
                 arguments_json,
             } => Self::ToolCallStarted {
                 id,
+                call_id,
                 name,
                 arguments_json,
             },

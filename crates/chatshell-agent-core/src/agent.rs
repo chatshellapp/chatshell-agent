@@ -307,13 +307,17 @@ fn to_rig_message(message: &ChatMessage) -> Message {
             if !message.content.is_empty() {
                 content.push(AssistantContent::Text(message.content.clone().into()));
             }
-            for tool_call in &message.tool_calls {
-                let arguments = serde_json::from_str(&tool_call.arguments_json)
+            for tc in &message.tool_calls {
+                let arguments = serde_json::from_str(&tc.arguments_json)
                     .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-                content.push(AssistantContent::ToolCall(ToolCall::new(
-                    tool_call.id.clone(),
-                    ToolFunction::new(tool_call.name.clone(), arguments),
-                )));
+                let mut rig_tool_call = ToolCall::new(
+                    tc.id.clone(),
+                    ToolFunction::new(tc.name.clone(), arguments),
+                );
+                if let Some(call_id) = &tc.call_id {
+                    rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
+                }
+                content.push(AssistantContent::ToolCall(rig_tool_call));
             }
             if content.is_empty() {
                 content.push(AssistantContent::Text(message.content.clone().into()));
@@ -325,7 +329,15 @@ fn to_rig_message(message: &ChatMessage) -> Message {
         }
         MessageRole::Tool => {
             let id = message.tool_call_id.clone().unwrap_or_default();
-            Message::tool_result(id, message.content.clone())
+            let call_id = message
+                .tool_result_call_id
+                .clone()
+                .or_else(|| message.tool_call_id.clone());
+            if let Some(call_id) = call_id {
+                Message::tool_result_with_call_id(id, Some(call_id), message.content.clone())
+            } else {
+                Message::tool_result(id, message.content.clone())
+            }
         }
     }
 }
@@ -425,6 +437,7 @@ where
                     sender,
                     AgentEvent::ToolCallStarted {
                         id: tool_call.id,
+                        call_id: tool_call.call_id,
                         name: tool_call.function.name,
                         arguments_json,
                     },
@@ -615,6 +628,7 @@ where
                     sender,
                     AgentEvent::ToolCallStarted {
                         id: tool_call.id,
+                        call_id: tool_call.call_id,
                         name: tool_call.function.name,
                         arguments_json,
                     },
@@ -682,6 +696,7 @@ mod tests {
                 images: vec![],
                 tool_calls: vec![],
                 tool_call_id: None,
+                tool_result_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::User,
@@ -690,6 +705,7 @@ mod tests {
                 images: vec![],
                 tool_calls: vec![],
                 tool_call_id: None,
+                tool_result_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::Assistant,
@@ -698,6 +714,7 @@ mod tests {
                 images: vec![],
                 tool_calls: vec![],
                 tool_call_id: None,
+                tool_result_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::User,
@@ -706,6 +723,7 @@ mod tests {
                 images: vec![],
                 tool_calls: vec![],
                 tool_call_id: None,
+                tool_result_call_id: None,
             },
         ];
 
@@ -779,12 +797,44 @@ mod tests {
             images: vec![],
             tool_calls: vec![],
             tool_call_id: Some("call_1".into()),
+            tool_result_call_id: Some("call_1".into()),
         };
         let rig_message = to_rig_message(&message);
         assert!(
             matches!(rig_message, Message::User { .. }),
             "tool result should map to a User message"
         );
+    }
+
+    #[test]
+    fn converts_assistant_tool_calls_with_call_id() {
+        let message = ChatMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            reasoning_content: None,
+            images: vec![],
+            tool_calls: vec![crate::types::ChatToolCall {
+                id: "fc_123".into(),
+                call_id: Some("call_abc".into()),
+                name: "web_search".into(),
+                arguments_json: r#"{"query":"rust"}"#.into(),
+            }],
+            tool_call_id: None,
+            tool_result_call_id: None,
+        };
+        let rig_message = to_rig_message(&message);
+        match rig_message {
+            Message::Assistant { content, .. } => {
+                let tool_call = content.iter().find_map(|item| match item {
+                    AssistantContent::ToolCall(tool_call) => Some(tool_call),
+                    _ => None,
+                });
+                let tool_call = tool_call.expect("expected tool call content");
+                assert_eq!(tool_call.id, "fc_123");
+                assert_eq!(tool_call.call_id.as_deref(), Some("call_abc"));
+            }
+            _ => panic!("expected Assistant message"),
+        }
     }
 
     #[test]
@@ -796,10 +846,12 @@ mod tests {
             images: vec![],
             tool_calls: vec![crate::types::ChatToolCall {
                 id: "call_1".into(),
+                call_id: None,
                 name: "web_search".into(),
                 arguments_json: r#"{"query":"rust"}"#.into(),
             }],
             tool_call_id: None,
+            tool_result_call_id: None,
         };
         let rig_message = to_rig_message(&message);
         match rig_message {
