@@ -7,7 +7,7 @@ use rig::message::{
     AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Reasoning,
     UserContent,
 };
-use rig::providers::{anthropic, moonshot, ollama, openrouter};
+use rig::providers::{anthropic, moonshot, ollama, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -22,9 +22,11 @@ type OpenAiCompatibleModel = moonshot::CompletionModel;
 type AnthropicModel = anthropic::completion::CompletionModel;
 type OpenRouterModel = openrouter::CompletionModel;
 type OllamaModel = ollama::CompletionModel;
+type OpenAiResponsesModel = openai::responses_api::ResponsesCompletionModel;
 
 enum ProviderAgent {
     OpenAiCompatible(Agent<OpenAiCompatibleModel>),
+    OpenAi(Agent<OpenAiResponsesModel>),
     Anthropic(Agent<AnthropicModel>),
     OpenRouter(Agent<OpenRouterModel>),
     Ollama(Agent<OllamaModel>),
@@ -40,6 +42,9 @@ pub async fn run_generation(
 
     let result = match agent {
         ProviderAgent::OpenAiCompatible(agent) => {
+            stream_agent(agent, prompt, history, &sender, &cancellation).await
+        }
+        ProviderAgent::OpenAi(agent) => {
             stream_agent(agent, prompt, history, &sender, &cancellation).await
         }
         ProviderAgent::Anthropic(agent) => {
@@ -75,17 +80,35 @@ fn create_agent(
                 .base_url
                 .as_deref()
                 .unwrap_or("https://api.openai.com/v1");
-            let client = moonshot::Client::<reqwest::Client>::builder()
-                .api_key(key)
-                .base_url(base_url)
-                .http_client(http_client)
-                .build()
-                .map_err(provider_error)?;
-            Ok(ProviderAgent::OpenAiCompatible(build_agent(
-                client.agent(model),
-                system_prompt,
-                parameters,
-            )?))
+            if request.provider.api_style.as_deref() == Some("chat_completions") {
+                // Chat Completions API - for OpenAI-compatible providers that
+                // do not implement the Responses API (e.g. MiniMax, DeepSeek).
+                let client = moonshot::Client::<reqwest::Client>::builder()
+                    .api_key(key)
+                    .base_url(base_url)
+                    .http_client(http_client)
+                    .build()
+                    .map_err(provider_error)?;
+                Ok(ProviderAgent::OpenAiCompatible(build_agent(
+                    client.agent(model),
+                    system_prompt,
+                    parameters,
+                )?))
+            } else {
+                // Responses API - default for OpenAI and custom_openai,
+                // matching desktop's `create_openai_agent`.
+                let client = openai::Client::<reqwest::Client>::builder()
+                    .api_key(key)
+                    .base_url(base_url)
+                    .http_client(http_client)
+                    .build()
+                    .map_err(provider_error)?;
+                Ok(ProviderAgent::OpenAi(build_agent(
+                    client.agent(model),
+                    system_prompt,
+                    parameters,
+                )?))
+            }
         }
         ProviderKind::Anthropic => {
             let key = required_key(request, "Anthropic")?;
@@ -453,6 +476,7 @@ mod tests {
                 kind: ProviderKind::OpenAi,
                 api_key: None,
                 base_url: None,
+                api_style: None,
             },
             model: "test".into(),
             messages: vec![],
@@ -462,5 +486,39 @@ mod tests {
             required_key(&request, "OpenAI-compatible"),
             Err(AgentError::MissingApiKey("OpenAI-compatible"))
         );
+    }
+
+    #[tokio::test]
+    async fn routes_openai_to_responses_by_default() {
+        let request = AgentRequest {
+            provider: ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                api_key: Some("sk-test".into()),
+                base_url: None,
+                api_style: None,
+            },
+            model: "gpt-4o".into(),
+            messages: vec![],
+            parameters: SamplingParameters::default(),
+        };
+        let agent = create_agent(&request, None).unwrap();
+        assert!(matches!(agent, ProviderAgent::OpenAi(_)));
+    }
+
+    #[tokio::test]
+    async fn routes_chat_completions_style_to_compat_model() {
+        let request = AgentRequest {
+            provider: ProviderConfig {
+                kind: ProviderKind::CustomOpenAi,
+                api_key: Some("sk-test".into()),
+                base_url: Some("https://api.deepseek.com".into()),
+                api_style: Some("chat_completions".into()),
+            },
+            model: "deepseek-chat".into(),
+            messages: vec![],
+            parameters: SamplingParameters::default(),
+        };
+        let agent = create_agent(&request, None).unwrap();
+        assert!(matches!(agent, ProviderAgent::OpenAiCompatible(_)));
     }
 }

@@ -23,6 +23,7 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub api_style: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
@@ -171,6 +172,7 @@ impl From<ProviderConfig> for core::ProviderConfig {
             kind: value.kind.into(),
             api_key: value.api_key,
             base_url: value.base_url,
+            api_style: value.api_style,
         }
     }
 }

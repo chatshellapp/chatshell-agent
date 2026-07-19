@@ -15,6 +15,10 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Selects the OpenAI API surface for `OpenAi` / `CustomOpenAi` providers.
+    /// `"chat_completions"` forces the Chat Completions API; any other value
+    /// (including `None`) selects the Responses API, matching desktop semantics.
+    pub api_style: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
