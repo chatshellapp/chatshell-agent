@@ -33,10 +33,18 @@ pub enum MessageRole {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatMessageImage {
+    pub base64: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub reasoning_content: Option<String>,
+    /// Images attached to a user message. Empty for non-user roles.
+    pub images: Vec<ChatMessageImage>,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -115,8 +123,7 @@ impl AgentCore {
         let task_cancellation = cancellation.clone();
 
         RUNTIME.spawn(async move {
-            let _ =
-                core::run_generation(request.into(), sender, task_cancellation).await;
+            let _ = core::run_generation(request.into(), sender, task_cancellation).await;
         });
 
         Arc::new(Generation {
@@ -186,6 +193,14 @@ impl From<ChatMessage> for core::ChatMessage {
             role: value.role.into(),
             content: value.content,
             reasoning_content: value.reasoning_content,
+            images: value
+                .images
+                .into_iter()
+                .map(|image| core::ChatMessageImage {
+                    base64: image.base64,
+                    media_type: image.media_type,
+                })
+                .collect(),
         }
     }
 }

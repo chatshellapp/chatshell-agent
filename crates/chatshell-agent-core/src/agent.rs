@@ -3,7 +3,10 @@ use rig::OneOrMany;
 use rig::agent::{Agent, AgentBuilder, MultiTurnStreamItem};
 use rig::client::{CompletionClient, Nothing};
 use rig::completion::{CompletionModel, Message};
-use rig::message::{AssistantContent, Reasoning, UserContent};
+use rig::message::{
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Reasoning,
+    UserContent,
+};
 use rig::providers::{anthropic, moonshot, ollama, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use tokio::sync::mpsc;
@@ -213,15 +216,40 @@ fn build_messages(
 
 fn to_rig_message(message: &ChatMessage) -> Message {
     match message.role {
-        MessageRole::User | MessageRole::System => Message::User {
-            content: OneOrMany::one(UserContent::Text(message.content.clone().into())),
-        },
+        MessageRole::User | MessageRole::System => {
+            let mut contents: Vec<UserContent> = Vec::new();
+            contents.push(UserContent::Text(message.content.clone().into()));
+            for image in &message.images {
+                if let Some(media_type) = mime_to_image_media_type(&image.media_type) {
+                    contents.push(UserContent::Image(Image {
+                        data: DocumentSourceKind::Base64(image.base64.clone()),
+                        media_type: Some(media_type),
+                        // OpenAI-compatible path (rig) requires `detail` to be
+                        // `Some` for base64 images; MiniMax additionally
+                        // rejects `"auto"` (error 2013) and accepts only
+                        // `low` / `default` / `high`. `High` is the only
+                        // value in rig's `ImageDetail` enum that satisfies both
+                        // OpenAI and MiniMax, so we use it for all providers.
+                        detail: Some(ImageDetail::High),
+                        additional_params: None,
+                    }));
+                }
+            }
+            let content = if contents.len() == 1 {
+                OneOrMany::one(contents.remove(0))
+            } else {
+                OneOrMany::many(contents).unwrap_or_else(|_| {
+                    OneOrMany::one(UserContent::Text(message.content.clone().into()))
+                })
+            };
+            Message::User { content }
+        }
         MessageRole::Assistant => {
             let mut content = Vec::new();
-            if let Some(reasoning) = message.reasoning_content.as_deref() {
-                if !reasoning.is_empty() {
-                    content.push(AssistantContent::reasoning(reasoning));
-                }
+            if let Some(reasoning) = message.reasoning_content.as_deref()
+                && !reasoning.is_empty()
+            {
+                content.push(AssistantContent::reasoning(reasoning));
             }
             content.push(AssistantContent::Text(message.content.clone().into()));
             Message::Assistant {
@@ -229,6 +257,19 @@ fn to_rig_message(message: &ChatMessage) -> Message {
                 content: OneOrMany::many(content).expect("assistant content is never empty"),
             }
         }
+    }
+}
+
+/// Convert a MIME string (e.g. `image/png`) to rig's `ImageMediaType`.
+/// Returns `None` for unsupported types so unknown formats are skipped
+/// rather than aborting the whole request.
+fn mime_to_image_media_type(mime: &str) -> Option<ImageMediaType> {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Some(ImageMediaType::JPEG),
+        "image/png" => Some(ImageMediaType::PNG),
+        "image/gif" => Some(ImageMediaType::GIF),
+        "image/webp" => Some(ImageMediaType::WEBP),
+        _ => None,
     }
 }
 
@@ -279,9 +320,7 @@ where
                 }
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
-                Reasoning {
-                    content: parts, ..
-                },
+                Reasoning { content: parts, .. },
             ))) => {
                 let delta = parts
                     .iter()
@@ -306,9 +345,10 @@ where
                     send_event(sender, AgentEvent::ReasoningDelta { text: delta }).await?;
                 }
             }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ToolCall { tool_call, .. },
-            )) => {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                tool_call,
+                ..
+            })) => {
                 let arguments_json = serde_json::to_string(&tool_call.function.arguments)
                     .unwrap_or_else(|_| "{}".to_string());
                 send_event(
@@ -379,21 +419,25 @@ mod tests {
                 role: MessageRole::System,
                 content: "Be concise".into(),
                 reasoning_content: None,
+                images: vec![],
             },
             ChatMessage {
                 role: MessageRole::User,
                 content: "First".into(),
                 reasoning_content: None,
+                images: vec![],
             },
             ChatMessage {
                 role: MessageRole::Assistant,
                 content: "Reply".into(),
                 reasoning_content: None,
+                images: vec![],
             },
             ChatMessage {
                 role: MessageRole::User,
                 content: "Second".into(),
                 reasoning_content: None,
+                images: vec![],
             },
         ];
 

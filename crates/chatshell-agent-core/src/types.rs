@@ -25,11 +25,23 @@ pub enum MessageRole {
     Assistant,
 }
 
+/// Base64-encoded image attached to a user message. Mirrors desktop `ImageData`:
+/// `base64` contains raw base64 data (no `data:` URL prefix), `media_type` is a
+/// MIME string such as `image/png`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatMessageImage {
+    pub base64: String,
+    pub media_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub reasoning_content: Option<String>,
+    /// Optional images on user messages. Ignored for assistant/system messages.
+    #[serde(default)]
+    pub images: Vec<ChatMessageImage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
