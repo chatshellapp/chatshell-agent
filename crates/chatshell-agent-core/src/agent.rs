@@ -18,7 +18,7 @@ use crate::types::{
     SamplingParameters,
 };
 
-type OpenAiCompatibleModel = moonshot::CompletionModel;
+type OpenAiCompatibleModel = crate::openai_compat::CompletionModel;
 type AnthropicModel = anthropic::completion::CompletionModel;
 type OpenRouterModel = openrouter::CompletionModel;
 type OllamaModel = ollama::CompletionModel;
@@ -90,7 +90,7 @@ fn create_agent(
                     .build()
                     .map_err(provider_error)?;
                 Ok(ProviderAgent::OpenAiCompatible(build_agent(
-                    client.agent(model),
+                    AgentBuilder::new(crate::openai_compat::CompletionModel::new(client, model)),
                     system_prompt,
                     parameters,
                 )?))
