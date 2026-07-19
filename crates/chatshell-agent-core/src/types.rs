@@ -27,6 +27,7 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 /// Base64-encoded image attached to a user message. Mirrors desktop `ImageData`:
@@ -38,6 +39,13 @@ pub struct ChatMessageImage {
     pub media_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
@@ -46,6 +54,14 @@ pub struct ChatMessage {
     /// Optional images on user messages. Ignored for assistant/system messages.
     #[serde(default)]
     pub images: Vec<ChatMessageImage>,
+    /// Tool calls emitted by the assistant. Set on assistant messages that
+    /// request tool execution. Empty for non-tool-call messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    /// Tool-call identifier. Set on `Tool`-role messages to associate a tool
+    /// result with the assistant's tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,12 +71,26 @@ pub struct SamplingParameters {
     pub additional_params_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool's parameters, as a JSON string.
+    pub parameters_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub provider: ProviderConfig,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub parameters: SamplingParameters,
+    /// Tool definitions exposed to the model. When non-empty, the agent runs
+    /// in client-side tool mode: tool calls are emitted as `ToolCallStarted`
+    /// events and NOT executed server-side; the client must execute them and
+    /// send a follow-up request with the tool results.
+    #[serde(default)]
+    pub tools: Vec<ClientToolDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

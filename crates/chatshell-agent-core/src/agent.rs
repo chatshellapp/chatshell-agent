@@ -1,11 +1,12 @@
+use std::sync::Arc;
 use futures::StreamExt;
 use rig::OneOrMany;
 use rig::agent::{Agent, AgentBuilder, MultiTurnStreamItem};
 use rig::client::{CompletionClient, Nothing};
-use rig::completion::{CompletionModel, Message};
+use rig::completion::{CompletionModel, GetTokenUsage, Message, ToolDefinition};
 use rig::message::{
     AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Reasoning,
-    UserContent,
+    ToolCall, ToolFunction, UserContent,
 };
 use rig::providers::{anthropic, moonshot, ollama, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
@@ -41,21 +42,26 @@ pub async fn run_generation(
     let agent = create_agent(&request, system_prompt.as_deref())?;
 
     let result = match agent {
-        ProviderAgent::OpenAiCompatible(agent) => {
-            stream_agent(agent, prompt, history, &sender, &cancellation).await
-        }
-        ProviderAgent::OpenAi(agent) => {
-            stream_agent(agent, prompt, history, &sender, &cancellation).await
-        }
-        ProviderAgent::Anthropic(agent) => {
-            stream_agent(agent, prompt, history, &sender, &cancellation).await
-        }
-        ProviderAgent::OpenRouter(agent) => {
-            stream_agent(agent, prompt, history, &sender, &cancellation).await
-        }
-        ProviderAgent::Ollama(agent) => {
-            stream_agent(agent, prompt, history, &sender, &cancellation).await
-        }
+        ProviderAgent::OpenAiCompatible(agent) => run_stream(
+            agent, prompt, history, request.tools.clone(),
+            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+        ).await,
+        ProviderAgent::OpenAi(agent) => run_stream(
+            agent, prompt, history, request.tools.clone(),
+            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+        ).await,
+        ProviderAgent::Anthropic(agent) => run_stream(
+            agent, prompt, history, request.tools.clone(),
+            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+        ).await,
+        ProviderAgent::OpenRouter(agent) => run_stream(
+            agent, prompt, history, request.tools.clone(),
+            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+        ).await,
+        ProviderAgent::Ollama(agent) => run_stream(
+            agent, prompt, history, request.tools.clone(),
+            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+        ).await,
     };
 
     if let Err(error) = &result {
@@ -217,21 +223,26 @@ fn build_messages(
         .iter()
         .find(|message| message.role == MessageRole::System)
         .map(|message| message.content.clone());
-    let last_user_index = messages
+
+    // The last non-system message is the prompt; everything else (except the
+    // system message) becomes history. This supports both the normal path
+    // (last message is the user's input) and the client-side tool path (last
+    // message is a tool result).
+    let last_prompt_index = messages
         .iter()
-        .rposition(|message| message.role == MessageRole::User)
+        .rposition(|message| message.role != MessageRole::System)
         .ok_or(AgentError::MissingUserMessage)?;
 
     let mut history = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        if message.role == MessageRole::System || index == last_user_index {
+        if message.role == MessageRole::System || index == last_prompt_index {
             continue;
         }
         history.push(to_rig_message(message));
     }
 
     Ok((
-        to_rig_message(&messages[last_user_index]),
+        to_rig_message(&messages[last_prompt_index]),
         history,
         system_prompt,
     ))
@@ -274,11 +285,28 @@ fn to_rig_message(message: &ChatMessage) -> Message {
             {
                 content.push(AssistantContent::reasoning(reasoning));
             }
-            content.push(AssistantContent::Text(message.content.clone().into()));
+            if !message.content.is_empty() {
+                content.push(AssistantContent::Text(message.content.clone().into()));
+            }
+            for tool_call in &message.tool_calls {
+                let arguments = serde_json::from_str(&tool_call.arguments_json)
+                    .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                content.push(AssistantContent::ToolCall(ToolCall::new(
+                    tool_call.id.clone(),
+                    ToolFunction::new(tool_call.name.clone(), arguments),
+                )));
+            }
+            if content.is_empty() {
+                content.push(AssistantContent::Text(message.content.clone().into()));
+            }
             Message::Assistant {
                 id: None,
                 content: OneOrMany::many(content).expect("assistant content is never empty"),
             }
+        }
+        MessageRole::Tool => {
+            let id = message.tool_call_id.clone().unwrap_or_default();
+            Message::tool_result(id, message.content.clone())
         }
     }
 }
@@ -416,6 +444,190 @@ where
     .await
 }
 
+/// Route a generation to the normal multi-turn stream or the client-side tool
+/// stream depending on whether tool definitions were provided.
+async fn run_stream<M>(
+    agent: Agent<M>,
+    prompt: Message,
+    history: Vec<Message>,
+    tools: Vec<crate::types::ClientToolDefinition>,
+    system_prompt: Option<&str>,
+    parameters: &SamplingParameters,
+    sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
+    cancellation: &CancellationToken,
+) -> Result<(), AgentError>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: GetTokenUsage,
+{
+    if tools.is_empty() {
+        stream_agent(agent, prompt, history, sender, cancellation).await
+    } else {
+        stream_agent_with_client_tools(
+            agent.model.clone(),
+            prompt,
+            history,
+            tools,
+            system_prompt,
+            parameters,
+            sender,
+            cancellation,
+        )
+        .await
+    }
+}
+
+/// Stream a single completion turn with client-side tool definitions. Tool
+/// calls are emitted as `ToolCallStarted` events and NOT executed server-side;
+/// the caller must execute them and send a follow-up `AgentRequest` containing
+/// the assistant tool-call message and a `Tool`-role result message. This
+/// bypasses rig's multi-turn auto-execution so tool execution can happen in
+/// the client (Swift), reusing the platform's native networking.
+async fn stream_agent_with_client_tools<M>(
+    model: Arc<M>,
+    prompt: Message,
+    history: Vec<Message>,
+    tools: Vec<crate::types::ClientToolDefinition>,
+    system_prompt: Option<&str>,
+    parameters: &SamplingParameters,
+    sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
+    cancellation: &CancellationToken,
+) -> Result<(), AgentError>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: GetTokenUsage,
+{
+    let tool_defs: Vec<ToolDefinition> = tools
+        .into_iter()
+        .map(|t| {
+            let parameters = serde_json::from_str(&t.parameters_json)
+                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+            ToolDefinition {
+                name: t.name,
+                description: t.description,
+                parameters,
+            }
+        })
+        .collect();
+
+    let mut builder = model.as_ref().completion_request(prompt).messages(history);
+    if let Some(p) = system_prompt {
+        builder = builder.preamble(p.to_string());
+    }
+    if let Some(temperature) = parameters.temperature {
+        builder = builder.temperature(temperature);
+    }
+    if let Some(max_tokens) = parameters.max_tokens {
+        builder = builder.max_tokens(max_tokens);
+    }
+    if let Some(json) = parameters.additional_params_json.as_deref() {
+        let value = serde_json::from_str(json)
+            .map_err(|error| AgentError::InvalidProvider(error.to_string()))?;
+        builder = builder.additional_params(value);
+    }
+    builder = builder.tools(tool_defs);
+
+    let mut stream = builder.stream().await.map_err(provider_error)?;
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                send_event(
+                    sender,
+                    AgentEvent::Completed {
+                        content,
+                        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+                        input_tokens,
+                        output_tokens,
+                        cancelled: true,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            item = stream.next() => match item {
+                Some(item) => item,
+                None => break,
+            }
+        };
+
+        match item {
+            Ok(StreamedAssistantContent::Text(text)) => {
+                if !text.text.is_empty() {
+                    content.push_str(&text.text);
+                    send_event(sender, AgentEvent::TextDelta { text: text.text }).await?;
+                }
+            }
+            Ok(StreamedAssistantContent::Reasoning(Reasoning { content: parts, .. })) => {
+                let delta = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        rig::message::ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                        rig::message::ReasoningContent::Summary(summary) => Some(summary.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if !delta.is_empty() {
+                    reasoning.push_str(&delta);
+                    send_event(sender, AgentEvent::ReasoningDelta { text: delta }).await?;
+                }
+            }
+            Ok(StreamedAssistantContent::ReasoningDelta { reasoning: delta, .. }) => {
+                if !delta.is_empty() {
+                    reasoning.push_str(&delta);
+                    send_event(sender, AgentEvent::ReasoningDelta { text: delta }).await?;
+                }
+            }
+            Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                let arguments_json = serde_json::to_string(&tool_call.function.arguments)
+                    .unwrap_or_else(|_| "{}".to_string());
+                send_event(
+                    sender,
+                    AgentEvent::ToolCallStarted {
+                        id: tool_call.id,
+                        name: tool_call.function.name,
+                        arguments_json,
+                    },
+                )
+                .await?;
+                // Client-side execution: do NOT call the tool here. Continue
+                // consuming the stream so trailing Final/usage is captured.
+            }
+            Ok(StreamedAssistantContent::Image(data_url)) => {
+                send_event(sender, AgentEvent::Image { data_url }).await?;
+            }
+            Ok(StreamedAssistantContent::Final(final_resp)) => {
+                if let Some(usage) = GetTokenUsage::token_usage(&final_resp) {
+                    input_tokens = usage.input_tokens;
+                    output_tokens = usage.output_tokens;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => return Err(provider_error(error)),
+        }
+    }
+
+    let parsed = parse_thinking_content(&content);
+    if reasoning.is_empty() {
+        reasoning = parsed.thinking_content.unwrap_or_default();
+    }
+    send_event(
+        sender,
+        AgentEvent::Completed {
+            content: parsed.content,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            input_tokens,
+            output_tokens,
+            cancelled: false,
+        },
+    )
+    .await
+}
 async fn send_event(
     sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
     event: AgentEvent,
@@ -443,24 +655,32 @@ mod tests {
                 content: "Be concise".into(),
                 reasoning_content: None,
                 images: vec![],
+                tool_calls: vec![],
+                tool_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::User,
                 content: "First".into(),
                 reasoning_content: None,
                 images: vec![],
+                tool_calls: vec![],
+                tool_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::Assistant,
                 content: "Reply".into(),
                 reasoning_content: None,
                 images: vec![],
+                tool_calls: vec![],
+                tool_call_id: None,
             },
             ChatMessage {
                 role: MessageRole::User,
                 content: "Second".into(),
                 reasoning_content: None,
                 images: vec![],
+                tool_calls: vec![],
+                tool_call_id: None,
             },
         ];
 
@@ -481,6 +701,7 @@ mod tests {
             model: "test".into(),
             messages: vec![],
             parameters: SamplingParameters::default(),
+            tools: vec![],
         };
         assert_eq!(
             required_key(&request, "OpenAI-compatible"),
@@ -500,6 +721,7 @@ mod tests {
             model: "gpt-4o".into(),
             messages: vec![],
             parameters: SamplingParameters::default(),
+            tools: vec![],
         };
         let agent = create_agent(&request, None).unwrap();
         assert!(matches!(agent, ProviderAgent::OpenAi(_)));
@@ -517,8 +739,55 @@ mod tests {
             model: "deepseek-chat".into(),
             messages: vec![],
             parameters: SamplingParameters::default(),
+            tools: vec![],
         };
         let agent = create_agent(&request, None).unwrap();
         assert!(matches!(agent, ProviderAgent::OpenAiCompatible(_)));
+    }
+
+    #[test]
+    fn converts_tool_result_message_to_user() {
+        let message = ChatMessage {
+            role: MessageRole::Tool,
+            content: "result text".into(),
+            reasoning_content: None,
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: Some("call_1".into()),
+        };
+        let rig_message = to_rig_message(&message);
+        assert!(
+            matches!(rig_message, Message::User { .. }),
+            "tool result should map to a User message"
+        );
+    }
+
+    #[test]
+    fn converts_assistant_message_with_tool_calls() {
+        let message = ChatMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            reasoning_content: None,
+            images: vec![],
+            tool_calls: vec![crate::types::ChatToolCall {
+                id: "call_1".into(),
+                name: "web_search".into(),
+                arguments_json: r#"{"query":"rust"}"#.into(),
+            }],
+            tool_call_id: None,
+        };
+        let rig_message = to_rig_message(&message);
+        match rig_message {
+            Message::Assistant { content, .. } => {
+                let has_tool_call = content
+                    .iter()
+                    .any(|c| matches!(c, AssistantContent::ToolCall(_)));
+                assert!(
+                    has_tool_call,
+                    "assistant tool-call message should carry the tool call"
+                );
+            }
+            _ => panic!("expected Assistant message"),
+        }
     }
 }

@@ -31,6 +31,7 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -40,12 +41,23 @@ pub struct ChatMessageImage {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub reasoning_content: Option<String>,
     /// Images attached to a user message. Empty for non-user roles.
     pub images: Vec<ChatMessageImage>,
+    /// Tool calls emitted by the assistant. Empty for non-tool-call messages.
+    pub tool_calls: Vec<ChatToolCall>,
+    /// Tool-call identifier for `Tool`-role messages.
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -56,11 +68,19 @@ pub struct SamplingParameters {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct ClientToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters_json: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct AgentRequest {
     pub provider: ProviderConfig,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub parameters: SamplingParameters,
+    pub tools: Vec<ClientToolDefinition>,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -162,6 +182,15 @@ impl From<AgentRequest> for core::AgentRequest {
             model: value.model,
             messages: value.messages.into_iter().map(Into::into).collect(),
             parameters: value.parameters.into(),
+            tools: value
+                .tools
+                .into_iter()
+                .map(|t| core::ClientToolDefinition {
+                    name: t.name,
+                    description: t.description,
+                    parameters_json: t.parameters_json,
+                })
+                .collect(),
         }
     }
 }
@@ -203,6 +232,16 @@ impl From<ChatMessage> for core::ChatMessage {
                     media_type: image.media_type,
                 })
                 .collect(),
+            tool_calls: value
+                .tool_calls
+                .into_iter()
+                .map(|tc| core::ChatToolCall {
+                    id: tc.id,
+                    name: tc.name,
+                    arguments_json: tc.arguments_json,
+                })
+                .collect(),
+            tool_call_id: value.tool_call_id,
         }
     }
 }
@@ -213,6 +252,7 @@ impl From<MessageRole> for core::MessageRole {
             MessageRole::System => Self::System,
             MessageRole::User => Self::User,
             MessageRole::Assistant => Self::Assistant,
+            MessageRole::Tool => Self::Tool,
         }
     }
 }
