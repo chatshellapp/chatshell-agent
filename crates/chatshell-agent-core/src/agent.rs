@@ -25,6 +25,23 @@ type OpenRouterModel = openrouter::CompletionModel;
 type OllamaModel = ollama::CompletionModel;
 type OpenAiResponsesModel = openai::responses_api::ResponsesCompletionModel;
 
+/// Default max_tokens for Anthropic (required by the API, unlike OpenAI).
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8192;
+
+fn sampling_parameters_with_default_max_tokens(
+    parameters: &SamplingParameters,
+    default_max_tokens: u64,
+) -> SamplingParameters {
+    if parameters.max_tokens.is_some() {
+        parameters.clone()
+    } else {
+        SamplingParameters {
+            max_tokens: Some(default_max_tokens),
+            ..parameters.clone()
+        }
+    }
+}
+
 enum ProviderAgent {
     OpenAiCompatible(Agent<OpenAiCompatibleModel>),
     OpenAi(Agent<OpenAiResponsesModel>),
@@ -44,23 +61,23 @@ pub async fn run_generation(
     let result = match agent {
         ProviderAgent::OpenAiCompatible(agent) => run_stream(
             agent, prompt, history, request.tools.clone(),
-            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+            system_prompt.as_deref(), &request.parameters, None, &sender, &cancellation,
         ).await,
         ProviderAgent::OpenAi(agent) => run_stream(
             agent, prompt, history, request.tools.clone(),
-            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+            system_prompt.as_deref(), &request.parameters, None, &sender, &cancellation,
         ).await,
         ProviderAgent::Anthropic(agent) => run_stream(
             agent, prompt, history, request.tools.clone(),
-            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+            system_prompt.as_deref(), &request.parameters, Some(ANTHROPIC_DEFAULT_MAX_TOKENS), &sender, &cancellation,
         ).await,
         ProviderAgent::OpenRouter(agent) => run_stream(
             agent, prompt, history, request.tools.clone(),
-            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+            system_prompt.as_deref(), &request.parameters, None, &sender, &cancellation,
         ).await,
         ProviderAgent::Ollama(agent) => run_stream(
             agent, prompt, history, request.tools.clone(),
-            system_prompt.as_deref(), &request.parameters, &sender, &cancellation,
+            system_prompt.as_deref(), &request.parameters, None, &sender, &cancellation,
         ).await,
     };
 
@@ -129,10 +146,12 @@ fn create_agent(
                 .http_client(http_client)
                 .build()
                 .map_err(provider_error)?;
+            let anthropic_parameters =
+                sampling_parameters_with_default_max_tokens(parameters, ANTHROPIC_DEFAULT_MAX_TOKENS);
             Ok(ProviderAgent::Anthropic(build_agent(
                 AgentBuilder::new(client.completion_model(model).with_prompt_caching()),
                 system_prompt,
-                parameters,
+                &anthropic_parameters,
             )?))
         }
         ProviderKind::OpenRouter => {
@@ -453,6 +472,7 @@ async fn run_stream<M>(
     tools: Vec<crate::types::ClientToolDefinition>,
     system_prompt: Option<&str>,
     parameters: &SamplingParameters,
+    default_max_tokens: Option<u64>,
     sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
     cancellation: &CancellationToken,
 ) -> Result<(), AgentError>
@@ -460,6 +480,11 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: GetTokenUsage,
 {
+    let parameters = match default_max_tokens {
+        Some(default) => sampling_parameters_with_default_max_tokens(parameters, default),
+        None => parameters.clone(),
+    };
+
     if tools.is_empty() {
         stream_agent(agent, prompt, history, sender, cancellation).await
     } else {
@@ -469,7 +494,7 @@ where
             history,
             tools,
             system_prompt,
-            parameters,
+            &parameters,
             sender,
             cancellation,
         )
