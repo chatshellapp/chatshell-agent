@@ -10,11 +10,13 @@
 //!   shared parser. This ensures both platforms extract results identically.
 //! - **Yahoo redirect URL resolution**: shared pure function.
 //!
-//! DuckDuckGo stays entirely platform-specific (WKWebView/headless Chrome for
-//! bot-detection bypass, no shareable parsing).
+//! DuckDuckGo's *fetching* stays platform-specific (WKWebView / headless
+//! Chrome for bot-detection bypass), but its result parsing and redirect
+//! resolution are shared here like Yahoo's.
 
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use url::form_urlencoded;
 
 /// A single search result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,21 +223,139 @@ pub fn parse_baidu_results(html: &str, max: usize) -> Vec<SearchResult> {
 /// `https://r.search.yahoo.com/_ylt=.../RU=https%3A%2F%2Fexample.com/RK=...`
 /// -> `https://example.com`.
 pub fn resolve_yahoo_redirect_url(href: &str) -> String {
-    if href.contains("r.search.yahoo.com") || href.contains("/RU=") {
-        if let Some(ru_start) = href.find("/RU=") {
-            let after_ru = &href[ru_start + 4..];
-            let encoded = match after_ru.find("/RK=") {
-                Some(end) => &after_ru[..end],
-                None => after_ru,
-            };
-            if let Ok(decoded) = urlencoding::decode(encoded) {
-                if decoded.starts_with("http") {
-                    return decoded.into_owned();
-                }
-            }
+    if (href.contains("r.search.yahoo.com") || href.contains("/RU="))
+        && let Some(ru_start) = href.find("/RU=")
+    {
+        let after_ru = &href[ru_start + 4..];
+        let encoded = match after_ru.find("/RK=") {
+            Some(end) => &after_ru[..end],
+            None => after_ru,
+        };
+        if let Ok(decoded) = urlencoding::decode(encoded)
+            && decoded.starts_with("http")
+        {
+            return decoded.into_owned();
         }
     }
     href.to_string()
+}
+
+/// Parse DuckDuckGo HTML search results. Pure function - the caller fetches
+/// the HTML (WKWebView on iOS, headless Chrome on desktop).
+///
+/// DuckDuckGo's HTML endpoint wraps each result in a `.result` div with a
+/// `.result__a` title link and a `.result__snippet` anchor.
+pub fn parse_duckduckgo_results(html: &str, max: usize) -> Vec<SearchResult> {
+    let document = Html::parse_document(html);
+
+    let Ok(result_sel) = Selector::parse(".result") else {
+        return Vec::new();
+    };
+    let Ok(title_sel) = Selector::parse(".result__a") else {
+        return Vec::new();
+    };
+    let Ok(snippet_sel) = Selector::parse(".result__snippet") else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+    for result_el in document.select(&result_sel).take(max) {
+        let Some(title_el) = result_el.select(&title_sel).next() else {
+            continue;
+        };
+
+        let title = title_el.text().collect::<String>().trim().to_string();
+        let href = title_el.value().attr("href").unwrap_or_default();
+        let url = resolve_duckduckgo_redirect_url(href);
+
+        let snippet = result_el
+            .select(&snippet_sel)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+
+        if !title.is_empty() && !url.is_empty() && url.starts_with("http") {
+            results.push(SearchResult {
+                title,
+                url,
+                snippet,
+            });
+        }
+    }
+
+    results
+}
+
+/// Resolve DuckDuckGo's redirect wrapper to the actual URL:
+/// `//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...` ->
+/// `https://example.com`. Protocol-relative URLs gain an `https:` scheme.
+pub fn resolve_duckduckgo_redirect_url(href: &str) -> String {
+    if (href.contains("duckduckgo.com/l/") || href.contains("uddg="))
+        && let Some(uddg_start) = href.find("uddg=")
+    {
+        let url_part = &href[uddg_start + 5..];
+        let url_end = url_part.find('&').unwrap_or(url_part.len());
+        let encoded_url = &url_part[..url_end];
+
+        // Decode via form-urlencoded pairs, then fall back to direct
+        // percent decoding for values that are not k=v shaped.
+        let decoded: String = form_urlencoded::parse(encoded_url.as_bytes())
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{}={}", k, v)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if decoded.starts_with("http") {
+            return decoded;
+        }
+        if let Ok(parsed) = url::Url::parse(&format!("http://x?x={}", encoded_url))
+            && let Some(value) = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "x")
+                .map(|(_, v)| v.to_string())
+            && value.starts_with("http")
+        {
+            return value;
+        }
+        let decoded = percent_decode_str(encoded_url);
+        if decoded.starts_with("http") {
+            return decoded;
+        }
+    }
+
+    if href.starts_with("//") {
+        return format!("https:{}", href);
+    }
+
+    href.to_string()
+}
+
+/// Manual percent decoding for URL strings.
+fn percent_decode_str(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(&hex, 16)
+            {
+                result.push(byte as char);
+                continue;
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -312,5 +432,59 @@ mod tests {
         "#;
         let results = parse_baidu_results(html, 5);
         assert!(results.is_empty());
+    }
+    #[test]
+    fn resolve_duckduckgo_redirect_url_decodes() {
+        let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=abc";
+        assert_eq!(
+            resolve_duckduckgo_redirect_url(href),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn resolve_duckduckgo_redirect_url_protocol_relative() {
+        assert_eq!(
+            resolve_duckduckgo_redirect_url("//example.com/page"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn resolve_duckduckgo_redirect_url_direct() {
+        assert_eq!(
+            resolve_duckduckgo_redirect_url("https://example.com/page"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn parse_duckduckgo_extracts_results() {
+        let html = r#"
+        <div class="result">
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Ftest&rut=x">Test Title</a>
+            <a class="result__snippet">Test snippet</a>
+        </div>
+        <div class="result">
+            <a class="result__a" href="https://example.org/direct">Direct Link</a>
+            <a class="result__snippet">Org snippet</a>
+        </div>
+        "#;
+        let results = parse_duckduckgo_results(html, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Test Title");
+        assert_eq!(results[0].url, "https://example.com/test");
+        assert_eq!(results[0].snippet, "Test snippet");
+        assert_eq!(results[1].url, "https://example.org/direct");
+    }
+
+    #[test]
+    fn parse_duckduckgo_respects_max() {
+        let html = r#"
+        <div class="result"><a class="result__a" href="https://a.com">A</a></div>
+        <div class="result"><a class="result__a" href="https://b.com">B</a></div>
+        <div class="result"><a class="result__a" href="https://c.com">C</a></div>
+        "#;
+        assert_eq!(parse_duckduckgo_results(html, 2).len(), 2);
     }
 }

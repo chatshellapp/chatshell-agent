@@ -3,6 +3,7 @@ pub mod compaction;
 pub mod context_pruning;
 pub mod edit_anchor;
 pub mod fuzzy_match;
+pub mod history;
 pub mod mcp;
 pub mod openai_compat;
 pub mod provider_catalog;
@@ -15,7 +16,8 @@ pub mod types;
 pub mod web_fetch;
 pub mod web_search;
 
-pub use agent::run_generation;
+pub use agent::{create_http_client, run_generation};
+pub use history::{HistoryRole, HistoryRow, ToolCallRow, pair_history};
 pub use mcp::{McpConnection, McpHttpConfig, McpToolInfo, McpToolResult};
 pub use provider_registry::{
     BuiltinProvider, builtin_providers, custom_provider, is_supported_fetch_provider,

@@ -91,7 +91,7 @@ fn create_agent(
                 .provider
                 .base_url
                 .as_deref()
-                .unwrap_or("https://api.openai.com/v1");
+                .unwrap_or(kind_default_url(crate::types::ProviderKind::OpenAi));
             if request.provider.api_style.as_deref() == Some("chat_completions") {
                 // Chat Completions API - for OpenAI-compatible providers that
                 // do not implement the Responses API (e.g. MiniMax, DeepSeek).
@@ -118,7 +118,7 @@ fn create_agent(
                 .provider
                 .base_url
                 .as_deref()
-                .unwrap_or("https://api.anthropic.com/v1");
+                .unwrap_or(kind_default_url(crate::types::ProviderKind::Anthropic));
             let client = anthropic::Client::<reqwest::Client>::builder()
                 .api_key(key)
                 .base_url(base_url)
@@ -138,7 +138,7 @@ fn create_agent(
                 .provider
                 .base_url
                 .as_deref()
-                .unwrap_or("https://openrouter.ai/api/v1");
+                .unwrap_or(kind_default_url(crate::types::ProviderKind::OpenRouter));
             let client = openrouter::Client::<reqwest::Client>::builder()
                 .api_key(key)
                 .base_url(base_url)
@@ -153,7 +153,7 @@ fn create_agent(
                 .provider
                 .base_url
                 .as_deref()
-                .unwrap_or("http://127.0.0.1:11434");
+                .unwrap_or(kind_default_url(crate::types::ProviderKind::Ollama));
             let client = ollama::Client::<reqwest::Client>::builder()
                 .api_key(Nothing)
                 .base_url(base_url)
@@ -186,9 +186,36 @@ where
     })
 }
 
-fn create_http_client() -> reqwest::Client {
+/// Default base URL for a named provider kind, sourced from the shared
+/// provider catalog (single home for URL knowledge).
+fn kind_default_url(kind: crate::types::ProviderKind) -> &'static str {
+    crate::provider_catalog::default_base_url_for_kind(kind).expect("named kind has default url")
+}
+
+/// Create the shared HTTP client for provider requests.
+///
+/// Carries app attribution headers (OpenRouter attribution) and an explicit
+/// `Content-Type` - rig's streaming path does not set one on its own, and
+/// without it providers like Anthropic reject the request with "unsupported
+/// content type". Re-exported for desktop so both clients send identical
+/// header sets.
+pub fn create_http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "HTTP-Referer",
+        reqwest::header::HeaderValue::from_static("https://chatshell.app"),
+    );
+    headers.insert(
+        "X-Title",
+        reqwest::header::HeaderValue::from_static("ChatShell"),
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
     reqwest::Client::builder()
         .user_agent("ChatShell/0.1")
+        .default_headers(headers)
         .build()
         .unwrap_or_default()
 }

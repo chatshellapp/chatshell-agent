@@ -64,8 +64,6 @@ cargo build -p chatshell-agent-core
 ./scripts/build-apple.sh
 ```
 
-The workspace patches `rig-core` from a local path (`../chatshell-desktop/patches/rig-core`).
-
 ## License
 
 [Apache License 2.0](LICENSE)

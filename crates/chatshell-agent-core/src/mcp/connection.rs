@@ -37,42 +37,7 @@ impl McpConnection {
     pub async fn connect(config: McpHttpConfig) -> Result<Self> {
         tracing::info!("Connecting to MCP server via HTTP: {}", config.endpoint);
 
-        let http_client = if config.custom_headers.is_empty() {
-            reqwest::Client::new()
-        } else {
-            let mut header_map = reqwest::header::HeaderMap::new();
-            for (k, v) in &config.custom_headers {
-                if let (Ok(name), Ok(val)) = (
-                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(v),
-                ) {
-                    header_map.insert(name, val);
-                }
-            }
-            reqwest::Client::builder()
-                .default_headers(header_map)
-                .build()
-                .context("Failed to build HTTP client with custom headers")?
-        };
-
-        let mut transport_config =
-            StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone());
-        if let Some(token) = config.auth_token {
-            transport_config = transport_config.auth_header(token);
-        }
-
-        let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
-
-        let client_info = ClientInfo::new(
-            ClientCapabilities::default(),
-            rmcp::model::Implementation::new("chatshell", env!("CARGO_PKG_VERSION")),
-        );
-
-        let running_service = client_info
-            .serve(transport)
-            .await
-            .context("Failed to connect to MCP server via HTTP")?;
-
+        let running_service = connect_http_service(&config).await?;
         let client = running_service.peer().clone();
 
         tracing::info!("Connected to MCP server");
@@ -139,4 +104,51 @@ impl McpConnection {
             is_error: result.is_error.unwrap_or(false),
         })
     }
+}
+
+/// Establish a Streamable HTTP MCP session and return the raw running
+/// service. This is the shared transport-construction layer: the
+/// higher-level [`McpConnection`] wraps it for iOS, and desktop's
+/// `mcp/manager.rs` uses it directly so both platforms build identical
+/// clients, headers, auth, and client identity.
+pub async fn connect_http_service(
+    config: &McpHttpConfig,
+) -> Result<RunningService<RoleClient, ClientInfo>> {
+    let http_client = if config.custom_headers.is_empty() {
+        reqwest::Client::new()
+    } else {
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (k, v) in &config.custom_headers {
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                header_map.insert(name, val);
+            }
+        }
+        reqwest::Client::builder()
+            .default_headers(header_map)
+            .build()
+            .context("Failed to build HTTP client with custom headers")?
+    };
+
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone());
+    if let Some(token) = &config.auth_token {
+        transport_config = transport_config.auth_header(token.clone());
+    }
+
+    let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
+
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        rmcp::model::Implementation::new("chatshell", env!("CARGO_PKG_VERSION")),
+    );
+
+    let running_service = client_info
+        .serve(transport)
+        .await
+        .context("Failed to connect to MCP server via HTTP")?;
+
+    Ok(running_service)
 }

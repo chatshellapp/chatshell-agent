@@ -918,6 +918,7 @@ dependencies = [
  "chatshell-agent-core",
  "once_cell",
  "parking_lot",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",

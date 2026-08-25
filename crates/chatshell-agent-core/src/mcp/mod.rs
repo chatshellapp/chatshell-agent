@@ -12,5 +12,5 @@
 mod connection;
 mod types;
 
-pub use connection::{McpConnection, McpHttpConfig};
+pub use connection::{McpConnection, McpHttpConfig, connect_http_service};
 pub use types::{McpToolInfo, McpToolResult};

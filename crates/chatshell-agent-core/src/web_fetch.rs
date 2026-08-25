@@ -276,7 +276,7 @@ fn extract_meta_description(document: &Html) -> Option<String> {
         })
 }
 
-fn extract_title_from_markdown(content: &str) -> Option<String> {
+pub fn extract_title_from_markdown(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(title) = trimmed.strip_prefix("# ") {

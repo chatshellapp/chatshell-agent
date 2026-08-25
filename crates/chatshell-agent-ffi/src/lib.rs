@@ -193,6 +193,34 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+/// Client-construction family a provider routes to. Mirrors
+/// `chatshell_agent_core::provider_catalog::Wire`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Wire {
+    Responses,
+    OpenAiCompat,
+    Anthropic,
+    OpenRouter,
+    Ollama,
+    Azure,
+    Gemini,
+    RigNative,
+}
+
+/// Routing data for one provider type. Mirrors
+/// `chatshell_agent_core::provider_catalog::ProviderRoute`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProviderRoute {
+    pub wire: Wire,
+    pub kind: Option<ProviderKind>,
+    pub default_base_url: Option<String>,
+    pub key_required: bool,
+    pub key_display: Option<String>,
+    pub local_no_key: bool,
+    pub string_content_only: bool,
+    pub default_api_style: Option<String>,
+}
+
 #[derive(uniffi::Object)]
 pub struct AgentCore;
 
@@ -285,6 +313,29 @@ pub fn builtin_tool_definitions() -> Vec<ClientToolDefinition> {
 #[uniffi::export]
 pub fn parse_thinking_content(text: String) -> ParsedContent {
     core::parse_thinking_content(&text).into()
+}
+
+/// Resolve routing data for a provider type (wire family, kind, default
+/// URL, key rules, string-content quirk, default api_style). `None` for
+/// unknown provider types.
+#[uniffi::export]
+pub fn resolve_provider_route(provider_type: String) -> Option<ProviderRoute> {
+    core::provider_catalog::resolve(&provider_type).map(Into::into)
+}
+
+/// Expand flattened history rows (a JSON-encoded `HistoryRow` array) into
+/// the replayable `ChatMessage` sequence. The assistant/tool/final-text
+/// pairing protocol lives in core; clients only flatten persistence rows.
+#[uniffi::export]
+pub fn pair_history(rows_json: String) -> Result<Vec<ChatMessage>, AgentError> {
+    let rows: Vec<core::history::HistoryRow> =
+        serde_json::from_str(&rows_json).map_err(|error| AgentError::InvalidProvider {
+            message: format!("invalid history rows JSON: {error}"),
+        })?;
+    Ok(core::history::pair_history(&rows)
+        .into_iter()
+        .map(Into::into)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +484,22 @@ pub async fn fetch_jina(url: String, api_key: Option<String>) -> FetchedResource
             extraction_error: Some("Runtime dropped".to_string()),
         },
     }
+}
+
+/// Parse DuckDuckGo HTML search results. Pure function - caller fetches
+/// the HTML.
+#[uniffi::export]
+pub fn parse_duckduckgo_results(html: String, max: u64) -> Vec<SearchResult> {
+    core::web_search::parse_duckduckgo_results(&html, max as usize)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Resolve DuckDuckGo's redirect wrapper to the actual URL.
+#[uniffi::export]
+pub fn resolve_duckduckgo_redirect_url(href: String) -> String {
+    core::web_search::resolve_duckduckgo_redirect_url(&href)
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +775,93 @@ impl From<core::SearchResult> for SearchResult {
             title: value.title,
             url: value.url,
             snippet: value.snippet,
+        }
+    }
+}
+
+impl From<core::ProviderKind> for ProviderKind {
+    fn from(value: core::ProviderKind) -> Self {
+        match value {
+            core::ProviderKind::OpenAi => Self::OpenAi,
+            core::ProviderKind::Anthropic => Self::Anthropic,
+            core::ProviderKind::OpenRouter => Self::OpenRouter,
+            core::ProviderKind::Ollama => Self::Ollama,
+            core::ProviderKind::CustomOpenAi => Self::CustomOpenAi,
+        }
+    }
+}
+
+impl From<core::provider_catalog::Wire> for Wire {
+    fn from(value: core::provider_catalog::Wire) -> Self {
+        match value {
+            core::provider_catalog::Wire::Responses => Self::Responses,
+            core::provider_catalog::Wire::OpenAiCompat => Self::OpenAiCompat,
+            core::provider_catalog::Wire::Anthropic => Self::Anthropic,
+            core::provider_catalog::Wire::OpenRouter => Self::OpenRouter,
+            core::provider_catalog::Wire::Ollama => Self::Ollama,
+            core::provider_catalog::Wire::Azure => Self::Azure,
+            core::provider_catalog::Wire::Gemini => Self::Gemini,
+            core::provider_catalog::Wire::RigNative => Self::RigNative,
+        }
+    }
+}
+
+impl From<core::provider_catalog::ProviderRoute> for ProviderRoute {
+    fn from(value: core::provider_catalog::ProviderRoute) -> Self {
+        Self {
+            wire: value.wire.into(),
+            kind: value.kind.map(Into::into),
+            default_base_url: value.default_base_url.map(str::to_string),
+            key_required: value.key_required,
+            key_display: value.key_display.map(str::to_string),
+            local_no_key: value.local_no_key,
+            string_content_only: value.string_content_only,
+            default_api_style: value.default_api_style.map(str::to_string),
+        }
+    }
+}
+
+impl From<core::MessageRole> for MessageRole {
+    fn from(value: core::MessageRole) -> Self {
+        match value {
+            core::MessageRole::System => Self::System,
+            core::MessageRole::User => Self::User,
+            core::MessageRole::Assistant => Self::Assistant,
+            core::MessageRole::Tool => Self::Tool,
+        }
+    }
+}
+
+impl From<core::ChatMessageImage> for ChatMessageImage {
+    fn from(value: core::ChatMessageImage) -> Self {
+        Self {
+            base64: value.base64,
+            media_type: value.media_type,
+        }
+    }
+}
+
+impl From<core::ChatToolCall> for ChatToolCall {
+    fn from(value: core::ChatToolCall) -> Self {
+        Self {
+            id: value.id,
+            call_id: value.call_id,
+            name: value.name,
+            arguments_json: value.arguments_json,
+        }
+    }
+}
+
+impl From<core::ChatMessage> for ChatMessage {
+    fn from(value: core::ChatMessage) -> Self {
+        Self {
+            role: value.role.into(),
+            content: value.content,
+            reasoning_content: value.reasoning_content,
+            images: value.images.into_iter().map(Into::into).collect(),
+            tool_calls: value.tool_calls.into_iter().map(Into::into).collect(),
+            tool_call_id: value.tool_call_id,
+            tool_result_call_id: value.tool_result_call_id,
         }
     }
 }
