@@ -3,6 +3,11 @@ name = "chatshell-agent-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["tls-native"]
+tls-native = ["reqwest/native-tls", "rig/native-tls"]
+rustls = ["reqwest/rustls", "rig/rustls"]
+
 [dependencies]
 dirs = "5"
 grep-regex = "0.1"
@@ -12,9 +17,12 @@ pdf-extract = "0.7"
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 async-stream.workspace = true
+encoding_rs.workspace = true
+aes-gcm.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 nanoid.workspace = true
+rand.workspace = true
 regex.workspace = true
 ab_glyph.workspace = true
 png.workspace = true
@@ -36,6 +44,11 @@ tracing.workspace = true
 unicode-normalization.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
+zstd.workspace = true
+blake3 = "1"
 
 [dev-dependencies]
 tempfile = "3"
+eventsource-stream = "0.2"
+bytes = "1"
+flate2 = "1"

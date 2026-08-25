@@ -80,7 +80,6 @@ pub async fn fetch_http(url: &str, max_chars: Option<usize>) -> FetchedResource 
     let response = match HTTP_CLIENT
         .get(url)
         .header("Accept", "text/markdown, text/html, */*")
-        .header("Accept-Encoding", "gzip, deflate, br, zstd")
         .send()
         .await
     {
@@ -108,12 +107,13 @@ pub async fn fetch_http(url: &str, max_chars: Option<usize>) -> FetchedResource 
         .trim()
         .to_string();
 
-    let body = match response.text().await {
+    let raw = match response.bytes().await {
         Ok(c) => c,
         Err(e) => {
             return FetchedResource::error(url, &mime_type, &format!("Failed to read body: {e}"));
         }
     };
+    let body = decode_body_bytes(&raw, &content_type);
 
     if mime_type.contains("html") {
         process_html(url, &body, &mime_type, max_chars)
@@ -309,6 +309,43 @@ fn truncate_by_chars(s: &str, max_chars: Option<usize>) -> (String, bool) {
     }
 }
 
+static META_CHARSET_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<meta[^>]+charset\s*=\s*["']?\s*([a-zA-Z0-9._-]+)"#).unwrap()
+});
+
+/// Number of leading bytes sniffed for a `<meta charset>` declaration.
+const CHARSET_SNIFF_LEN: usize = 4096;
+
+/// Decode a raw response body to text, honoring the declared charset.
+///
+/// Priority: HTTP `Content-Type: ...; charset=` -> BOM -> HTML
+/// `<meta charset>` in the leading bytes -> UTF-8 fallback. Prevents mojibake
+/// for pages that only declare their charset inside the HTML (common for
+/// GBK/GB2312 sites). BOM handling is delegated to `Encoding::decode`, which
+/// sniffs and honors it per the WHATWG encoding standard.
+pub fn decode_body_bytes(raw: &[u8], content_type: &str) -> String {
+    let header_charset = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|param| param.strip_prefix("charset="))
+        .map(str::trim);
+
+    let sniff_head = &raw[..raw.len().min(CHARSET_SNIFF_LEN)];
+    let encoding = header_charset
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .or_else(|| encoding_rs::Encoding::for_bom(sniff_head).map(|(enc, _)| enc))
+        .or_else(|| {
+            META_CHARSET_REGEX
+                .captures(&String::from_utf8_lossy(sniff_head))?
+                .get(1)
+                .and_then(|m| encoding_rs::Encoding::for_label(m.as_str().as_bytes()))
+        })
+        .unwrap_or(encoding_rs::UTF_8);
+
+    let (text, _, _) = encoding.decode(raw);
+    text.into_owned()
+}
+
 fn normalize_html_images(html: &str) -> String {
     IMG_TAG_REGEX
         .replace_all(html, |caps: &regex::Captures| {
@@ -374,5 +411,55 @@ mod tests {
         assert_eq!(r.url, "https://example.com");
         assert_eq!(r.extraction_error, Some("Failed".to_string()));
         assert!(r.content.is_empty());
+    }
+
+    #[test]
+    fn decode_cjk_via_content_type_header() {
+        for (encoding, label, sample) in [
+            (encoding_rs::GBK, "gbk", "中文内容测试"),
+            (
+                encoding_rs::SHIFT_JIS,
+                "shift_jis",
+                "こんにちは世界のテスト",
+            ),
+            (encoding_rs::EUC_KR, "euc-kr", "안녕하세요 세계 테스트"),
+        ] {
+            let (bytes, _, _) = encoding.encode(sample);
+            let decoded = decode_body_bytes(&bytes, &format!("text/html; charset={label}"));
+            assert_eq!(decoded, sample);
+        }
+    }
+
+    #[test]
+    fn decode_cjk_via_meta_charset_sniff() {
+        for (encoding, label, sample) in [
+            (encoding_rs::GBK, "gbk", "中文内容测试"),
+            (encoding_rs::SHIFT_JIS, "shift_jis", "こんにちは世界"),
+            (encoding_rs::EUC_KR, "euc-kr", "안녕하세요 세계"),
+        ] {
+            let (bytes, _, _) = encoding.encode(sample);
+            let html_head =
+                format!(r#"<html><head><meta charset="{label}"><title>x</title></head>"#);
+            let mut raw = html_head.into_bytes();
+            raw.extend_from_slice(&bytes);
+            // No charset in the HTTP header: must be sniffed from the HTML meta tag.
+            let decoded = decode_body_bytes(&raw, "text/html");
+            assert!(decoded.contains(sample), "decoded: {decoded}");
+        }
+    }
+
+    #[test]
+    fn decode_utf8_default_when_no_charset_declared() {
+        let raw = "plain utf8 text".as_bytes();
+        let decoded = decode_body_bytes(raw, "application/json");
+        assert_eq!(decoded, "plain utf8 text");
+    }
+
+    #[test]
+    fn decode_honors_bom_over_header() {
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice("bom text".as_bytes());
+        let decoded = decode_body_bytes(&raw, "text/plain");
+        assert_eq!(decoded, "bom text");
     }
 }

@@ -1,3 +1,6 @@
+#[cfg(target_os = "android")]
+mod android_tls;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,6 +12,14 @@ use tokio_util::sync::CancellationToken;
 
 static RUNTIME: Lazy<Runtime> =
     Lazy::new(|| Runtime::new().expect("ChatShell agent runtime must initialize"));
+
+/// Outcome of [`Generation::try_next_event`].
+#[derive(Debug, uniffi::Enum)]
+pub enum PollEvent {
+    Event { event: AgentEvent },
+    Done,
+    Pending,
+}
 
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum ProviderKind {
@@ -237,9 +248,14 @@ impl AgentCore {
         let task_cancellation = cancellation.clone();
 
         RUNTIME.spawn(async move {
-            let _ = core::run_generation(request.into(), sender, task_cancellation).await;
+            // Surface terminal errors as events: dropping the sender without
+            // one would make clients see a silent, empty stream.
+            let result =
+                core::run_generation(request.into(), sender.clone(), task_cancellation).await;
+            if let Err(error) = result {
+                let _ = sender.send(Err(error.into())).await;
+            }
         });
-
         Arc::new(Generation {
             receiver: Mutex::new(receiver),
             cancellation,
@@ -260,6 +276,31 @@ impl Generation {
             Some(Ok(event)) => Ok(Some(event.into())),
             Some(Err(error)) => Err(error.into()),
             None => Ok(None),
+        }
+    }
+
+    /// Synchronous, timeout-bounded alternative to [`Generation::next_event`].
+    ///
+    /// The UniFFI foreign-future callback path used by `next_event` can stall
+    /// in some client environments; polling from the client side avoids it.
+    /// A timeout yields `PollEvent::Pending`, not an error: callers simply
+    /// poll again until `Done` or an error arrives.
+    pub fn try_next_event(&self, timeout_ms: u64) -> Result<PollEvent, AgentError> {
+        let result = RUNTIME.block_on(async {
+            let mut receiver = self.receiver.lock().await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                receiver.recv(),
+            )
+            .await
+        });
+        match result {
+            Ok(Some(Ok(event))) => Ok(PollEvent::Event {
+                event: event.into(),
+            }),
+            Ok(Some(Err(error))) => Err(error.into()),
+            Ok(None) => Ok(PollEvent::Done),
+            Err(_) => Ok(PollEvent::Pending),
         }
     }
 
@@ -336,6 +377,103 @@ pub fn pair_history(rows_json: String) -> Result<Vec<ChatMessage>, AgentError> {
         .into_iter()
         .map(Into::into)
         .collect())
+}
+
+/// Provider-key encryption errors surfaced to Swift.
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
+pub enum CryptoError {
+    #[error("Crypto operation failed: {message}")]
+    Failure { message: String },
+}
+
+impl CryptoError {
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        Self::Failure {
+            message: format!("{error:#}"),
+        }
+    }
+}
+
+/// Fresh random 32-byte master key, base64-encoded. Callers store it in the
+/// platform keychain; it never persists anywhere else.
+#[uniffi::export]
+pub fn generate_master_key_b64() -> String {
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.encode(core::crypto::generate_master_key())
+}
+
+/// Encrypt under a base64 master key; returns `base64(nonce ‖ ciphertext)`,
+/// the exact format desktop's `providers.api_key` column carries.
+#[uniffi::export]
+pub fn encrypt_with_master_key(
+    master_key_b64: String,
+    plaintext: String,
+) -> Result<String, CryptoError> {
+    decode_master_key(&master_key_b64)
+        .and_then(|key| core::crypto::encrypt(&key, &plaintext))
+        .map_err(CryptoError::from_anyhow)
+}
+
+/// Decrypt `providers.api_key`-format ciphertext under a base64 master key.
+#[uniffi::export]
+pub fn decrypt_with_master_key(
+    master_key_b64: String,
+    ciphertext_b64: String,
+) -> Result<String, CryptoError> {
+    decode_master_key(&master_key_b64)
+        .and_then(|key| core::crypto::decrypt(&key, &ciphertext_b64))
+        .map_err(CryptoError::from_anyhow)
+}
+
+/// BLAKE3 hex digest of `data` — identical to desktop's
+/// `storage::hash_bytes`. Names the content-addressed blob sidecar files and
+/// fills `files.content_hash` on platforms without a local blake3 binding.
+#[uniffi::export]
+pub fn blake3_hex(data: Vec<u8>) -> String {
+    core::crypto::blake3_hex(&data)
+}
+
+/// How a device should settle its master key (pure policy, shared with the
+/// desktop app): the iCloud-synchronizable item is the authority; a device
+/// that sees it adopts it (demoting a different local key to the decrypt
+/// fallback); with nothing anywhere, mint.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum MasterKeyResolution {
+    /// The existing local key stands (item equals local, or no item).
+    KeepCurrent,
+    /// The synchronizable item wins; `demote_current` is true when a
+    /// different local key must be kept as the decrypt fallback.
+    AdoptSync { demote_current: bool },
+    /// No key exists anywhere: mint one, persist locally, write the item
+    /// best-effort.
+    Mint,
+}
+
+/// Master-key resolution policy for one device. `sync_item` is the
+/// iCloud-synchronizable keychain item value (None when unreadable or
+/// absent); `local_key` is this device's local copy (None when absent).
+#[uniffi::export]
+pub fn resolve_master_key(
+    sync_item: Option<String>,
+    local_key: Option<String>,
+) -> MasterKeyResolution {
+    match core::crypto::resolve_master_key(sync_item.as_deref(), local_key.as_deref()) {
+        core::crypto::MasterKeyResolution::KeepCurrent => MasterKeyResolution::KeepCurrent,
+        core::crypto::MasterKeyResolution::AdoptSync { demote_current } => {
+            MasterKeyResolution::AdoptSync { demote_current }
+        }
+        core::crypto::MasterKeyResolution::Mint => MasterKeyResolution::Mint,
+    }
+}
+
+fn decode_master_key(master_key_b64: &str) -> anyhow::Result<[u8; core::crypto::MASTER_KEY_LEN]> {
+    use base64::{Engine as _, engine::general_purpose};
+    let bytes = general_purpose::STANDARD
+        .decode(master_key_b64)
+        .map_err(|e| anyhow::anyhow!("invalid master key base64: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("master key must be {} bytes", core::crypto::MASTER_KEY_LEN))
 }
 
 // ---------------------------------------------------------------------------

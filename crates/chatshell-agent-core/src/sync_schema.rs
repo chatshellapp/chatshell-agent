@@ -129,12 +129,12 @@ mod tests {
             seed_row(
                 &src,
                 "messages",
-                "('id','id','user',NULL,'c',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL,NULL,NULL,NULL)",
+                "('id','id','user',NULL,'c',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
                 "providers",
-                "('id','p','openai',NULL,NULL,NULL,NULL,1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL,NULL)",
+                "('id','p','openai',NULL,NULL,NULL,NULL,1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
@@ -155,6 +155,79 @@ mod tests {
         let report =
             crate::sync::merge_remote(&dst, &snapshot, PRODUCTION_MERGE_TABLES).expect("merge");
         assert_eq!(report.total_inserted(), 5, "seeded rows must arrive");
+        let _ = std::fs::remove_file(&snapshot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A payload-wiping tombstone written on one device (desktop's
+    /// soft_delete module shape) must propagate to a peer through the
+    /// mutable natural-key specs — including the flipped junction/participant
+    /// tables — or deletions resurrect from peer snapshots.
+    #[test]
+    fn wiped_tombstones_propagate_to_peers() {
+        let dir =
+            std::env::temp_dir().join(format!("chatshell-sync-tombstone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("snapshot.db");
+        let _ = std::fs::remove_file(&snapshot);
+
+        {
+            let src = fresh();
+            ensure_sync_tables(&src).unwrap();
+            crate::sync::set_meta(&src, "sync_version", "1:a").unwrap();
+            seed_row(
+                &src,
+                "conversations",
+                "('id','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+            );
+            seed_row(
+                &src,
+                "messages",
+                "('id','id','user',NULL,'secret content',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+            );
+            seed_row(
+                &src,
+                "conversation_participants",
+                "('id','id','user','u',NULL,'member','active','2026-01-01T00:00:00Z',NULL,NULL,NULL,'2026-01-01T00:00:00Z',NULL)",
+            );
+            crate::sync::publish_snapshot(&src, &snapshot).unwrap();
+
+            let dst = fresh();
+            ensure_sync_tables(&dst).unwrap();
+            crate::sync::set_meta(&dst, "sync_version", "1:b").unwrap();
+            crate::sync::merge_remote(&dst, &snapshot, PRODUCTION_MERGE_TABLES).unwrap();
+
+            // On the second device, remove the participant with a wiping
+            // tombstone and republish.
+            dst.execute(
+                "UPDATE conversation_participants \
+                 SET display_name = NULL, role = NULL, status = NULL, joined_at = '', \
+                     left_at = NULL, last_read_at = NULL, metadata = NULL, \
+                     deleted_at = '2026-08-24T00:00:00Z', updated_at = '2026-08-24T00:00:00Z' \
+                 WHERE id = 'id'",
+                [],
+            )
+            .unwrap();
+            crate::sync::set_meta(&dst, "sync_version", "2:b").unwrap();
+            crate::sync::publish_snapshot(&dst, &snapshot).unwrap();
+
+            // Back on the first device the removal must arrive, not resurrect.
+            crate::sync::merge_remote(&src, &snapshot, PRODUCTION_MERGE_TABLES).unwrap();
+            let (deleted, role): (Option<String>, Option<String>) = src
+                .query_row(
+                    "SELECT deleted_at, role FROM conversation_participants WHERE id = 'id'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                deleted.as_deref(),
+                Some("2026-08-24T00:00:00Z"),
+                "tombstone must propagate to the peer"
+            );
+            assert!(role.is_none(), "wiped payload must not resurrect content");
+        }
+
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_dir_all(&dir);
     }

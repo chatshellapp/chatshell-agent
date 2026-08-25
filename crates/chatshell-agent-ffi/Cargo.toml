@@ -10,8 +10,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+default = ["tls-native"]
+tls-native = ["chatshell-agent-core/tls-native"]
+rustls = ["chatshell-agent-core/rustls"]
+
 [dependencies]
-chatshell-agent-core = { path = "../chatshell-agent-core" }
+anyhow.workspace = true
+base64.workspace = true
+chatshell-agent-core = { path = "../chatshell-agent-core", default-features = false }
 parking_lot.workspace = true
 serde_json.workspace = true
 once_cell.workspace = true
@@ -19,3 +26,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uniffi = { workspace = true, features = ["cli"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+rustls-platform-verifier = "0.7"

@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 /// Meta keys for in-DB snapshot versioning.
 pub const META_SYNC_VERSION: &str = "sync_version";
 pub const META_DEVICE_ID: &str = "device_id";
-pub const META_BASE_VERSION: &str = "base_version";
 
 /// One table in the merge registry.
 pub const SNAPSHOT_FILE: &str = "snapshot.db";
@@ -90,22 +89,32 @@ pub const PRODUCTION_MERGE_TABLES: &[TableSpec] = &[
     t("files"),
     t("messages"),
     t("search_results"),
-    immut("search_decisions"),
-    immut("thinking_steps"),
+    // Tables whose rows can be removed on one device are mutable-with-
+    // natural-key: whole-row LWW carries `deleted_at` tombstones to peers.
+    // Immutable (INSERT OR IGNORE) specs would swallow the tombstone update
+    // on any peer that already has the row, so removals could not propagate.
+    t("search_decisions"),
+    t("thinking_steps"),
     t("tool_calls"),
     t("code_executions"),
     t("compactions"),
-    immut("content_blocks"),
-    immut("message_attachments"),
-    immut("message_contexts"),
+    t("content_blocks"),
+    tnk("message_attachments", "message_id, attachment_id"),
+    tnk("message_contexts", "message_id, context_type, context_id"),
     immut("message_prompts"),
     immut("message_knowledge_bases"),
     immut("message_tools"),
-    immut("assistant_tools"),
-    immut("assistant_skills"),
-    immut("assistant_knowledge_bases"),
+    tnk("assistant_tools", "assistant_id, tool_id"),
+    tnk("assistant_skills", "assistant_id, skill_id"),
+    tnk(
+        "assistant_knowledge_bases",
+        "assistant_id, knowledge_base_id",
+    ),
     tpk("conversation_settings", "conversation_id"),
-    immut("conversation_participants"),
+    tnk(
+        "conversation_participants",
+        "conversation_id, participant_type, participant_id",
+    ),
 ];
 
 /// Per-table outcome of one merge pass.
@@ -179,9 +188,8 @@ pub fn merge_remote(
         "ATTACH DATABASE ?1 AS remote_db",
         [remote_path.to_string_lossy().as_ref()],
     )?;
-    let report = (|| {
+    let merge_pass = || -> Result<MergeReport> {
         let mut report = MergeReport::default();
-        local.execute_batch("BEGIN IMMEDIATE")?;
         for spec in tables {
             // Skip tables the remote snapshot predates (devices upgrade at
             // different times; a fresh local table must not abort the merge
@@ -200,9 +208,6 @@ pub fn merge_remote(
             // the INSERT/UPDATE. This makes the merge tolerant of deployment
             // skew (one device upgraded ahead of the other) instead of
             // aborting with "no such column" on the first divergent pass.
-            // Column intersection: only columns present on BOTH sides enter
-            // the INSERT/UPDATE. This makes the merge tolerant of deployment
-            // skew (one device upgraded ahead of the other).
             let local_cols = table_columns(local, spec.name)?;
             let remote_cols: Vec<String> = {
                 let mut stmt = local.prepare(&format!(
@@ -239,10 +244,23 @@ pub fn merge_remote(
                     .natural_key
                     .map(|nk| format!(" ON CONFLICT({nk}) DO NOTHING"))
                     .unwrap_or_default();
+                // Compare instants, not byte order: iOS stamps RFC3339 with a
+                // "Z" suffix while desktop writes chrono's "+00:00" form with
+                // variable fraction width, and lexicographic order across
+                // those shapes does not match time order ('Z' and '+'
+                // terminate the fraction, digits continue it). julianday()
+                // normalizes every notation to one comparable value at
+                // millisecond resolution - matching what the iOS stamp
+                // carries anyway. Sub-millisecond cross-device races on one
+                // row resolve as ties (strict > keeps the merged-in row),
+                // which is deterministic and flap-free; unparseable values
+                // (e.g. the '' schema default) coalesce to 0.0 so any real
+                // timestamp beats them.
                 format!(
                     "INSERT INTO main.{name} ({col_list}) {src} WHERE true \
                      ON CONFLICT({pk}) DO UPDATE SET {assignments} \
-                     WHERE excluded.updated_at > main.{name}.updated_at{natural_clause}",
+                     WHERE COALESCE(julianday(excluded.updated_at), 0.0) > \
+                     COALESCE(julianday(main.{name}.updated_at), 0.0){natural_clause}",
                     name = spec.name,
                     pk = spec.pk
                 )
@@ -283,9 +301,23 @@ pub fn merge_remote(
                 .tables
                 .push((spec.name, TableReport { inserted, updated }));
         }
-        local.execute_batch("COMMIT")?;
         Ok(report)
-    })();
+    };
+    local.execute_batch("BEGIN IMMEDIATE")?;
+    let report = match merge_pass() {
+        Ok(report) => {
+            local.execute_batch("COMMIT")?;
+            Ok(report)
+        }
+        Err(err) => {
+            // A failed pass must not strand the side connection's write lock
+            // (it would stall every app-pool commit until busy timeout) nor
+            // leave remote_db attached (the next ATTACH would fail for the
+            // whole process lifetime).
+            let _ = local.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    };
     let _ = local.execute("DETACH DATABASE remote_db", []);
     report
 }
@@ -307,6 +339,59 @@ pub fn publish_snapshot(conn: &Connection, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Name of the compressed cloud artifact for snapshot `snapshot.db`.
+pub fn compressed_snapshot_name(target: &Path) -> PathBuf {
+    let mut os = target.as_os_str().to_os_string();
+    os.push(".zst");
+    PathBuf::from(os)
+}
+
+/// Compress `src` into `dst` (zstd level 3). Level 3 measured ~70% size
+/// reduction on the real database with compression time comparable to the
+/// `VACUUM INTO` itself; higher levels cost 8x CPU for a few more percent.
+fn compress_file_zst(src: &Path, dst: &Path) -> Result<()> {
+    let input = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let output = std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    zstd::stream::copy_encode(input, output, 3)
+        .with_context(|| format!("zstd compress {}", src.display()))
+}
+
+/// Decompress a [`compress_file_zst`] artifact into `dst`.
+fn decompress_file_zst(src: &Path, dst: &Path) -> Result<()> {
+    let input = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let output = std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    zstd::stream::copy_decode(input, output)
+        .with_context(|| format!("zstd decompress {}", src.display()))
+}
+
+/// Publish the snapshot in its transport form: plain `VACUUM INTO` temp,
+/// zstd-compress to a temp artifact, atomic rename over `<target>.zst`, then
+/// drop both the plain temp and any legacy uncompressed cloud copy.
+///
+/// Peers either see the previous `.zst` or the new one - never a partial
+/// file. Devices running pre-compression engines are out of scope by design:
+/// this lands inside the migration-free window before any sync-enabled
+/// release ships.
+pub fn publish_snapshot_compressed(conn: &Connection, target: &Path) -> Result<()> {
+    let zst_target = compressed_snapshot_name(target);
+    let tmp_plain = target.with_extension("tmp-publishing");
+    if tmp_plain.exists() {
+        std::fs::remove_file(&tmp_plain).context("remove stale temp snapshot")?;
+    }
+    conn.execute("VACUUM INTO ?1", [tmp_plain.to_string_lossy().as_ref()])
+        .context("VACUUM INTO temp snapshot")?;
+    let tmp_zst = zst_target.with_extension("tmp-publishing");
+    if tmp_zst.exists() {
+        std::fs::remove_file(&tmp_zst).context("remove stale temp compressed snapshot")?;
+    }
+    compress_file_zst(&tmp_plain, &tmp_zst)?;
+    std::fs::rename(&tmp_zst, &zst_target).context("atomic rename of compressed snapshot")?;
+    // The plain artifacts never travel; only `.zst` lives in the container.
+    let _ = std::fs::remove_file(&tmp_plain);
+    let _ = std::fs::remove_file(target);
+    Ok(())
+}
+
 /// What the local device should do with a remote snapshot.
 #[derive(Debug, PartialEq)]
 pub enum SyncAction {
@@ -315,35 +400,33 @@ pub enum SyncAction {
     Merge,
 }
 
-/// Three-way version compare. Version ids are `<counter>:<device_id>` —
-/// unique per publish (a bare counter collides when two devices branch from
-/// one base and both mint the same number). Only the counter orders lineage.
+/// Version compare. Version ids are `<counter>:<device_id>` — unique per
+/// publish (a bare counter collides when two devices branch from one base
+/// and both mint the same number). Only the counter orders lineage; an id
+/// tie means the snapshot was published by us (or already adopted).
 pub fn plan_sync(local: &Connection, remote: &Connection) -> Result<SyncAction> {
     let local_version = get_meta(local, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
-    let local_base = get_meta(local, META_BASE_VERSION)?.unwrap_or_else(|| "0:none".into());
     let remote_version = get_meta(remote, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
 
-    if remote_version == local_version || remote_version == local_base {
+    if remote_version == local_version {
         return Ok(SyncAction::UpToDate);
     }
 
     let local_counter = counter_of(&local_version);
     let remote_counter = counter_of(&remote_version);
-    let local_clean = local_version == local_base;
 
-    if local_clean {
-        if remote_counter > local_counter {
-            return Ok(SyncAction::Adopt);
-        }
-        if remote_counter == local_counter {
-            return Ok(SyncAction::Merge);
-        }
-        return Ok(SyncAction::UpToDate); // stale remote
+    if remote_counter > local_counter {
+        return Ok(SyncAction::Adopt);
     }
-    Ok(SyncAction::Merge)
+    if remote_counter == local_counter {
+        return Ok(SyncAction::Merge);
+    }
+    Ok(SyncAction::UpToDate) // stale remote
 }
 
-fn now_rfc3339() -> String {
+/// Wall-clock marker for the meta table's own `updated_at` (never merged, so
+/// the compact unix form is fine despite what an RFC3339 name would suggest).
+fn now_unix_marker() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| format!("unix:{}", d.as_secs()))
@@ -368,7 +451,7 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO meta(key, value, updated_at) VALUES(?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        rusqlite::params![key, value, now_rfc3339()],
+        rusqlite::params![key, value, now_unix_marker()],
     )?;
     Ok(())
 }
@@ -515,14 +598,12 @@ impl SyncEngine {
         let prior_clean = get_meta(&engine.conn, META_CLEAN_EXIT)?
             .map(|v| v == "1")
             .unwrap_or(false);
-        engine.force_first_flush =
-            !prior_clean && engine.current_version() != INITIAL_VERSION;
+        engine.force_first_flush = !prior_clean && engine.current_version() != INITIAL_VERSION;
         set_meta(&engine.conn, META_CLEAN_EXIT, "0")?;
         validate_registry(&engine.conn, engine.tables)
             .context("sync registry validation against live schema")?;
         Ok(engine)
     }
-
 
     /// Access the underlying connection (tests, meta inspection).
     pub fn connection(&self) -> &Connection {
@@ -540,7 +621,6 @@ impl SyncEngine {
         }
         if get_meta(&self.conn, META_SYNC_VERSION)?.is_none() {
             set_meta(&self.conn, META_SYNC_VERSION, INITIAL_VERSION)?;
-            set_meta(&self.conn, META_BASE_VERSION, INITIAL_VERSION)?;
         }
         Ok(())
     }
@@ -595,9 +675,8 @@ impl SyncEngine {
                 .unwrap_or(0);
             let new_version = format!("{}:{}", counter + 1, self.device_id());
             set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
-            set_meta(&self.conn, META_BASE_VERSION, &new_version)?;
         }
-        publish_snapshot(&self.conn, &self.snapshot_path())?;
+        publish_snapshot_compressed(&self.conn, &self.snapshot_path())?;
         let seen = self.data_version()?;
         self.last_published_data_version = Some(seen);
         self.pool_baseline_data_version = seen;
@@ -652,16 +731,51 @@ impl SyncEngine {
 
     /// One sync pass against the cloud snapshot, if one exists.
     pub fn sync_now(&mut self) -> Result<SyncOutcome> {
-        let snapshot = self.snapshot_path();
-        if !snapshot.exists() {
-            // First run on this device: publish so the other side can see us.
-            self.publish()?;
-            return Ok(SyncOutcome {
-                action: "published-initial".into(),
-                ..Default::default()
-            });
-        }
+        let staged = self.stage_remote_snapshot()?;
+        let outcome = match staged {
+            Some((snapshot, is_temp)) => {
+                let result = self.sync_against(&snapshot);
+                if is_temp {
+                    let _ = std::fs::remove_file(&snapshot);
+                }
+                result
+            }
+            None => {
+                // First run on this device: publish so the other side can
+                // see us.
+                self.publish()?;
+                Ok(SyncOutcome {
+                    action: "published-initial".into(),
+                    ..Default::default()
+                })
+            }
+        };
+        outcome
+    }
 
+    /// Resolve the cloud artifact to a readable plain SQLite path. Prefers
+    /// the compressed `snapshot.db.zst`; falls back to a legacy uncompressed
+    /// `snapshot.db`. Decompressed copies land in the OS temp dir and are
+    /// flagged so the caller removes them after the pass. `None` = no
+    /// snapshot in the cloud dir yet.
+    fn stage_remote_snapshot(&self) -> Result<Option<(PathBuf, bool)>> {
+        let zst = compressed_snapshot_name(&self.snapshot_path());
+        if zst.exists() {
+            let plain = std::env::temp_dir().join(format!(
+                "chatshell-snapshot-{}-{}.db",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+            decompress_file_zst(&zst, &plain)?;
+            Ok(Some((plain, true)))
+        } else if self.snapshot_path().exists() {
+            Ok(Some((self.snapshot_path(), false)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn sync_against(&mut self, snapshot: &Path) -> Result<SyncOutcome> {
         let remote = Connection::open(&snapshot)?;
         let action = plan_sync(&self.conn, &remote)?;
         drop(remote);
@@ -691,7 +805,6 @@ impl SyncEngine {
                     // refreshed here: pool writes since construction are
                     // still unshipped and must stay detectable below.
                     set_meta(&self.conn, META_SYNC_VERSION, &remote_version)?;
-                    set_meta(&self.conn, META_BASE_VERSION, &remote_version)?;
                     let seen = self.data_version()?;
                     self.last_published_data_version = Some(seen);
                     // Adoption alone must not strand local writes made while
@@ -722,7 +835,6 @@ impl SyncEngine {
                         self.device_id()
                     );
                     set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
-                    set_meta(&self.conn, META_BASE_VERSION, &new_version)?;
                     self.publish()?;
                     Ok(SyncOutcome {
                         action: "merged".into(),
@@ -809,6 +921,38 @@ CREATE TABLE conversations (
     }
 
     #[test]
+    fn cloud_artifact_is_compressed_and_peers_still_converge() {
+        let space = dir("zst");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        seed(&b_path, "b1", "from B");
+
+        let mut a = SyncEngine::new_with_tables(&a_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+
+        // The container carries only the compressed artifact.
+        assert!(compressed_snapshot_name(&cloud.join(SNAPSHOT_FILE)).exists());
+        assert!(!cloud.join(SNAPSHOT_FILE).exists());
+
+        // A peer stages the .zst and merges it like any snapshot.
+        let mut b = SyncEngine::new_with_tables(&b_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let out = b.sync_now().unwrap();
+        assert!(out.rows_merged > 0);
+        let n: i64 = b
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        // (No global "no staged leftovers" assertion here: staged copies are
+        // UUID-named per pass, so a shared-temp-dir check races with parallel
+        // engine tests.)
+    }
+
+    #[test]
     fn tick_flush_ships_pending_pool_writes_and_throttles() {
         let space = dir("flush");
         let db = space.path().join("a.db");
@@ -828,8 +972,9 @@ CREATE TABLE conversations (
 
         // A pool commit since construction ships on the next tick under a
         // freshly minted version id.
-        let version_before =
-            get_meta(engine.connection(), META_SYNC_VERSION).unwrap().unwrap();
+        let version_before = get_meta(engine.connection(), META_SYNC_VERSION)
+            .unwrap()
+            .unwrap();
         {
             let pool = Connection::open(&db).unwrap();
             pool.execute(
@@ -841,8 +986,9 @@ CREATE TABLE conversations (
         }
         let out = engine.sync_now().unwrap();
         assert_eq!(out.action, "flushed");
-        let version_after =
-            get_meta(engine.connection(), META_SYNC_VERSION).unwrap().unwrap();
+        let version_after = get_meta(engine.connection(), META_SYNC_VERSION)
+            .unwrap()
+            .unwrap();
         assert_ne!(version_before, version_after, "flush mints a new id");
 
         // Throttle: fresh pool writes inside the window are deferred - the
@@ -922,6 +1068,69 @@ CREATE TABLE conversations (
             .unwrap();
         assert_eq!(v1, v2);
     }
+
+    #[test]
+    fn failed_merge_rolls_back_and_detaches() {
+        let space = dir("lockleak");
+        let local_path = space.path().join("local.db");
+        let remote_path = space.path().join("remote.db");
+
+        let schema = r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE owners (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
+CREATE TABLE items (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+    label TEXT NOT NULL, updated_at TEXT NOT NULL);
+"#;
+        const FK_TABLES: &[TableSpec] = &[t("owners"), t("items")];
+
+        let local = Connection::open(&local_path).unwrap();
+        local.pragma_update(None, "foreign_keys", "ON").unwrap();
+        local.execute_batch(schema).unwrap();
+        set_meta(&local, META_SYNC_VERSION, "1:a").unwrap();
+        let remote = Connection::open(&remote_path).unwrap();
+        // Bundled SQLite compiles with SQLITE_DEFAULT_FOREIGN_KEYS=1; the
+        // authoring side must not enforce the constraint the merge violates.
+        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        remote.execute_batch(schema).unwrap();
+        remote
+            .execute(
+                "INSERT INTO owners(id, updated_at) VALUES('o1', '2026-08-21T10:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        // Child row references an owner the snapshot never carries: the
+        // items pass aborts mid-transaction on the immediate FK check.
+        remote
+            .execute(
+                "INSERT INTO items(id, owner_id, label, updated_at)
+                 VALUES('i1', 'missing', 'orphan', '2026-08-21T10:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        drop(remote);
+
+        assert!(merge_remote(&local, &remote_path, FK_TABLES).is_err());
+
+        // No partial state survived (the write transaction rolled back)...
+        let n: i64 = local
+            .query_row("SELECT COUNT(*) FROM owners", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "rollback must discard the parents-first inserts");
+        // ...remote_db is gone (a second ATTACH would otherwise fail for the
+        // process lifetime)...
+        let attached: i64 = local
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'remote_db'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 0, "DETACH must succeed after the rollback");
+        // ...and the connection's write lock is free again.
+        local.execute_batch("BEGIN IMMEDIATE").unwrap();
+        local.execute_batch("COMMIT").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -932,7 +1141,6 @@ mod column_intersection_tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         set_meta(conn, META_SYNC_VERSION, "1:base").unwrap();
-        set_meta(conn, META_BASE_VERSION, "1:base").unwrap();
     }
 
     fn conv(c: &Connection, id: &str, title: &str, updated_at: &str) {
@@ -1017,7 +1225,6 @@ CREATE TABLE conversations (
         let b = Connection::open(&b_path).unwrap();
         b.execute_batch(SCHEMA).unwrap();
         set_meta(&b, META_SYNC_VERSION, "1:b").unwrap();
-        set_meta(&b, META_BASE_VERSION, "1:b").unwrap();
         conv(&b, "c1", "B with extra col", "2026-08-21T11:00:00+00:00");
         b.execute("ALTER TABLE conversations ADD COLUMN extra_col TEXT", [])
             .unwrap();
@@ -1029,6 +1236,40 @@ CREATE TABLE conversations (
         assert_eq!(
             scalar(&a2, "SELECT title FROM conversations WHERE id='c1'"),
             "B with extra col"
+        );
+    }
+
+    #[test]
+    fn lww_compares_instants_across_timestamp_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("local.db");
+        let remote_path = dir.path().join("remote.db");
+
+        let local = Connection::open(&local_path).unwrap();
+        init(&local);
+        conv(
+            &local,
+            "c1",
+            "lexically larger, temporally older",
+            "2026-08-21T10:00:05+00:00",
+        );
+
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.execute_batch(SCHEMA).unwrap();
+        set_meta(&remote, META_SYNC_VERSION, "1:b").unwrap();
+        conv(
+            &remote,
+            "c1",
+            "lexically smaller, temporally newer",
+            "2026-08-21T10:00:05.100Z",
+        );
+        drop(remote);
+
+        let report = merge_remote(&local, &remote_path, TEST_TABLES).unwrap();
+        assert_eq!(report.total_updated(), 1, "the later instant must win");
+        assert_eq!(
+            scalar(&local, "SELECT title FROM conversations WHERE id='c1'"),
+            "lexically smaller, temporally newer"
         );
     }
 }

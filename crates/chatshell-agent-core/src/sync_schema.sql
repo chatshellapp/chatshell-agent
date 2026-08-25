@@ -53,8 +53,7 @@ CREATE TABLE IF NOT EXISTS providers (
     is_enabled INTEGER DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    deleted_at TEXT,
-    api_key_account TEXT
+    deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS models (
@@ -221,9 +220,6 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT,
-    images TEXT,
-    tool_calls TEXT,
-    reasoning_content TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
@@ -337,6 +333,7 @@ CREATE TABLE IF NOT EXISTS message_attachments (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT,
+    UNIQUE(message_id, attachment_id),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
@@ -349,6 +346,7 @@ CREATE TABLE IF NOT EXISTS message_contexts (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT,
+    UNIQUE(message_id, context_type, context_id),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 

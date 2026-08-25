@@ -4,6 +4,7 @@ pub mod bash_ast;
 pub mod bash_security;
 pub mod compaction;
 pub mod context_pruning;
+pub mod crypto;
 pub mod edit_anchor;
 pub mod fuzzy_match;
 pub mod history;
