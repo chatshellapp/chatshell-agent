@@ -898,6 +898,15 @@ impl From<core::sync::SyncOutcome> for SyncOutcome {
     }
 }
 
+/// The canonical sync schema as one idempotent SQL batch (CREATE TABLE IF
+/// NOT EXISTS, parents-first). Clients whose schema predates the shared
+/// registry apply this in their own migration tooling (e.g. GRDB on iOS) so
+/// every device carries the same table/column shape for snapshot merging.
+#[uniffi::export]
+pub fn current_sync_schema_sql() -> String {
+    core::sync_schema::SYNC_SCHEMA_SQL.to_string()
+}
+
 #[derive(uniffi::Object)]
 pub struct SyncEngine {
     inner: std::sync::Mutex<core::sync::SyncEngine>,

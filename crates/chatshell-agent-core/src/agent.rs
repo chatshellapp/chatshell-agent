@@ -21,7 +21,28 @@ use crate::types::{
 };
 
 /// Default max_tokens for Anthropic (required by the API, unlike OpenAI).
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8192;
+pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8192;
+
+/// Create an Anthropic completion model with prompt caching enabled.
+///
+/// The single construction site shared by core's `run_generation` and
+/// desktop's `create_anthropic_agent`: same HTTP client (attribution +
+/// explicit Content-Type headers), same default base URL from the provider
+/// catalog, same `with_prompt_caching()` wiring.
+pub fn create_anthropic_completion_model(
+    api_key: &str,
+    base_url: Option<&str>,
+    model_id: &str,
+) -> Result<anthropic::completion::CompletionModel, AgentError> {
+    let http_client = create_http_client();
+    let client = anthropic::Client::<reqwest::Client>::builder()
+        .api_key(api_key)
+        .base_url(base_url.unwrap_or(kind_default_url(crate::types::ProviderKind::Anthropic)))
+        .http_client(http_client)
+        .build()
+        .map_err(provider_error)?;
+    Ok(client.completion_model(model_id).with_prompt_caching())
+}
 
 fn sampling_parameters_with_default_max_tokens(
     parameters: &SamplingParameters,
@@ -114,22 +135,15 @@ fn create_agent(
         }
         ProviderKind::Anthropic => {
             let key = required_key(request, "Anthropic")?;
-            let base_url = request
-                .provider
-                .base_url
-                .as_deref()
-                .unwrap_or(kind_default_url(crate::types::ProviderKind::Anthropic));
-            let client = anthropic::Client::<reqwest::Client>::builder()
-                .api_key(key)
-                .base_url(base_url)
-                .http_client(http_client)
-                .build()
-                .map_err(provider_error)?;
+            let model = create_anthropic_completion_model(
+                key,
+                request.provider.base_url.as_deref(),
+                model,
+            )?;
             let anthropic_parameters = sampling_parameters_with_default_max_tokens(
                 parameters,
                 ANTHROPIC_DEFAULT_MAX_TOKENS,
             );
-            let model = client.completion_model(model).with_prompt_caching();
             build_provider_agent(kind, model, system_prompt, &anthropic_parameters)
         }
         ProviderKind::OpenRouter => {

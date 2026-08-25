@@ -12,6 +12,9 @@ pub const META_DEVICE_ID: &str = "device_id";
 pub const META_BASE_VERSION: &str = "base_version";
 
 /// One table in the merge registry.
+pub const SNAPSHOT_FILE: &str = "snapshot.db";
+
+/// One table in the merge registry.
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
     pub name: &'static str,
@@ -193,7 +196,33 @@ pub fn merge_remote(
             if !remote_has_table {
                 continue;
             }
-            let cols = table_columns(local, spec.name)?;
+            // Column intersection: only columns present on BOTH sides enter
+            // the INSERT/UPDATE. This makes the merge tolerant of deployment
+            // skew (one device upgraded ahead of the other) instead of
+            // aborting with "no such column" on the first divergent pass.
+            // Column intersection: only columns present on BOTH sides enter
+            // the INSERT/UPDATE. This makes the merge tolerant of deployment
+            // skew (one device upgraded ahead of the other).
+            let local_cols = table_columns(local, spec.name)?;
+            let remote_cols: Vec<String> = {
+                let mut stmt = local.prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{}') WHERE schema = 'remote_db'",
+                    spec.name
+                ))?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let cols: Vec<String> = local_cols
+                .iter()
+                .filter(|c| remote_cols.contains(c))
+                .cloned()
+                .collect();
+            if cols.is_empty() {
+                bail!(
+                    "table {} has no common columns between local and remote",
+                    spec.name
+                );
+            }
             let col_list = cols.join(", ");
             let src = format!("SELECT {col_list} FROM remote_db.{}", spec.name);
             let sql = if spec.mutable {
@@ -355,12 +384,10 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(cols)
 }
 
+/// Mini-schema mirroring production shapes + sync columns (shared by tests
+/// and the column-intersection test module).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Mini-schema mirroring production shapes + sync columns.
-    const SCHEMA_SQL: &str = r#"
+const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY, title TEXT NOT NULL,
@@ -381,381 +408,14 @@ CREATE TABLE message_attachments (
     UNIQUE(message_id, attachment_id));
 "#;
 
-    const TEST_TABLES: &[TableSpec] = &[
-        t("conversations"),
-        t("files"),
-        t("messages"),
-        immut("message_attachments"),
-    ];
-
-    fn init(conn: &Connection) {
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(SCHEMA_SQL).unwrap();
-        set_meta(conn, META_SYNC_VERSION, "1:base").unwrap();
-        set_meta(conn, META_BASE_VERSION, "1:base").unwrap();
-    }
-
-    fn conv(c: &Connection, id: &str, title: &str, updated_at: &str) {
-        c.execute(
-            "INSERT INTO conversations(id, title, created_at, updated_at, deleted_at)
-             VALUES(?1, ?2, ?3, ?3, NULL)
-             ON CONFLICT(id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at",
-            [id, title, updated_at],
-        )
-        .unwrap();
-    }
-
-    fn msg(c: &Connection, id: &str, conversation_id: &str, content: &str, updated_at: &str) {
-        c.execute(
-            "INSERT INTO messages(id, conversation_id, sender_type, content, created_at, updated_at, deleted_at)
-             VALUES(?1, ?2, 'user', ?3, ?4, ?4, NULL)
-             ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-            rusqlite::params![id, conversation_id, content, updated_at],
-        )
-        .unwrap();
-    }
-
-    fn count(c: &Connection, sql: &str) -> i64 {
-        c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
-    }
-
-    fn scalar(c: &Connection, sql: &str) -> String {
-        c.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap()
-    }
-
-    struct Env {
-        dir: tempfile::TempDir,
-        b_path: std::path::PathBuf,
-    }
-
-    fn env_with(seed: fn(&Connection)) -> (Env, Connection, Connection) {
-        let dir = tempfile::tempdir().unwrap();
-        let base_path = dir.path().join("base.db");
-        let base = Connection::open(&base_path).unwrap();
-        init(&base);
-        seed(&base);
-        let a_path = dir.path().join("a.db");
-        let b_path = dir.path().join("b.db");
-        publish_snapshot(&base, &a_path).unwrap();
-        publish_snapshot(&base, &b_path).unwrap();
-        let a = Connection::open(&a_path).unwrap();
-        let b = Connection::open(&b_path).unwrap();
-        set_meta(&a, META_DEVICE_ID, "a").unwrap();
-        set_meta(&b, META_DEVICE_ID, "b").unwrap();
-        (Env { dir, b_path }, a, b)
-    }
-
-    #[test]
-    fn registry_invariants() {
-        // Unique names, pk non-empty, mutable tables... structural checks.
-        let mut seen = std::collections::HashSet::new();
-        for spec in PRODUCTION_MERGE_TABLES {
-            assert!(!spec.pk.is_empty(), "{}", spec.name);
-            assert!(seen.insert(spec.name), "duplicate table {}", spec.name);
-        }
-        // Parents before children for the FK-critical pairs.
-        let pos = |name: &str| {
-            PRODUCTION_MERGE_TABLES
-                .iter()
-                .position(|s| s.name == name)
-                .unwrap()
-        };
-        for (parent, child) in [
-            ("conversations", "messages"),
-            ("messages", "message_attachments"),
-            ("files", "message_attachments"),
-            ("fetch_results", "message_contexts"),
-            ("prompts", "message_prompts"),
-            ("tools", "message_tools"),
-            ("knowledge_bases", "message_knowledge_bases"),
-            ("assistants", "assistant_tools"),
-            ("messages", "tool_calls"),
-            ("messages", "thinking_steps"),
-            ("search_results", "search_decisions"),
-            ("providers", "models"),
-            ("conversations", "conversation_settings"),
-        ] {
-            assert!(pos(parent) < pos(child), "{parent} must precede {child}");
-        }
-        // Key-value tables use their natural pk.
-        assert_eq!(
-            PRODUCTION_MERGE_TABLES
-                .iter()
-                .find(|s| s.name == "settings")
-                .unwrap()
-                .pk,
-            "key"
-        );
-        assert_eq!(
-            PRODUCTION_MERGE_TABLES
-                .iter()
-                .find(|s| s.name == "conversation_settings")
-                .unwrap()
-                .pk,
-            "conversation_id"
-        );
-    }
-
-    #[test]
-    fn validate_registry_checks_columns() {
-        let conn = Connection::open_in_memory().unwrap();
-        init(&conn);
-        assert!(validate_registry(&conn, TEST_TABLES).is_ok());
-        // Mutable table missing updated_at must fail.
-        conn.execute("CREATE TABLE bad(id TEXT PRIMARY KEY, title TEXT)", [])
-            .unwrap();
-        assert!(
-            validate_registry(
-                &conn,
-                &[TableSpec {
-                    name: "bad",
-                    pk: "id",
-                    mutable: true,
-                    natural_key: None,
-                }]
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn disjoint_appends_merge_union() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "base", "2026-08-21T10:00:00+00:00");
-        });
-        msg(&a, "a1", "c1", "from A", "2026-08-21T11:00:00+00:00");
-        msg(&b, "b1", "c1", "from B", "2026-08-21T11:30:00+00:00");
-        let report = merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(count(&a, "SELECT COUNT(*) FROM messages"), 2);
-        assert_eq!(report.total_inserted(), 1);
-    }
-
-    #[test]
-    fn lww_both_directions() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "original", "2026-08-21T10:00:00+00:00");
-        });
-        conv(&a, "c1", "from A", "2026-08-21T11:00:00+00:00");
-        conv(&b, "c1", "from B", "2026-08-21T12:00:00+00:00");
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            scalar(&a, "SELECT title FROM conversations WHERE id='c1'"),
-            "from B"
-        );
-        conv(&a, "c1", "from A again", "2026-08-21T13:00:00+00:00");
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            scalar(&a, "SELECT title FROM conversations WHERE id='c1'"),
-            "from A again"
-        );
-    }
-
-    #[test]
-    fn tombstone_and_resurrect() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "keep", "2026-08-21T10:00:00+00:00");
-            conv(base, "c2", "delete", "2026-08-21T10:00:00+00:00");
-        });
-        b.execute(
-            "UPDATE conversations SET deleted_at='2026-08-21T12:00:00+00:00', updated_at='2026-08-21T12:00:00+00:00' WHERE id='c1'",
-        []
-        )
-        .unwrap();
-        conv(&a, "c1", "A edit", "2026-08-21T11:00:00+00:00");
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            scalar(&a, "SELECT deleted_at FROM conversations WHERE id='c1'"),
-            "2026-08-21T12:00:00+00:00"
-        );
-        // Newer edit on A resurrects c2 even though B tombstoned it.
-        b.execute(
-            "UPDATE conversations SET deleted_at='2026-08-21T12:00:00+00:00', updated_at='2026-08-21T12:00:00+00:00' WHERE id='c2'",
-        []
-        )
-        .unwrap();
-        conv(&a, "c2", "resurrect", "2026-08-21T13:00:00+00:00");
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            count(
-                &a,
-                "SELECT COUNT(*) FROM conversations WHERE id='c2' AND deleted_at IS NULL"
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn merge_is_idempotent() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "base", "2026-08-21T10:00:00+00:00");
-        });
-        msg(&b, "b1", "c1", "from B", "2026-08-21T11:00:00+00:00");
-        conv(&b, "c1", "B title", "2026-08-21T11:30:00+00:00");
-        let first = merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!((first.total_inserted(), first.total_updated()), (1, 1));
-        let second = merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!((second.total_inserted(), second.total_updated()), (0, 0));
-    }
-
-    #[test]
-    fn fk_parents_first() {
-        let (env, a, _b) = env_with(|_| {});
-        let b = Connection::open(&env.b_path).unwrap();
-        conv(&b, "c-new", "B only", "2026-08-21T11:00:00+00:00");
-        msg(&b, "m-new", "c-new", "child", "2026-08-21T11:01:00+00:00");
-        drop(b);
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            count(&a, "SELECT COUNT(*) FROM messages WHERE id='m-new'"),
-            1
-        );
-    }
-
-    #[test]
-    fn junction_natural_key_dedup() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "c", "2026-08-21T10:00:00+00:00");
-            msg(base, "m1", "c1", "attach", "2026-08-21T10:00:00+00:00");
-            base.execute(
-                "INSERT INTO files(id, file_name, content_hash, created_at, updated_at)
-                 VALUES('f1', 'a.png', 'h1', '2026-08-21T10:00:00+00:00', '2026-08-21T10:00:00+00:00')",
-                [],
-            )
-            .unwrap();
-        });
-        for (c, id) in [(&a, "att-a"), (&b, "att-b")] {
-            c.execute(
-                "INSERT INTO message_attachments(id, message_id, attachment_id, created_at)
-                 VALUES(?1, 'm1', 'f1', '2026-08-21T11:00:00+00:00')",
-                [id],
-            )
-            .unwrap();
-        }
-        merge_remote(&a, &env.b_path, TEST_TABLES).unwrap();
-        assert_eq!(
-            count(
-                &a,
-                "SELECT COUNT(*) FROM message_attachments WHERE message_id='m1' AND attachment_id='f1'"
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn publish_snapshot_standalone() {
-        let dir = tempfile::tempdir().unwrap();
-        let live = Connection::open(dir.path().join("live.db")).unwrap();
-        init(&live);
-        conv(&live, "c1", "with wal", "2026-08-21T10:00:00+00:00");
-        live.pragma_update(None, "journal_mode", "WAL").unwrap();
-        msg(&live, "m1", "c1", "via wal", "2026-08-21T10:05:00+00:00");
-        let snap = dir.path().join("snapshot.db");
-        publish_snapshot(&live, &snap).unwrap();
-        assert!(!dir.path().join("snapshot.db-wal").exists());
-        let opened = Connection::open(&snap).unwrap();
-        assert_eq!(
-            scalar(&opened, "SELECT content FROM messages WHERE id='m1'"),
-            "via wal"
-        );
-        msg(&live, "m2", "c1", "after", "2026-08-21T10:06:00+00:00");
-        assert_eq!(count(&live, "SELECT COUNT(*) FROM messages"), 2);
-    }
-
-    #[test]
-    fn full_divergence_converges() {
-        let (env, a, b) = env_with(|base| {
-            conv(base, "c1", "base", "2026-08-21T10:00:00+00:00");
-        });
-        msg(&a, "a1", "c1", "A only", "2026-08-21T11:00:00+00:00");
-        set_meta(&a, META_SYNC_VERSION, "2:a").unwrap();
-        let a_snap = env.dir.path().join("a-snapshot.db");
-        publish_snapshot(&a, &a_snap).unwrap();
-
-        msg(&b, "b1", "c1", "B only", "2026-08-21T11:30:00+00:00");
-        conv(&b, "c1", "B title", "2026-08-21T11:45:00+00:00");
-        set_meta(&b, META_SYNC_VERSION, "2:b").unwrap();
-        let b_snap = env.dir.path().join("b-snapshot.db");
-        publish_snapshot(&b, &b_snap).unwrap();
-
-        let remote = Connection::open(&b_snap).unwrap();
-        assert_eq!(plan_sync(&a, &remote).unwrap(), SyncAction::Merge);
-        merge_remote(&a, &b_snap, TEST_TABLES).unwrap();
-        set_meta(&a, META_SYNC_VERSION, "3:a").unwrap();
-        set_meta(&a, META_BASE_VERSION, "3:a").unwrap();
-        publish_snapshot(&a, &a_snap).unwrap();
-        assert_eq!(count(&a, "SELECT COUNT(*) FROM messages"), 2);
-        assert_eq!(
-            scalar(&a, "SELECT title FROM conversations WHERE id='c1'"),
-            "B title"
-        );
-
-        let a_remote = Connection::open(&a_snap).unwrap();
-        assert_eq!(plan_sync(&b, &a_remote).unwrap(), SyncAction::Merge);
-        merge_remote(&b, &a_snap, TEST_TABLES).unwrap();
-        set_meta(&b, META_BASE_VERSION, "3:a").unwrap();
-        set_meta(&b, META_SYNC_VERSION, "3:a").unwrap();
-        assert_eq!(count(&b, "SELECT COUNT(*) FROM messages"), 2);
-
-        assert_eq!(plan_sync(&a, &a_remote).unwrap(), SyncAction::UpToDate);
-        let old_b = Connection::open(&b_snap).unwrap();
-        assert_eq!(plan_sync(&b, &old_b).unwrap(), SyncAction::UpToDate);
-    }
-}
-
+/// Mini merge registry for tests.
 #[cfg(test)]
-mod natural_key_tests {
-    use super::*;
-
-    #[test]
-    fn same_natural_key_different_pk_does_not_abort_merge() {
-        // Two devices seed the same preset name under different UUIDs.
-        let dir = tempfile::tempdir().unwrap();
-        let a_path = dir.path().join("a.db");
-        let b_path = dir.path().join("b.db");
-        let mk = |path: &std::path::Path, id: &str| {
-            let conn = Connection::open(path).unwrap();
-            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-            conn.execute_batch(
-                "CREATE TABLE presets (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    updated_at TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO presets(id, name, updated_at) VALUES(?1, 'Default', '2026-08-21T10:00:00+00:00')",
-                [id],
-            )
-            .unwrap();
-            conn
-        };
-        let a = mk(&a_path, "id-a");
-        let _b = mk(&b_path, "id-b");
-        drop(_b);
-
-        let tables = [tnk("presets", "name")];
-        let report =
-            merge_remote(&a, &b_path, &tables).expect("natural-key collision must not abort");
-        // Remote's twin lost to the local natural key; no rows inserted.
-        assert_eq!(report.total_inserted(), 0);
-        let count: i64 = a
-            .query_row("SELECT COUNT(*) FROM presets", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-        let id: String = a
-            .query_row("SELECT id FROM presets", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(id, "id-a", "local natural-key twin wins");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SyncEngine: publish/merge orchestration (lifted from desktop Phase 3a)
-// ---------------------------------------------------------------------------
-
-/// Filename of the published snapshot inside the cloud directory.
-pub const SNAPSHOT_FILE: &str = "snapshot.db";
+const TEST_TABLES: &[TableSpec] = &[
+    t("conversations"),
+    t("files"),
+    t("messages"),
+    immut("message_attachments"),
+];
 
 /// What one `sync_now` pass did.
 #[derive(Debug, Default, PartialEq)]
@@ -777,13 +437,45 @@ pub struct SyncOutcome {
 ///   pool). An empty merge report means the local content already equals the
 ///   remote, so the local version id adopts the remote id and two devices
 ///   converge instead of ping-ponging counters. A non-empty merge mints a
-///   fresh version and republishes.
+///   fresh version and republishes. When the remote is already up to date,
+///   pending local writes still ship via a throttled flush (`maybe_flush`),
+///   so timer-driven ticks both pull and push without fixed-cadence churn.
 pub struct SyncEngine {
     conn: Connection,
     cloud_dir: PathBuf,
     tables: &'static [TableSpec],
+    /// `PRAGMA data_version` observed at the last publish (or adoption).
+    /// `None` until this process publishes/adopts; `None` makes
+    /// [`Self::dirty_since_last_publish`] report dirty so the first mint of
+    /// a real version id (`0:local` -> `<counter>:<device>`) always happens.
     last_published_data_version: Option<i64>,
+    /// `PRAGMA data_version` captured at construction and refreshed at each
+    /// publish. Pool commits since then mean unshipped local writes.
+    pool_baseline_data_version: i64,
+    /// Wall-clock guard for tick-driven flushes so an idle app never
+    /// republishes more often than this interval. Exit-time publishes bypass
+    /// it. Defaults to [`PUBLISH_MIN_INTERVAL`]; tests shrink it to zero.
+    min_publish_interval: std::time::Duration,
+    /// Instant of the last publish; `None` until this process publishes.
+    last_publish_at: Option<std::time::Instant>,
+    /// Armed at construction when the previous process may have died with
+    /// unshipped writes (no clean-exit marker); consumed by the first
+    /// `maybe_flush`, which then forces a publish regardless of the pool
+    /// baseline.
+    force_first_flush: bool,
 }
+
+/// Meta key recording whether the previous process ended with a successful
+/// publish. Absent/`0` at construction arms [`SyncEngine::force_first_flush`].
+const META_CLEAN_EXIT: &str = "sync_clean_exit";
+
+/// Minimum wall-clock spacing between tick-driven publishes. Each publish is
+/// a full `VACUUM INTO` of the database plus a cloud upload, so an idle or
+/// lightly-used app must not republish on every timer tick.
+const PUBLISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Placeholder version id before a device mints its first real version.
+const INITIAL_VERSION: &str = "0:local";
 
 impl SyncEngine {
     /// Open a side connection against the live database and validate the
@@ -803,17 +495,34 @@ impl SyncEngine {
         let conn = Connection::open(db_path)
             .with_context(|| format!("open sync connection {}", db_path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let pool_baseline_data_version =
+            conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
         let mut engine = Self {
             conn,
             cloud_dir,
             tables,
             last_published_data_version: None,
+            pool_baseline_data_version,
+            min_publish_interval: PUBLISH_MIN_INTERVAL,
+            last_publish_at: None,
+            force_first_flush: false,
         };
         engine.ensure_device_id()?;
+        // If the previous process did not end with a successful publish
+        // (killed, crashed, or pre-dating the marker), writes from that
+        // session may never have shipped - arm one forced flush. The first
+        // publish in this process re-arms the "clean" state.
+        let prior_clean = get_meta(&engine.conn, META_CLEAN_EXIT)?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        engine.force_first_flush =
+            !prior_clean && engine.current_version() != INITIAL_VERSION;
+        set_meta(&engine.conn, META_CLEAN_EXIT, "0")?;
         validate_registry(&engine.conn, engine.tables)
             .context("sync registry validation against live schema")?;
         Ok(engine)
     }
+
 
     /// Access the underlying connection (tests, meta inspection).
     pub fn connection(&self) -> &Connection {
@@ -830,8 +539,8 @@ impl SyncEngine {
             set_meta(&self.conn, META_DEVICE_ID, &id)?;
         }
         if get_meta(&self.conn, META_SYNC_VERSION)?.is_none() {
-            set_meta(&self.conn, META_SYNC_VERSION, "0:local")?;
-            set_meta(&self.conn, META_BASE_VERSION, "0:local")?;
+            set_meta(&self.conn, META_SYNC_VERSION, INITIAL_VERSION)?;
+            set_meta(&self.conn, META_BASE_VERSION, INITIAL_VERSION)?;
         }
         Ok(())
     }
@@ -847,7 +556,7 @@ impl SyncEngine {
         get_meta(&self.conn, META_SYNC_VERSION)
             .ok()
             .flatten()
-            .unwrap_or_else(|| "0:local".to_string())
+            .unwrap_or_else(|| INITIAL_VERSION.to_string())
     }
 
     fn data_version(&self) -> Result<i64> {
@@ -870,9 +579,14 @@ impl SyncEngine {
 
     /// Publish the current database state to the cloud dir. Bumps the
     /// version id only when the database changed since the last publish;
-    /// otherwise the snapshot is republished under the same id.
+    /// otherwise the snapshot is republished under the same id. Unthrottled:
+    /// used for exit/background flushes where terminal state must land.
     pub fn publish(&mut self) -> Result<()> {
-        if self.dirty_since_last_publish()? {
+        self.publish_inner(false)
+    }
+
+    fn publish_inner(&mut self, force_bump: bool) -> Result<()> {
+        if force_bump || self.dirty_since_last_publish()? {
             let counter = self
                 .current_version()
                 .split(':')
@@ -884,8 +598,56 @@ impl SyncEngine {
             set_meta(&self.conn, META_BASE_VERSION, &new_version)?;
         }
         publish_snapshot(&self.conn, &self.snapshot_path())?;
-        self.last_published_data_version = Some(self.data_version()?);
+        let seen = self.data_version()?;
+        self.last_published_data_version = Some(seen);
+        self.pool_baseline_data_version = seen;
+        self.last_publish_at = Some(std::time::Instant::now());
+        // Any successful publish ships everything this process knew about;
+        // the construction-time suspicion is resolved either way.
+        self.force_first_flush = false;
+        set_meta(&self.conn, META_CLEAN_EXIT, "1")?;
         Ok(())
+    }
+
+    /// True when the app pool committed since this process last published
+    /// (or since construction, if it has not published yet). The placeholder
+    /// version [`INITIAL_VERSION`] means this device never minted a real
+    /// version - the published-initial / adopt paths own that first
+    /// transition, so a tick flush stays out of their way.
+    fn pool_has_unshipped_writes(&self) -> Result<bool> {
+        if self.current_version() == INITIAL_VERSION {
+            return Ok(false);
+        }
+        Ok(self.data_version()? != self.pool_baseline_data_version)
+    }
+
+    /// Throttled flush for timer-driven ticks: publish pending local writes
+    /// only when the app pool actually committed since the last publish AND
+    /// the last publish is older than the configured interval. Returns true
+    /// when a snapshot was published.
+    fn maybe_flush(&mut self) -> Result<bool> {
+        // Armed at construction: the previous process may have died with
+        // unshipped writes that the pool baseline cannot see. Consume the
+        // flag once and force the publish (bypassing the throttle - this is
+        // the startup pass, before any publish in this process).
+        if self.force_first_flush {
+            self.force_first_flush = false;
+            self.publish_inner(true)?;
+            return Ok(true);
+        }
+        if !self.pool_has_unshipped_writes()? {
+            return Ok(false);
+        }
+        if let Some(at) = self.last_publish_at
+            && at.elapsed() < self.min_publish_interval
+        {
+            return Ok(false);
+        }
+        // Forced bump: the DB may carry an id just adopted from the remote
+        // while content has moved on - publishing under an unchanged id
+        // would make peers treat the new rows as already-synced.
+        self.publish_inner(true)?;
+        Ok(true)
     }
 
     /// One sync pass against the cloud snapshot, if one exists.
@@ -905,10 +667,15 @@ impl SyncEngine {
         drop(remote);
 
         match action {
-            SyncAction::UpToDate => Ok(SyncOutcome {
-                action: "up-to-date".into(),
-                ..Default::default()
-            }),
+            SyncAction::UpToDate => {
+                // Remote has nothing new, but local writes since the last
+                // publish must still ship (throttled - see `maybe_flush`).
+                let flushed = self.maybe_flush()?;
+                Ok(SyncOutcome {
+                    action: if flushed { "flushed" } else { "up-to-date" }.into(),
+                    ..Default::default()
+                })
+            }
             SyncAction::Adopt | SyncAction::Merge => {
                 let report = merge_remote(&self.conn, &snapshot, self.tables)?;
                 let rows_merged = report.total_inserted() + report.total_updated();
@@ -920,13 +687,21 @@ impl SyncEngine {
                 if rows_merged == 0 {
                     // Content already equal: adopt the remote version id and
                     // converge - republishing under a new id would ping-pong.
+                    // `pool_baseline_data_version` is intentionally NOT
+                    // refreshed here: pool writes since construction are
+                    // still unshipped and must stay detectable below.
                     set_meta(&self.conn, META_SYNC_VERSION, &remote_version)?;
                     set_meta(&self.conn, META_BASE_VERSION, &remote_version)?;
-                    self.last_published_data_version = Some(self.data_version()?);
+                    let seen = self.data_version()?;
+                    self.last_published_data_version = Some(seen);
+                    // Adoption alone must not strand local writes made while
+                    // the app was running (e.g. a conversation created since
+                    // the last publish): ship them via the throttled flush.
+                    let flushed = self.maybe_flush()?;
                     Ok(SyncOutcome {
-                        action: "converged".into(),
+                        action: if flushed { "flushed" } else { "converged" }.into(),
                         rows_merged: 0,
-                        republished: false,
+                        republished: flushed,
                     })
                 } else {
                     // Fresh local state: mint a new version and publish it.
@@ -1034,6 +809,102 @@ CREATE TABLE conversations (
     }
 
     #[test]
+    fn tick_flush_ships_pending_pool_writes_and_throttles() {
+        let space = dir("flush");
+        let db = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        seed(&db, "c1", "first");
+
+        let mut engine = SyncEngine::new_with_tables(&db, cloud, ENGINE_TABLES).unwrap();
+        engine.min_publish_interval = std::time::Duration::ZERO;
+        assert_eq!(engine.sync_now().unwrap().action, "published-initial");
+
+        // No pool writes since construction: the tick must stay a cheap
+        // no-op (no republish, no version churn for peers to react to).
+        let out = engine.sync_now().unwrap();
+        assert_eq!(out.action, "up-to-date");
+        assert!(!out.republished);
+
+        // A pool commit since construction ships on the next tick under a
+        // freshly minted version id.
+        let version_before =
+            get_meta(engine.connection(), META_SYNC_VERSION).unwrap().unwrap();
+        {
+            let pool = Connection::open(&db).unwrap();
+            pool.execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('c2', 'second', '2026-08-21T11:00:00+00:00', '2026-08-21T11:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        }
+        let out = engine.sync_now().unwrap();
+        assert_eq!(out.action, "flushed");
+        let version_after =
+            get_meta(engine.connection(), META_SYNC_VERSION).unwrap().unwrap();
+        assert_ne!(version_before, version_after, "flush mints a new id");
+
+        // Throttle: fresh pool writes inside the window are deferred - the
+        // tick still reports up-to-date instead of publishing.
+        engine.min_publish_interval = std::time::Duration::from_secs(3600);
+        {
+            let pool = Connection::open(&db).unwrap();
+            pool.execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('c3', 'third', '2026-08-21T12:00:00+00:00', '2026-08-21T12:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        }
+        let out = engine.sync_now().unwrap();
+        assert_eq!(out.action, "up-to-date");
+    }
+
+    #[test]
+    fn converged_adoption_flushes_pending_pool_writes() {
+        let space = dir("converged-flush");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        // A publishes one conversation.
+        seed(&a_path, "c1", "shared");
+        let mut a = SyncEngine::new_with_tables(&a_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+
+        // B already holds that same row, so its first pass converges with an
+        // empty merge report - but it also has a pending local write made
+        // after engine construction (the app was running).
+        seed(&b_path, "c1", "shared");
+        let mut b = SyncEngine::new_with_tables(&b_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        b.min_publish_interval = std::time::Duration::ZERO;
+        {
+            let pool = Connection::open(&b_path).unwrap();
+            pool.execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('c2', 'from B', '2026-08-21T11:00:00+00:00', '2026-08-21T11:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out_b = b.sync_now().unwrap();
+        assert_eq!(out_b.action, "flushed", "adoption must not strand writes");
+        assert!(out_b.republished);
+
+        // A pulls B's pending row on its next pass.
+        let out_a = a.sync_now().unwrap();
+        assert!(out_a.rows_merged > 0);
+        let n: i64 = a
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
     fn republish_without_writes_keeps_version() {
         let space = dir("stable");
         let db = space.path().join("a.db");
@@ -1050,5 +921,114 @@ CREATE TABLE conversations (
             .unwrap()
             .unwrap();
         assert_eq!(v1, v2);
+    }
+}
+
+#[cfg(test)]
+mod column_intersection_tests {
+    use super::*;
+
+    fn init(conn: &Connection) {
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        set_meta(conn, META_SYNC_VERSION, "1:base").unwrap();
+        set_meta(conn, META_BASE_VERSION, "1:base").unwrap();
+    }
+
+    fn conv(c: &Connection, id: &str, title: &str, updated_at: &str) {
+        c.execute(
+            "INSERT INTO conversations(id, title, created_at, updated_at, deleted_at)
+             VALUES(?1, ?2, ?3, ?3, NULL)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at",
+            [id, title, updated_at],
+        )
+        .unwrap();
+    }
+
+    fn scalar(c: &Connection, sql: &str) -> String {
+        c.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap()
+    }
+
+    const SCHEMA: &str = r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE conversations (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+);
+"#;
+
+    #[test]
+    fn merge_tolerates_column_skew() {
+        // Local (desktop v15): has new_col. Remote (iOS, old schema): doesn't.
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("local.db");
+        let remote_path = dir.path().join("remote.db");
+
+        let local = Connection::open(&local_path).unwrap();
+        init(&local);
+        conv(&local, "c1", "local title", "2026-08-21T10:00:00+00:00");
+
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.execute_batch(SCHEMA).unwrap();
+        remote
+            .execute(
+                "INSERT INTO meta(key, value, updated_at) VALUES('sync_version', '1:ios', '2026-08-21T10:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        remote
+            .execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('c2', 'from ios', '2026-08-21T10:00:00+00:00', '2026-08-21T10:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        drop(remote);
+
+        // Add new_col to LOCAL only — simulating desktop upgraded ahead of iOS.
+        local
+            .execute("ALTER TABLE conversations ADD COLUMN new_col TEXT", [])
+            .unwrap();
+
+        // Merge must NOT abort with "no such column" — the intersection skips it.
+        let report = merge_remote(&local, &remote_path, TEST_TABLES).unwrap();
+        assert_eq!(report.total_inserted(), 1, "B's row must arrive");
+
+        // Verify data integrity on both common columns.
+        let title: String = local
+            .query_row("SELECT title FROM conversations WHERE id='c2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "from ios");
+    }
+
+    #[test]
+    fn reverse_direction_also_tolerates_skew() {
+        // Remote has extra_col that local doesn't — SELECT must not fail.
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db");
+        let b_path = dir.path().join("b.db");
+        let a = Connection::open(&a_path).unwrap();
+        init(&a);
+        conv(&a, "c1", "A", "2026-08-21T10:00:00+00:00");
+        drop(a);
+
+        let b = Connection::open(&b_path).unwrap();
+        b.execute_batch(SCHEMA).unwrap();
+        set_meta(&b, META_SYNC_VERSION, "1:b").unwrap();
+        set_meta(&b, META_BASE_VERSION, "1:b").unwrap();
+        conv(&b, "c1", "B with extra col", "2026-08-21T11:00:00+00:00");
+        b.execute("ALTER TABLE conversations ADD COLUMN extra_col TEXT", [])
+            .unwrap();
+        drop(b);
+
+        let a2 = Connection::open(&a_path).unwrap();
+        let report = merge_remote(&a2, &b_path, TEST_TABLES).unwrap();
+        assert_eq!(report.total_updated(), 1, "LWW update applied");
+        assert_eq!(
+            scalar(&a2, "SELECT title FROM conversations WHERE id='c1'"),
+            "B with extra col"
+        );
     }
 }

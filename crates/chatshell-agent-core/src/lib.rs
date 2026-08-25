@@ -1,4 +1,7 @@
 mod agent;
+pub mod anchor_store;
+pub mod bash_ast;
+pub mod bash_security;
 pub mod compaction;
 pub mod context_pruning;
 pub mod edit_anchor;
@@ -6,17 +9,25 @@ pub mod fuzzy_match;
 pub mod history;
 pub mod mcp;
 pub mod openai_compat;
+pub mod path_policy;
+pub mod process_api;
 pub mod provider_catalog;
 pub mod provider_registry;
 pub mod snapcompact;
 pub mod sync;
+pub mod sync_schema;
 pub mod thinking;
 pub mod tool_definitions;
+pub mod tool_fs;
+pub mod tools;
 pub mod types;
 pub mod web_fetch;
 pub mod web_search;
 
-pub use agent::{create_http_client, run_generation};
+pub use agent::{
+    ANTHROPIC_DEFAULT_MAX_TOKENS, create_anthropic_completion_model, create_http_client,
+    run_generation,
+};
 pub use history::{HistoryRole, HistoryRow, ToolCallRow, pair_history};
 pub use mcp::{McpConnection, McpHttpConfig, McpToolInfo, McpToolResult};
 pub use provider_registry::{
