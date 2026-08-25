@@ -713,3 +713,80 @@ impl From<core::SearchResult> for SearchResult {
 }
 
 uniffi::setup_scaffolding!();
+
+// ---------------------------------------------------------------------------
+// Snapshot sync (ADR 01). The engine runs on the caller's database file
+// through a dedicated side connection; the host keeps its own async access.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum SyncError {
+    #[error("{message}")]
+    Failed { message: String },
+    #[error("sync engine unavailable (poisoned lock)")]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncOutcome {
+    pub action: String,
+    pub rows_merged: u64,
+    pub republished: bool,
+}
+
+impl From<core::sync::SyncOutcome> for SyncOutcome {
+    fn from(outcome: core::sync::SyncOutcome) -> Self {
+        Self {
+            action: outcome.action,
+            rows_merged: outcome.rows_merged as u64,
+            republished: outcome.republished,
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct SyncEngine {
+    inner: std::sync::Mutex<core::sync::SyncEngine>,
+}
+
+#[uniffi::export]
+impl SyncEngine {
+    /// Open a sync side connection. `cloud_dir` must already exist (the
+    /// device that owns the iCloud container provisions it).
+    #[uniffi::constructor]
+    pub fn new(db_path: String, cloud_dir: String) -> Result<Self, SyncError> {
+        let engine = core::sync::SyncEngine::new(
+            std::path::Path::new(&db_path),
+            std::path::PathBuf::from(cloud_dir),
+        )
+        .map_err(|e| SyncError::Failed {
+            message: e.to_string(),
+        })?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(engine),
+        })
+    }
+
+    /// Publish the current state to the cloud snapshot.
+    pub fn publish(&self) -> Result<(), SyncError> {
+        self.inner
+            .lock()
+            .map_err(|_| SyncError::Unavailable)?
+            .publish()
+            .map_err(|e| SyncError::Failed {
+                message: e.to_string(),
+            })
+    }
+
+    /// One sync pass: merge remote changes, then republish when needed.
+    pub fn sync_now(&self) -> Result<SyncOutcome, SyncError> {
+        self.inner
+            .lock()
+            .map_err(|_| SyncError::Unavailable)?
+            .sync_now()
+            .map(Into::into)
+            .map_err(|e| SyncError::Failed {
+                message: e.to_string(),
+            })
+    }
+}

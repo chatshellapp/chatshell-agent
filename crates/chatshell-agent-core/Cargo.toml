@@ -9,6 +9,9 @@ anyhow.workspace = true
 futures.workspace = true
 nanoid.workspace = true
 regex.workspace = true
+ab_glyph.workspace = true
+png.workspace = true
+base64.workspace = true
 reqwest.workspace = true
 htmd.workspace = true
 rmcp.workspace = true
@@ -23,3 +26,9 @@ tokio-util.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 tracing.workspace = true
+unicode-normalization.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

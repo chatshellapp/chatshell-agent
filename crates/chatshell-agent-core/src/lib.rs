@@ -1,8 +1,14 @@
 mod agent;
+pub mod compaction;
+pub mod context_pruning;
+pub mod edit_anchor;
+pub mod fuzzy_match;
 pub mod mcp;
 pub mod openai_compat;
 pub mod provider_catalog;
 pub mod provider_registry;
+pub mod snapcompact;
+pub mod sync;
 pub mod thinking;
 pub mod tool_definitions;
 pub mod types;
