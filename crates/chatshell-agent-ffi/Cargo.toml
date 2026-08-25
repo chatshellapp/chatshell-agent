@@ -12,6 +12,7 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
 chatshell-agent-core = { path = "../chatshell-agent-core" }
+parking_lot.workspace = true
 once_cell.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
