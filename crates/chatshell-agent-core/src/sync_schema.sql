@@ -1,4 +1,5 @@
--- Canonical sync schema (desktop schema v14 shape).
+-- Canonical sync schema: the desktop migration ladder's endpoint shape
+-- (user_version 11), pinned by the desktop drift-guard test.
 -- Generated from a freshly migrated desktop database; kept in lockstep by the
 -- desktop drift-guard test. Parents-first (merge-registry order); meta rides
 -- along; the FTS5 table is intentionally absent (never merged).

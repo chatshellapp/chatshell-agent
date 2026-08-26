@@ -10,15 +10,14 @@
 //! source of that shape.
 //!
 //! Consumers:
-//! - **chatshell-desktop** carries the authoritative schema ladder (sqlx
-//!   migrations, currently v14). Its drift-guard test asserts that a freshly
-//!   migrated desktop database and [`ensure_sync_tables`] produce identical
-//!   table/column sets — extending the desktop schema without updating this
-//!   constant fails that test.
-//! - **chatshell-ios** applies this DDL idempotently in its GRDB V6 migration
-//!   (tables it predates are skipped and altered explicitly; tables it never
-//!   had are created as pass-through shells whose rows ride snapshots
-//!   untouched).
+//! - **chatshell-desktop** carries the authoritative migration ladder. Its
+//!   drift-guard test asserts that a freshly migrated desktop database and
+//!   [`ensure_sync_tables`] produce identical table/column sets - extending
+//!   the desktop schema without updating this constant fails that test.
+//! - **chatshell-ios** collapsed its historical V1-V8 GRDB ladder into a
+//!   single migration that executes this DDL verbatim over FFI
+//!   (`currentSyncSchemaSql()`); databases predating the collapse already
+//!   hold the final shape and skip the migration untouched.
 //!
 //! The `meta` table is included (both sides need it for version bookkeeping);
 //! the FTS5 virtual table and its shadow tables are not (never merged,
@@ -33,20 +32,56 @@ use rusqlite::Connection;
 
 /// The canonical sync schema as one idempotent SQL batch.
 ///
-/// Shape = desktop schema **v14**: v13 plus
-/// - `messages.images / tool_calls / reasoning_content` (the JSON columns the
-///   iOS app has carried since its V3-V5 — desktop writes NULL, iOS round-trips
-///   its streaming state through them), and
-/// - `providers.api_key_account` (the iOS Keychain account reference).
+/// Shape = the consolidated desktop ladder endpoint (user_version 11, which
+/// collapsed the previously shipped v11-v15 steps): every synced table
+/// carries `updated_at` LWW stamps and `deleted_at` tombstones,
+/// mutable-with-natural-key tables carry their UNIQUE indexes, and the
+/// formerly dual-representation columns (`messages.images`,
+/// `messages.tool_calls`, `messages.reasoning_content`,
+/// `providers.api_key_account`) are gone everywhere — tool calls, user
+/// attachments, and reasoning persist only in their normalized tables
+/// (`tool_calls`, `files` + `message_attachments`, `thinking_steps`).
 ///
-/// Both additions exist solely so column sets match across devices.
+/// Evolution: bump [`CANONICAL_SCHEMA_VERSION`] whenever this shape changes.
+/// The stamp is diagnostic provenance, not a merge gate:
+/// `crate::sync::merge_remote` logs a warning on mismatch but proceeds, so
+/// additive changes keep degrading gracefully through column intersection
+/// (the documented design: drift-guard tests are the primary contract,
+/// intersection the runtime safety net). A future destructive migration can
+/// promote the stamp to a hard check deliberately.
 pub const SYNC_SCHEMA_SQL: &str = include_str!("sync_schema.sql");
 
-/// Apply [`SYNC_SCHEMA_SQL`] to `conn`. Safe to call on a database that
-/// already has any subset of the tables (`IF NOT EXISTS` throughout).
+/// Monotonic version of [`SYNC_SCHEMA_SQL`]'s shape, recorded in the `meta`
+/// table under [`META_SCHEMA_VERSION`]. Bump on every shape change;
+/// [`ensure_sync_tables`] stamps it into fresh databases.
+pub const CANONICAL_SCHEMA_VERSION: i64 = 1;
+
+/// `meta` key holding [`CANONICAL_SCHEMA_VERSION`].
+pub const META_SCHEMA_VERSION: &str = "schema_version";
+
+/// Apply [`SYNC_SCHEMA_SQL`] to `conn` and stamp
+/// [`CANONICAL_SCHEMA_VERSION`] into `meta` when absent. Safe to call on a
+/// database that already has any subset of the tables (`IF NOT EXISTS`
+/// throughout); an existing stamp is never overwritten here - version
+/// changes go through real migrations, not re-running this batch.
 pub fn ensure_sync_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(SYNC_SCHEMA_SQL)
-        .context("apply canonical sync schema")
+        .context("apply canonical sync schema")?;
+    if crate::sync::get_meta(conn, META_SCHEMA_VERSION)?.is_none() {
+        crate::sync::set_meta(
+            conn,
+            META_SCHEMA_VERSION,
+            &CANONICAL_SCHEMA_VERSION.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Read the canonical-schema version stamped in `meta`, if any. `None`
+/// means the database predates the stamping gate and is treated as
+/// compatible by the merge path.
+pub fn read_schema_version(conn: &Connection) -> Result<Option<i64>> {
+    Ok(crate::sync::get_meta(conn, META_SCHEMA_VERSION)?.and_then(|v| v.parse().ok()))
 }
 
 #[cfg(test)]
@@ -74,6 +109,30 @@ mod tests {
         ensure_sync_tables(&conn).expect("first apply");
         ensure_sync_tables(&conn).expect("second apply");
         validate_registry(&conn, PRODUCTION_MERGE_TABLES).unwrap();
+    }
+
+    #[test]
+    fn ensure_sync_tables_stamps_the_canonical_version() {
+        let conn = fresh();
+        ensure_sync_tables(&conn).unwrap();
+        assert_eq!(
+            read_schema_version(&conn).unwrap(),
+            Some(CANONICAL_SCHEMA_VERSION),
+            "fresh application must stamp CANONICAL_SCHEMA_VERSION into meta"
+        );
+    }
+
+    #[test]
+    fn stamping_never_clobbers_an_existing_version() {
+        let conn = fresh();
+        ensure_sync_tables(&conn).unwrap();
+        crate::sync::set_meta(&conn, META_SCHEMA_VERSION, "99").unwrap();
+        ensure_sync_tables(&conn).unwrap();
+        assert_eq!(
+            read_schema_version(&conn).unwrap(),
+            Some(99),
+            "re-running the batch is not a migration; existing stamps stay"
+        );
     }
 
     #[test]

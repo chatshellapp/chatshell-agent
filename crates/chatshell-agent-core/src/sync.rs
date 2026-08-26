@@ -190,6 +190,30 @@ pub fn merge_remote(
     )?;
     let merge_pass = || -> Result<MergeReport> {
         let mut report = MergeReport::default();
+        // Schema-shape provenance: log (don't reject) when the snapshot was
+        // written under a different canonical-schema version. Column
+        // intersection below keeps mismatched shapes merging safely for
+        // additive changes; the warning makes silent column freeze visible
+        // and marks where a future hard gate would go.
+        if let (Some(local_v), Some(remote_v)) = (
+            crate::sync_schema::read_schema_version(local)?,
+            local
+                .query_row(
+                    "SELECT value FROM remote_db.meta WHERE key = ?1",
+                    [crate::sync_schema::META_SCHEMA_VERSION],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok()),
+        ) && local_v != remote_v
+        {
+            tracing::warn!(
+                local_schema_version = local_v,
+                remote_schema_version = remote_v,
+                "merging snapshot written under a different canonical schema \
+                 version; columns absent on either side are not exchanged"
+            );
+        }
         for spec in tables {
             // Skip tables the remote snapshot predates (devices upgrade at
             // different times; a fresh local table must not abort the merge
