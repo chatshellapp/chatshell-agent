@@ -16,6 +16,7 @@ pub mod provider_catalog;
 pub mod provider_registry;
 pub mod snapcompact;
 pub mod sync;
+pub mod sync_crypto;
 pub mod sync_schema;
 pub mod thinking;
 pub mod tool_definitions;

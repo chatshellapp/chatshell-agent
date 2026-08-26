@@ -1015,6 +1015,12 @@ uniffi::setup_scaffolding!();
 pub enum SyncError {
     #[error("{message}")]
     Failed { message: String },
+    /// The cloud artifact rejected this device's key material (wrong or
+    /// missing content key — sync group reset elsewhere, rotation we never
+    /// learned). Hosts drop the engine and re-enter the acquisition ladder
+    /// at the passphrase rung (ADR 04 §3 rule 2) — never an error loop.
+    #[error("content key rejected: {message}")]
+    KeyMaterial { message: String },
     #[error("sync engine unavailable (poisoned lock)")]
     Unavailable,
 }
@@ -1026,6 +1032,24 @@ pub struct SyncOutcome {
     pub republished: bool,
 }
 
+/// Map an engine error, preserving the key-material classification that
+/// core's typed `SyncCryptoError` carries through anyhow.
+fn classify_sync_error(e: anyhow::Error) -> SyncError {
+    if let Some(core_err) = e.downcast_ref::<core::sync_crypto::SyncCryptoError>()
+        && matches!(
+            core_err,
+            core::sync_crypto::SyncCryptoError::Auth
+                | core::sync_crypto::SyncCryptoError::UnknownKeyVersion(_)
+        )
+    {
+        return SyncError::KeyMaterial {
+            message: e.to_string(),
+        };
+    }
+    SyncError::Failed {
+        message: e.to_string(),
+    }
+}
 impl From<core::sync::SyncOutcome> for SyncOutcome {
     fn from(outcome: core::sync::SyncOutcome) -> Self {
         Self {
@@ -1053,12 +1077,22 @@ pub struct SyncEngine {
 #[uniffi::export]
 impl SyncEngine {
     /// Open a sync side connection. `cloud_dir` must already exist (the
-    /// device that owns the iCloud container provisions it).
+    /// device that owns the iCloud container provisions it). `cache_dir` is
+    /// the app-private staging directory for decrypted snapshots — never a
+    /// shared temp dir (ADR 04 §1). `crypto` enables encrypted transport;
+    /// `None` keeps the legacy plaintext artifacts (debug staging only).
     #[uniffi::constructor]
-    pub fn new(db_path: String, cloud_dir: String) -> Result<Self, SyncError> {
+    pub fn new(
+        db_path: String,
+        cloud_dir: String,
+        cache_dir: String,
+        crypto: Option<std::sync::Arc<SyncCrypto>>,
+    ) -> Result<Self, SyncError> {
         let engine = core::sync::SyncEngine::new(
             std::path::Path::new(&db_path),
             std::path::PathBuf::from(cloud_dir),
+            std::path::PathBuf::from(cache_dir),
+            crypto.map(|c| c.inner.lock().expect("crypto lock").clone()),
         )
         .map_err(|e| SyncError::Failed {
             message: e.to_string(),
@@ -1074,9 +1108,7 @@ impl SyncEngine {
             .lock()
             .map_err(|_| SyncError::Unavailable)?
             .publish()
-            .map_err(|e| SyncError::Failed {
-                message: e.to_string(),
-            })
+            .map_err(classify_sync_error)
     }
 
     /// One sync pass: merge remote changes, then republish when needed.
@@ -1086,8 +1118,242 @@ impl SyncEngine {
             .map_err(|_| SyncError::Unavailable)?
             .sync_now()
             .map(Into::into)
-            .map_err(|e| SyncError::Failed {
-                message: e.to_string(),
-            })
+            .map_err(classify_sync_error)
+    }
+
+    /// The engine's current content-key chain (may have gained carried
+    /// slots after a pass saw a rotated remote header), serialized for the
+    /// device-local cache file. `None` when this engine does not encrypt.
+    pub fn sync_crypto_chain(&self) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|engine| engine.crypto().map(|c| c.keys().encode()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport encryption (ADR 04). One cryptographic implementation shared by
+// every platform; the host owns Keychain access and file IO.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum SyncCryptoError {
+    #[error("{message}")]
+    Failed { message: String },
+    #[error("artifact is corrupt or foreign: {message}")]
+    Corrupt { message: String },
+    #[error("unsupported transport format version {version}")]
+    UnsupportedFormat { version: u16 },
+    #[error("content key version {version} is not held on this device")]
+    UnknownKeyVersion { version: u32 },
+    #[error("decryption failed (wrong key or tampered data)")]
+    Auth,
+    #[error("wrong passphrase")]
+    WrongPassphrase,
+}
+
+impl From<core::sync_crypto::SyncCryptoError> for SyncCryptoError {
+    fn from(e: core::sync_crypto::SyncCryptoError) -> Self {
+        match e {
+            core::sync_crypto::SyncCryptoError::Corrupt(m) => {
+                SyncCryptoError::Corrupt { message: m }
+            }
+            core::sync_crypto::SyncCryptoError::UnsupportedFormat(v) => {
+                SyncCryptoError::UnsupportedFormat { version: v }
+            }
+            core::sync_crypto::SyncCryptoError::UnknownKeyVersion(v) => {
+                SyncCryptoError::UnknownKeyVersion { version: v }
+            }
+            core::sync_crypto::SyncCryptoError::Auth => SyncCryptoError::Auth,
+            core::sync_crypto::SyncCryptoError::WrongPassphrase => SyncCryptoError::WrongPassphrase,
+            other => SyncCryptoError::Failed {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+/// Generate a high-entropy diceware-style sync passphrase (shown once with
+/// save guidance; never stored by the app — ADR 04 §3).
+#[uniffi::export]
+pub fn generate_sync_passphrase() -> String {
+    core::sync_crypto::generate_passphrase()
+}
+
+/// Serialize a single-entry chain (Keychain adoption: the item holds only
+/// the current key; its version comes from the artifact header). Keeps the
+/// cache format owned by Rust.
+#[uniffi::export]
+pub fn sync_chain_from_single_key(
+    version: u32,
+    key_b64: String,
+) -> Result<Vec<u8>, SyncCryptoError> {
+    use base64::{Engine as _, engine::general_purpose};
+    let key: [u8; core::sync_crypto::CK_LEN] = general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| SyncCryptoError::Failed {
+            message: "content key must be base64 of 32 bytes".into(),
+        })?
+        .try_into()
+        .map_err(|_| SyncCryptoError::Failed {
+            message: "content key must be base64 of 32 bytes".into(),
+        })?;
+    let keys = core::sync_crypto::ContentKeys::from_entries(vec![(version, key)])?;
+    Ok(keys.encode())
+}
+
+/// Plaintext header of an encrypted artifact, minus the slot payloads
+/// (hosts never need raw slot bytes — `SyncCrypto.from_chain` re-carries
+/// them from the artifact path itself).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ArtifactHeaderInfo {
+    pub sync_version: String,
+    pub schema_version: u64,
+    pub key_version: u32,
+    pub icloud_slot: bool,
+}
+
+#[uniffi::export]
+pub fn read_artifact_header_info(path: String) -> Result<ArtifactHeaderInfo, SyncCryptoError> {
+    let header = core::sync_crypto::read_artifact_header(std::path::Path::new(&path))?;
+    Ok(ArtifactHeaderInfo {
+        sync_version: header.sync_version,
+        schema_version: header.schema_version,
+        key_version: header.key_version,
+        icloud_slot: header.icloud_slot,
+    })
+}
+
+/// Transport-encryption state for one sync group: the content-key chain
+/// plus the Argon2id slot bytes carried in artifact headers. Hosts keep the
+/// chain in their own cache (`chain_bytes`) and the current key in a
+/// dedicated iCloud Keychain synchronizable item (`current_key_b64`).
+#[derive(uniffi::Object)]
+pub struct SyncCrypto {
+    inner: std::sync::Mutex<core::sync_crypto::SyncCrypto>,
+}
+
+#[uniffi::export]
+impl SyncCrypto {
+    /// First device of a sync group: mint a content key and wrap it under
+    /// the group passphrase (required even on Apple platforms so the
+    /// fallback exists when the Keychain slot fails — ADR 04 §3 rule 1).
+    #[uniffi::constructor]
+    pub fn bootstrap(passphrase: String) -> Result<Self, SyncCryptoError> {
+        let inner = core::sync_crypto::SyncCrypto::bootstrap(&passphrase)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
+    }
+
+    /// Rebuild from the device-local chain cache. When `artifact_path`
+    /// points at an existing remote artifact, its Argon2id slots are
+    /// carried forward verbatim so passphrase-only peers keep their
+    /// fallback (Apple platforms always set the marker slot).
+    #[uniffi::constructor]
+    pub fn from_chain(
+        chain: Vec<u8>,
+        artifact_path: Option<String>,
+    ) -> Result<Self, SyncCryptoError> {
+        let keys = core::sync_crypto::ContentKeys::decode(&chain)?;
+        let slots = match artifact_path.as_deref().filter(|p| !p.is_empty()) {
+            Some(path) => {
+                let header = core::sync_crypto::read_artifact_header(std::path::Path::new(path))?;
+                header.slots
+            }
+            None => Vec::new(),
+        };
+        let inner = core::sync_crypto::SyncCrypto::from_keys(keys, slots, true)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
+    }
+
+    /// Passphrase rung of the acquisition ladder: unwrap every slot of the
+    /// remote artifact header into the full chain (unioned with a locally
+    /// cached chain when supplied), e.g. after a rotation elsewhere or a
+    /// sync-group reset.
+    #[uniffi::constructor]
+    pub fn unlock_from_artifact(
+        artifact_path: String,
+        passphrase: String,
+        known_chain: Option<Vec<u8>>,
+    ) -> Result<Self, SyncCryptoError> {
+        let header = core::sync_crypto::read_artifact_header(std::path::Path::new(&artifact_path))?;
+        let known = match known_chain {
+            Some(bytes) => Some(core::sync_crypto::ContentKeys::decode(&bytes)?),
+            None => None,
+        };
+        let inner = core::sync_crypto::SyncCrypto::from_passphrase(
+            &header,
+            &passphrase,
+            known.as_ref(),
+            true,
+        )?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
+    }
+
+    /// Serialized chain for the device-local cache file.
+    pub fn chain_bytes(&self) -> Vec<u8> {
+        self.inner.lock().expect("crypto lock").keys().encode()
+    }
+
+    /// Highest chain version — used for every new write.
+    pub fn current_key_version(&self) -> u32 {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .keys()
+            .current_version()
+    }
+
+    /// Explicit user action (suspected compromise, lost device): mint the
+    /// next CK under the passphrase. Forward-only revocation — ADR 04 §5.
+    /// The carried slots come from the artifact the object was built with,
+    /// so the caller must publish promptly after rotating.
+    pub fn rotate(&self, passphrase: String) -> Result<(), SyncCryptoError> {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .rotate(passphrase.trim())
+            .map_err(Into::into)
+    }
+
+    /// Base64 of the current content key, for the dedicated iCloud
+    /// Keychain synchronizable item (separate from the master key's item).
+    pub fn current_key_b64(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose};
+        general_purpose::STANDARD
+            .encode(self.inner.lock().expect("crypto lock").keys().current_key())
+    }
+
+    /// Encrypt attachment bytes for the blob sidecar (`BlobStore` stays
+    /// IO-only; this is the single crypto implementation).
+    pub fn encrypt_blob(
+        &self,
+        digest_hex: String,
+        plaintext: Vec<u8>,
+    ) -> Result<Vec<u8>, SyncCryptoError> {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .encrypt_blob(&digest_hex, &plaintext)
+            .map_err(Into::into)
+    }
+
+    /// Decrypt a blob sidecar (verifies the content hash after decrypt).
+    pub fn decrypt_blob(
+        &self,
+        digest_hex: String,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, SyncCryptoError> {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .decrypt_blob(&digest_hex, &ciphertext)
+            .map_err(Into::into)
     }
 }

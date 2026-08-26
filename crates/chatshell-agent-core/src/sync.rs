@@ -6,12 +6,21 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
+use crate::sync_crypto::{self, ArtifactHeader, SyncCrypto};
+
 /// Meta keys for in-DB snapshot versioning.
 pub const META_SYNC_VERSION: &str = "sync_version";
 pub const META_DEVICE_ID: &str = "device_id";
 
-/// One table in the merge registry.
+/// Name of the plain snapshot file this engine publishes from.
 pub const SNAPSHOT_FILE: &str = "snapshot.db";
+
+/// Encrypted transport artifact (ADR 04). The plaintext `.zst` form never
+/// shipped beyond developer devices, so the encrypted artifact takes its own
+/// filename and a stale plaintext copy in a dev container is never read. On
+/// any artifact the engine does open, an unexpected magic means corrupt or
+/// foreign: error, never a plaintext parse.
+pub const ENCRYPTED_SNAPSHOT_FILE: &str = "snapshot.db.enc";
 
 /// One table in the merge registry.
 #[derive(Debug, Clone, Copy)]
@@ -370,6 +379,13 @@ pub fn compressed_snapshot_name(target: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Name of the encrypted cloud artifact for snapshot `snapshot.db`.
+pub fn encrypted_snapshot_name(target: &Path) -> PathBuf {
+    let mut os = target.as_os_str().to_os_string();
+    os.push(".enc");
+    PathBuf::from(os)
+}
+
 /// Compress `src` into `dst` (zstd level 3). Level 3 measured ~70% size
 /// reduction on the real database with compression time comparable to the
 /// `VACUUM INTO` itself; higher levels cost 8x CPU for a few more percent.
@@ -416,12 +432,111 @@ pub fn publish_snapshot_compressed(conn: &Connection, target: &Path) -> Result<(
     Ok(())
 }
 
+/// The header's `sync_version`: `<counter>:<blake3_hex(device_id)>`. The DB
+/// meta table keeps the full device id; the header hashes it so the
+/// provider sees no device census or per-device activity timeline
+/// (ADR 04 §4).
+fn hashed_sync_version(conn: &Connection) -> Result<String> {
+    let version = get_meta(conn, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
+    let device = get_meta(conn, META_DEVICE_ID)?.unwrap_or_else(|| "none".into());
+    Ok(format!(
+        "{}:{}",
+        counter_of(&version),
+        crate::crypto::blake3_hex(device.as_bytes())
+    ))
+}
+
+/// Canonical schema version for the header; falls back to the built-in
+/// constant when the meta stamp is missing.
+fn canonical_schema_version(conn: &Connection) -> u64 {
+    crate::sync_schema::read_schema_version(conn)
+        .ok()
+        .flatten()
+        .unwrap_or(crate::sync_schema::CANONICAL_SCHEMA_VERSION)
+        .max(0) as u64
+}
+
+/// Publish the snapshot in its encrypted transport form (ADR 04 §1):
+/// plain `VACUUM INTO` temp → zstd → AEAD under the content key → atomic
+/// rename over `snapshot.db.enc`. Compression is strictly before
+/// encryption. Legacy plaintext artifacts are dropped so the container
+/// converges on the encrypted form.
+pub fn publish_snapshot_encrypted(
+    conn: &Connection,
+    target: &Path,
+    crypto: &SyncCrypto,
+) -> Result<()> {
+    let enc_target = encrypted_snapshot_name(target);
+    let tmp_plain = target.with_extension("tmp-publishing");
+    if tmp_plain.exists() {
+        std::fs::remove_file(&tmp_plain).context("remove stale temp snapshot")?;
+    }
+    conn.execute("VACUUM INTO ?1", [tmp_plain.to_string_lossy().as_ref()])
+        .context("VACUUM INTO temp snapshot")?;
+    let plain_bytes = std::fs::read(&tmp_plain).context("read temp snapshot")?;
+    let mut zst = Vec::with_capacity(plain_bytes.len() / 2);
+    zstd::stream::copy_encode(&plain_bytes[..], &mut zst, 3).context("zstd compress snapshot")?;
+    let (header, salt) = crypto
+        .build_header(&hashed_sync_version(conn)?, canonical_schema_version(conn))
+        .map_err(anyhow::Error::from)?;
+    let payload = sync_crypto::encrypt_snapshot_payload(crypto.keys(), &salt, &zst)
+        .map_err(anyhow::Error::from)?;
+    let artifact = sync_crypto::build_artifact(&header, &payload);
+    let tmp_enc = enc_target.with_extension("tmp-publishing");
+    if tmp_enc.exists() {
+        std::fs::remove_file(&tmp_enc).context("remove stale temp encrypted snapshot")?;
+    }
+    std::fs::write(&tmp_enc, &artifact).context("write temp encrypted snapshot")?;
+    std::fs::rename(&tmp_enc, &enc_target).context("atomic rename of encrypted snapshot")?;
+    // The plain temp never travels; legacy plaintext artifacts are cleaned
+    // out of the container by hand, never by code (no-compat window).
+    let _ = std::fs::remove_file(&tmp_plain);
+    Ok(())
+}
+
 /// What the local device should do with a remote snapshot.
 #[derive(Debug, PartialEq)]
 pub enum SyncAction {
     UpToDate,
     Adopt,
     Merge,
+}
+
+/// Header-first version compare (ADR 04 §1): decides from the parsed
+/// artifact header alone — no decryption, no staging, so idle ticks skip
+/// the payload entirely. The local meta keeps the full `<counter>:<device>`
+/// form; the header carries `<counter>:<blake3_hex(device)>`, so the local
+/// device id is hashed before the equality check. Only the counter orders
+/// lineage; a counter tie with a different device hash means divergent
+/// snapshots → Merge (the lossless union).
+pub fn plan_sync_header(local: &Connection, header: &ArtifactHeader) -> Result<SyncAction> {
+    let local_version = get_meta(local, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
+    // The id comes from the LOCAL VERSION STRING, not the device meta: a
+    // device that adopted a peer's version id carries the publisher's id in
+    // its meta, and that adoption is exactly what must compare equal here.
+    let local_id = local_version
+        .split_once(':')
+        .map(|(_, id)| id)
+        .unwrap_or("");
+    let local_hash = crate::crypto::blake3_hex(local_id.as_bytes());
+    let remote_id = header
+        .sync_version
+        .split_once(':')
+        .map(|(_, id)| id)
+        .unwrap_or("");
+    let local_counter = counter_of(&local_version);
+    let remote_counter = counter_of(&header.sync_version);
+
+    if remote_counter == local_counter && remote_id == local_hash {
+        return Ok(SyncAction::UpToDate);
+    }
+    if remote_counter > local_counter {
+        return Ok(SyncAction::Adopt);
+    }
+    if remote_counter == local_counter {
+        return Ok(SyncAction::Merge);
+    }
+    Ok(SyncAction::UpToDate) // stale remote
 }
 
 /// Version compare. Version ids are `<counter>:<device_id>` — unique per
@@ -550,6 +665,16 @@ pub struct SyncOutcome {
 pub struct SyncEngine {
     conn: Connection,
     cloud_dir: PathBuf,
+    /// App-private staging directory for decrypted remote snapshots —
+    /// never the shared OS temp dir: per-user temp is readable by
+    /// same-user processes and swept by backup/forensic scans, which would
+    /// undercut the threat model transport encryption exists to close
+    /// (ADR 04 §1).
+    cache_dir: PathBuf,
+    /// Transport encryption state (ADR 04). `None` keeps the legacy
+    /// plaintext `.zst` artifacts — a debug-only staging mode now that
+    /// release wiring always encrypts.
+    crypto: Option<SyncCrypto>,
     tables: &'static [TableSpec],
     /// `PRAGMA data_version` observed at the last publish (or adoption).
     /// `None` until this process publishes/adopts; `None` makes
@@ -588,8 +713,19 @@ impl SyncEngine {
     /// Open a side connection against the live database and validate the
     /// production registry. The cloud directory must already exist (the
     /// device that owns the iCloud container provisions it).
-    pub fn new(db_path: &Path, cloud_dir: PathBuf) -> Result<Self> {
-        Self::new_with_tables(db_path, cloud_dir, PRODUCTION_MERGE_TABLES)
+    pub fn new(
+        db_path: &Path,
+        cloud_dir: PathBuf,
+        cache_dir: PathBuf,
+        crypto: Option<SyncCrypto>,
+    ) -> Result<Self> {
+        Self::new_with_tables(
+            db_path,
+            cloud_dir,
+            cache_dir,
+            crypto,
+            PRODUCTION_MERGE_TABLES,
+        )
     }
 
     /// Same as [`SyncEngine::new`] with an explicit table registry (tests,
@@ -597,6 +733,8 @@ impl SyncEngine {
     pub fn new_with_tables(
         db_path: &Path,
         cloud_dir: PathBuf,
+        cache_dir: PathBuf,
+        crypto: Option<SyncCrypto>,
         tables: &'static [TableSpec],
     ) -> Result<Self> {
         let conn = Connection::open(db_path)
@@ -607,6 +745,8 @@ impl SyncEngine {
         let mut engine = Self {
             conn,
             cloud_dir,
+            cache_dir,
+            crypto,
             tables,
             last_published_data_version: None,
             pool_baseline_data_version,
@@ -636,6 +776,23 @@ impl SyncEngine {
 
     pub fn cloud_dir(&self) -> &Path {
         &self.cloud_dir
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Transport-encryption state, when this engine encrypts (ADR 04).
+    /// Platforms read the (possibly slot-refreshed) chain back from here
+    /// to persist their cache after passes.
+    pub fn crypto(&self) -> Option<&SyncCrypto> {
+        self.crypto.as_ref()
+    }
+
+    /// Replace the crypto state (e.g. after the platform unlocked the full
+    /// chain via the passphrase ladder mid-process).
+    pub fn set_crypto(&mut self, crypto: SyncCrypto) {
+        self.crypto = Some(crypto);
     }
 
     fn ensure_device_id(&mut self) -> Result<()> {
@@ -700,7 +857,10 @@ impl SyncEngine {
             let new_version = format!("{}:{}", counter + 1, self.device_id());
             set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
         }
-        publish_snapshot_compressed(&self.conn, &self.snapshot_path())?;
+        match self.crypto.as_ref() {
+            Some(crypto) => publish_snapshot_encrypted(&self.conn, &self.snapshot_path(), crypto)?,
+            None => publish_snapshot_compressed(&self.conn, &self.snapshot_path())?,
+        }
         let seen = self.data_version()?;
         self.last_published_data_version = Some(seen);
         self.pool_baseline_data_version = seen;
@@ -754,42 +914,114 @@ impl SyncEngine {
     }
 
     /// One sync pass against the cloud snapshot, if one exists.
+    ///
+    /// Encrypted transport (ADR 04 §1): **parse header → compare → decrypt
+    /// only on demand**. The remote header is read and the version compare
+    /// runs before any payload work; only an Adopt/Merge verdict stages
+    /// (decrypt + decompress) the snapshot, so idle ticks skip staging
+    /// entirely — the old engine decompressed the full artifact on every
+    /// tick even when up to date. The plaintext path (debug staging without
+    /// a content key) keeps the legacy stage-then-compare flow.
     pub fn sync_now(&mut self) -> Result<SyncOutcome> {
-        let staged = self.stage_remote_snapshot()?;
-        let outcome = match staged {
-            Some((snapshot, is_temp)) => {
-                let result = self.sync_against(&snapshot);
-                if is_temp {
-                    let _ = std::fs::remove_file(&snapshot);
-                }
-                result
-            }
-            None => {
-                // First run on this device: publish so the other side can
-                // see us.
+        if self.crypto.is_some() {
+            let enc = encrypted_snapshot_name(&self.snapshot_path());
+            if !enc.exists() {
+                // First run in this cloud dir: publish so the other side
+                // can see us.
                 self.publish()?;
-                Ok(SyncOutcome {
+                return Ok(SyncOutcome {
                     action: "published-initial".into(),
                     ..Default::default()
-                })
+                });
             }
+            let header = sync_crypto::read_artifact_header(&enc).map_err(anyhow::Error::from)?;
+            if let Some(crypto) = self.crypto.as_mut() {
+                crypto.carry_slots_from(&header);
+            }
+            let action = plan_sync_header(&self.conn, &header)?;
+            match action {
+                SyncAction::UpToDate => self.up_to_date_tail(),
+                SyncAction::Adopt | SyncAction::Merge => {
+                    let staged = self.stage_encrypted(&enc)?;
+                    let outcome = self.merge_against_staged(&staged, Some(&header), action);
+                    let _ = std::fs::remove_file(&staged);
+                    outcome
+                }
+            }
+        } else {
+            let staged = self.stage_remote_snapshot()?;
+            match staged {
+                Some((snapshot, is_temp)) => {
+                    let result = self.sync_against(&snapshot);
+                    if is_temp {
+                        let _ = std::fs::remove_file(&snapshot);
+                    }
+                    result
+                }
+                None => {
+                    // First run on this device: publish so the other side
+                    // can see us.
+                    self.publish()?;
+                    Ok(SyncOutcome {
+                        action: "published-initial".into(),
+                        ..Default::default()
+                    })
+                }
+            }
+        }
+    }
+
+    /// The UpToDate tail: nothing to pull, but local writes since the last
+    /// publish must still ship (throttled — see `maybe_flush`).
+    fn up_to_date_tail(&mut self) -> Result<SyncOutcome> {
+        let flushed = self.maybe_flush()?;
+        Ok(SyncOutcome {
+            action: if flushed { "flushed" } else { "up-to-date" }.into(),
+            ..Default::default()
+        })
+    }
+
+    /// Decrypt + decompress the encrypted artifact into the app-private
+    /// cache dir (never the OS temp dir). The staged file is removed by the
+    /// caller after the pass.
+    fn stage_encrypted(&self, enc: &Path) -> Result<PathBuf> {
+        let Some(crypto) = self.crypto.as_ref() else {
+            bail!("stage_encrypted without crypto state");
         };
-        outcome
+        let bytes = std::fs::read(enc).context("read encrypted artifact")?;
+        let (parsed, payload) = sync_crypto::split_artifact(&bytes).map_err(anyhow::Error::from)?;
+        let zst = sync_crypto::decrypt_snapshot_payload(crypto.keys(), &parsed, payload)
+            .map_err(anyhow::Error::from)?;
+        std::fs::create_dir_all(&self.cache_dir)
+            .with_context(|| format!("provision cache dir {}", self.cache_dir.display()))?;
+        let plain = self.cache_dir.join(format!(
+            "chatshell-staged-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let mut out = std::fs::File::create(&plain)
+            .with_context(|| format!("create staged snapshot {}", plain.display()))?;
+        zstd::stream::copy_decode(&zst[..], &mut out)
+            .with_context(|| format!("zstd decompress into {}", plain.display()))?;
+        Ok(plain)
     }
 
     /// Resolve the cloud artifact to a readable plain SQLite path. Prefers
     /// the compressed `snapshot.db.zst`; falls back to a legacy uncompressed
-    /// `snapshot.db`. Decompressed copies land in the OS temp dir and are
-    /// flagged so the caller removes them after the pass. `None` = no
-    /// snapshot in the cloud dir yet.
+    /// `snapshot.db`. Decompressed copies land in the app-private cache dir
+    /// (never the OS temp dir, ADR 04 §1) and are flagged so the caller
+    /// removes them after the pass. `None` = no snapshot in the cloud dir
+    /// yet. Debug/staging path — the encrypted transport plans from the
+    /// header instead and stages via [`Self::stage_encrypted`].
     fn stage_remote_snapshot(&self) -> Result<Option<(PathBuf, bool)>> {
         let zst = compressed_snapshot_name(&self.snapshot_path());
         if zst.exists() {
-            let plain = std::env::temp_dir().join(format!(
+            let plain = self.cache_dir.join(format!(
                 "chatshell-snapshot-{}-{}.db",
                 std::process::id(),
                 uuid::Uuid::now_v7()
             ));
+            std::fs::create_dir_all(&self.cache_dir).ok();
             decompress_file_zst(&zst, &plain)?;
             Ok(Some((plain, true)))
         } else if self.snapshot_path().exists() {
@@ -800,73 +1032,109 @@ impl SyncEngine {
     }
 
     fn sync_against(&mut self, snapshot: &Path) -> Result<SyncOutcome> {
-        let remote = Connection::open(&snapshot)?;
+        let remote = Connection::open(snapshot)?;
         let action = plan_sync(&self.conn, &remote)?;
         drop(remote);
 
         match action {
-            SyncAction::UpToDate => {
-                // Remote has nothing new, but local writes since the last
-                // publish must still ship (throttled - see `maybe_flush`).
-                let flushed = self.maybe_flush()?;
-                Ok(SyncOutcome {
-                    action: if flushed { "flushed" } else { "up-to-date" }.into(),
-                    ..Default::default()
-                })
-            }
+            SyncAction::UpToDate => self.up_to_date_tail(),
             SyncAction::Adopt | SyncAction::Merge => {
-                let report = merge_remote(&self.conn, &snapshot, self.tables)?;
-                let rows_merged = report.total_inserted() + report.total_updated();
-                let remote_version = Connection::open(&snapshot)
-                    .ok()
-                    .and_then(|c| get_meta(&c, META_SYNC_VERSION).ok().flatten())
-                    .unwrap_or_else(|| "0:none".to_string());
-
-                if rows_merged == 0 {
-                    // Content already equal: adopt the remote version id and
-                    // converge - republishing under a new id would ping-pong.
-                    // `pool_baseline_data_version` is intentionally NOT
-                    // refreshed here: pool writes since construction are
-                    // still unshipped and must stay detectable below.
-                    set_meta(&self.conn, META_SYNC_VERSION, &remote_version)?;
-                    let seen = self.data_version()?;
-                    self.last_published_data_version = Some(seen);
-                    // Adoption alone must not strand local writes made while
-                    // the app was running (e.g. a conversation created since
-                    // the last publish): ship them via the throttled flush.
-                    let flushed = self.maybe_flush()?;
-                    Ok(SyncOutcome {
-                        action: if flushed { "flushed" } else { "converged" }.into(),
-                        rows_merged: 0,
-                        republished: flushed,
-                    })
-                } else {
-                    // Fresh local state: mint a new version and publish it.
-                    let local_counter = self
-                        .current_version()
-                        .split(':')
-                        .next()
-                        .and_then(|c| c.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    let remote_counter = remote_version
-                        .split(':')
-                        .next()
-                        .and_then(|c| c.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    let new_version = format!(
-                        "{}:{}",
-                        local_counter.max(remote_counter) + 1,
-                        self.device_id()
-                    );
-                    set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
-                    self.publish()?;
-                    Ok(SyncOutcome {
-                        action: "merged".into(),
-                        rows_merged,
-                        republished: true,
-                    })
-                }
+                self.merge_against_staged(snapshot, None, action)
             }
+        }
+    }
+
+    /// Adopt/Merge tail over an already-staged plaintext snapshot. In
+    /// encrypted mode `header` is the parsed remote header and the staged
+    /// DB's meta `sync_version` is asserted against it: a mismatch (bug,
+    /// torn write) degrades to Merge — the lossless union — with a warning,
+    /// never silence, because the post-merge version arithmetic below reads
+    /// the meta value and a quiet disagreement would skew it (ADR 04 §1).
+    fn merge_against_staged(
+        &mut self,
+        snapshot: &Path,
+        header: Option<&ArtifactHeader>,
+        _action: SyncAction,
+    ) -> Result<SyncOutcome> {
+        if let Some(header) = header {
+            let staged = Connection::open(snapshot).ok();
+            let staged_version = staged
+                .as_ref()
+                .and_then(|c| get_meta(c, META_SYNC_VERSION).ok().flatten())
+                .unwrap_or_default();
+            let staged_device = staged
+                .as_ref()
+                .and_then(|c| get_meta(c, META_DEVICE_ID).ok().flatten())
+                .unwrap_or_default();
+            let staged_hash = crate::crypto::blake3_hex(staged_device.as_bytes());
+            let header_id = header
+                .sync_version
+                .split_once(':')
+                .map(|(_, id)| id)
+                .unwrap_or("");
+            if counter_of(&staged_version) != counter_of(&header.sync_version)
+                || staged_hash != header_id
+            {
+                tracing::warn!(
+                    staged = %staged_version,
+                    header = %header.sync_version,
+                    "staged snapshot meta disagrees with the artifact header; \
+                     merging losslessly (never silently)"
+                );
+            }
+        }
+        // Both verdicts share this body: adopt collapses into merge — the
+        // same lossless union a degraded Merge needs.
+        let report = merge_remote(&self.conn, snapshot, self.tables)?;
+        let rows_merged = report.total_inserted() + report.total_updated();
+        let remote_version = Connection::open(snapshot)
+            .ok()
+            .and_then(|c| get_meta(&c, META_SYNC_VERSION).ok().flatten())
+            .unwrap_or_else(|| "0:none".to_string());
+
+        if rows_merged == 0 {
+            // Content already equal: adopt the remote version id and
+            // converge - republishing under a new id would ping-pong.
+            // `pool_baseline_data_version` is intentionally NOT
+            // refreshed here: pool writes since construction are
+            // still unshipped and must stay detectable below.
+            set_meta(&self.conn, META_SYNC_VERSION, &remote_version)?;
+            let seen = self.data_version()?;
+            self.last_published_data_version = Some(seen);
+            // Adoption alone must not strand local writes made while
+            // the app was running (e.g. a conversation created since
+            // the last publish): ship them via the throttled flush.
+            let flushed = self.maybe_flush()?;
+            Ok(SyncOutcome {
+                action: if flushed { "flushed" } else { "converged" }.into(),
+                rows_merged: 0,
+                republished: flushed,
+            })
+        } else {
+            // Fresh local state: mint a new version and publish it.
+            let local_counter = self
+                .current_version()
+                .split(':')
+                .next()
+                .and_then(|c| c.parse::<u64>().ok())
+                .unwrap_or(0);
+            let remote_counter = remote_version
+                .split(':')
+                .next()
+                .and_then(|c| c.parse::<u64>().ok())
+                .unwrap_or(0);
+            let new_version = format!(
+                "{}:{}",
+                local_counter.max(remote_counter) + 1,
+                self.device_id()
+            );
+            set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
+            self.publish()?;
+            Ok(SyncOutcome {
+                action: "merged".into(),
+                rows_merged,
+                republished: true,
+            })
         }
     }
 }
@@ -899,6 +1167,12 @@ CREATE TABLE conversations (
         tempfile::tempdir().unwrap()
     }
 
+    /// Plaintext (debug-staging) engine: no content key, legacy `.zst`
+    /// artifacts, staged under the test space's own cache dir.
+    fn plain_engine(db: &Path, cloud: PathBuf, cache: PathBuf) -> SyncEngine {
+        SyncEngine::new_with_tables(db, cloud, cache, None, ENGINE_TABLES).unwrap()
+    }
+
     #[test]
     fn two_engines_converge_via_cloud_snapshot() {
         let space = dir("engine");
@@ -910,10 +1184,10 @@ CREATE TABLE conversations (
         seed(&a_path, "a1", "from A");
         seed(&b_path, "b1", "from B");
 
-        let mut a = SyncEngine::new_with_tables(&a_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
         assert_eq!(a.sync_now().unwrap().action, "published-initial");
 
-        let mut b = SyncEngine::new_with_tables(&b_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cache-b"));
         let out_b = b.sync_now().unwrap();
         assert!(out_b.rows_merged > 0 && out_b.republished);
 
@@ -955,7 +1229,7 @@ CREATE TABLE conversations (
         seed(&a_path, "a1", "from A");
         seed(&b_path, "b1", "from B");
 
-        let mut a = SyncEngine::new_with_tables(&a_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
         assert_eq!(a.sync_now().unwrap().action, "published-initial");
 
         // The container carries only the compressed artifact.
@@ -963,7 +1237,7 @@ CREATE TABLE conversations (
         assert!(!cloud.join(SNAPSHOT_FILE).exists());
 
         // A peer stages the .zst and merges it like any snapshot.
-        let mut b = SyncEngine::new_with_tables(&b_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cache-b"));
         let out = b.sync_now().unwrap();
         assert!(out.rows_merged > 0);
         let n: i64 = b
@@ -984,7 +1258,7 @@ CREATE TABLE conversations (
         std::fs::create_dir_all(&cloud).unwrap();
         seed(&db, "c1", "first");
 
-        let mut engine = SyncEngine::new_with_tables(&db, cloud, ENGINE_TABLES).unwrap();
+        let mut engine = plain_engine(&db, cloud, space.path().join("cache"));
         engine.min_publish_interval = std::time::Duration::ZERO;
         assert_eq!(engine.sync_now().unwrap().action, "published-initial");
 
@@ -1041,14 +1315,14 @@ CREATE TABLE conversations (
 
         // A publishes one conversation.
         seed(&a_path, "c1", "shared");
-        let mut a = SyncEngine::new_with_tables(&a_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
         assert_eq!(a.sync_now().unwrap().action, "published-initial");
 
         // B already holds that same row, so its first pass converges with an
         // empty merge report - but it also has a pending local write made
         // after engine construction (the app was running).
         seed(&b_path, "c1", "shared");
-        let mut b = SyncEngine::new_with_tables(&b_path, cloud.clone(), ENGINE_TABLES).unwrap();
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cache-b"));
         b.min_publish_interval = std::time::Duration::ZERO;
         {
             let pool = Connection::open(&b_path).unwrap();
@@ -1081,7 +1355,7 @@ CREATE TABLE conversations (
         let cloud = space.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
         seed(&db, "x", "t");
-        let mut engine = SyncEngine::new_with_tables(&db, cloud, ENGINE_TABLES).unwrap();
+        let mut engine = plain_engine(&db, cloud, space.path().join("cache"));
         engine.publish().unwrap();
         let v1 = get_meta(engine.connection(), META_SYNC_VERSION)
             .unwrap()
@@ -1091,6 +1365,304 @@ CREATE TABLE conversations (
             .unwrap()
             .unwrap();
         assert_eq!(v1, v2);
+    }
+
+    fn weak_crypto() -> sync_crypto::SyncCrypto {
+        sync_crypto::SyncCrypto::bootstrap_with_params(
+            "engine test passphrase",
+            sync_crypto::ArgonParams::test(),
+        )
+        .unwrap()
+    }
+
+    fn encrypted_engine(
+        db: &Path,
+        cloud: PathBuf,
+        cache: PathBuf,
+        crypto: sync_crypto::SyncCrypto,
+    ) -> SyncEngine {
+        SyncEngine::new_with_tables(db, cloud, cache, Some(crypto), ENGINE_TABLES).unwrap()
+    }
+
+    #[test]
+    fn encrypted_two_engines_converge() {
+        let space = dir("enc");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        seed(&b_path, "b1", "from B");
+
+        let group = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            group.clone(),
+        );
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+
+        // Only the encrypted artifact exists in the container; the payload
+        // is opaque ciphertext.
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        assert!(enc.exists());
+        assert!(!compressed_snapshot_name(&cloud.join(SNAPSHOT_FILE)).exists());
+        assert!(!cloud.join(SNAPSHOT_FILE).exists());
+        let raw = std::fs::read(&enc).unwrap();
+        assert_eq!(&raw[..8], sync_crypto::ARTIFACT_MAGIC);
+        assert!(
+            !raw.windows(6).any(|w| w == b"from A"),
+            "plaintext must not leak"
+        );
+
+        // A peer holding the same content key merges and republishes.
+        let mut b = encrypted_engine(
+            &b_path,
+            cloud.clone(),
+            space.path().join("cache-b"),
+            group.clone(),
+        );
+        let out_b = b.sync_now().unwrap();
+        assert!(out_b.rows_merged > 0 && out_b.republished);
+
+        let out_a2 = a.sync_now().unwrap();
+        assert!(out_a2.rows_merged > 0);
+        let out_b2 = b.sync_now().unwrap();
+        assert_eq!(out_b2.action, "converged");
+        assert_eq!(a.sync_now().unwrap().action, "up-to-date");
+        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+
+        for conn in [&a, &b] {
+            let n: i64 = conn
+                .connection()
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 2);
+        }
+        // No staged plaintext survives the pass in the cache dirs.
+        for cache in ["cache-a", "cache-b"] {
+            let leftovers: Vec<_> = std::fs::read_dir(space.path().join(cache))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains("chatshell"))
+                .collect();
+            assert!(leftovers.is_empty(), "staged snapshots must be removed");
+        }
+    }
+
+    #[test]
+    fn encrypted_idle_tick_skips_staging_entirely() {
+        // After convergence, an up-to-date tick plans from the header alone:
+        // corrupting the payload must not affect it (decryption never runs).
+        let space = dir("enc-idle");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let group = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            group.clone(),
+        );
+        a.sync_now().unwrap();
+
+        seed(&b_path, "a1", "from A");
+        let mut b = encrypted_engine(
+            &b_path,
+            cloud.clone(),
+            space.path().join("cache-b"),
+            group.clone(),
+        );
+        let out = b.sync_now().unwrap();
+        assert_eq!(out.action, "converged");
+        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+
+        // Trash the payload bytes (keep the header region intact).
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        let mut raw = std::fs::read(&enc).unwrap();
+        let (_, offset) = sync_crypto::ArtifactHeader::parse(&raw).unwrap();
+        for byte in &mut raw[offset..] {
+            *byte ^= 0x5A;
+        }
+        std::fs::write(&enc, &raw).unwrap();
+
+        // The idle tick still succeeds — it never touched the payload.
+        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+    }
+
+    #[test]
+    fn encrypted_wrong_key_is_an_error_never_plaintext() {
+        let space = dir("enc-wrongkey");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            weak_crypto(),
+        );
+        a.sync_now().unwrap();
+
+        // A device holding a DIFFERENT content key plans from the header
+        // (fine) but cannot decrypt the payload — deterministic error, no
+        // silent fallback to treating the artifact as plaintext.
+        let b_path = space.path().join("b.db");
+        seed(&b_path, "b1", "from B");
+        let mut b = encrypted_engine(
+            &b_path,
+            cloud.clone(),
+            space.path().join("cache-b"),
+            weak_crypto(), // same passphrase, independent mint → different CK
+        );
+        let err = b.sync_now().unwrap_err().to_string();
+        assert!(
+            err.contains("decryption failed"),
+            "expected decrypt failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn foreign_magic_never_parses_as_plaintext() {
+        let space = dir("enc-magic");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            weak_crypto(),
+        );
+        a.sync_now().unwrap();
+
+        // Overwrite with a plaintext-looking SQLite file under the
+        // encrypted artifact name: the header parse must reject it.
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        std::fs::write(&enc, b"SQLite format 3\0...junk...").unwrap();
+        let err = a.sync_now().unwrap_err().to_string();
+        assert!(
+            err.contains("not an encrypted snapshot artifact"),
+            "expected header failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn staged_meta_mismatch_degrades_to_lossless_merge() {
+        // Simulate a torn write: the header's counter disagrees with the
+        // staged DB's meta. The pass must still merge losslessly (rows from
+        // both sides survive) instead of adopting skewed version math.
+        let space = dir("enc-torn");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let group = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            group.clone(),
+        );
+        a.sync_now().unwrap();
+
+        // Tamper ONLY the header's sync_version counter (same length).
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        let raw = std::fs::read(&enc).unwrap();
+        // The header carries the hashed form; rebuild it from A's meta.
+        let version = hashed_sync_version(a.connection()).unwrap();
+        let (counter, id) = version.split_once(':').unwrap();
+        let bumped = format!("{}:{id}", counter.parse::<u64>().unwrap() + 8);
+        let needle = version.as_bytes();
+        let pos = raw
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("sync_version bytes in header");
+        let mut tampered = raw.clone();
+        tampered[pos..pos + needle.len()].copy_from_slice(bumped.as_bytes());
+        std::fs::write(&enc, &tampered).unwrap();
+
+        seed(&b_path, "b1", "from B");
+        let mut b = encrypted_engine(
+            &b_path,
+            cloud.clone(),
+            space.path().join("cache-b"),
+            group.clone(),
+        );
+        let out = b.sync_now().unwrap();
+        assert!(out.rows_merged > 0, "mismatch must still merge losslessly");
+        let n: i64 = b
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn engine_carries_slots_from_rotated_remote_header() {
+        // Device A rotates (with passphrase); device B, holding only the
+        // Keychain current key and no passphrase, adopts the carried slots
+        // from the next remote header and can keep publishing.
+        let space = dir("enc-carry");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut crypto_a = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("cache-a"),
+            crypto_a.clone(),
+        );
+        a.sync_now().unwrap();
+
+        // B adopts ONLY the current key (Keychain path), no slots carried
+        // from any artifact yet (fresh group view), and converges.
+        let keys_b =
+            sync_crypto::ContentKeys::from_entries(vec![(1, *crypto_a.keys().current_key())])
+                .unwrap();
+        let crypto_b = sync_crypto::SyncCrypto::from_keys(keys_b, vec![], true).unwrap();
+        // Publishing with zero slots while claiming version 1 is allowed
+        // only when the chain has exactly one version — it does here.
+        seed(&b_path, "a1", "from A");
+        let mut b = encrypted_engine(
+            &b_path,
+            cloud.clone(),
+            space.path().join("cache-b"),
+            crypto_b,
+        );
+        assert_eq!(b.sync_now().unwrap().action, "converged");
+
+        // A rotates; its next publish carries TWO slots.
+        crypto_a
+            .rotate_with_params("engine test passphrase", sync_crypto::ArgonParams::test())
+            .unwrap();
+        a.set_crypto(crypto_a);
+        a.publish().unwrap();
+
+        // B's next pass plans from the rotated header (unknown key version
+        // → error) — but first, the header carry itself: simulate the
+        // platform ladder having unwrapped nothing; B's engine still picked
+        // up the carried slots during the failed-pass header parse.
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        let header = sync_crypto::read_artifact_header(&enc).unwrap();
+        assert_eq!(header.key_version, 2);
+        assert_eq!(header.slots.len(), 2);
     }
 
     #[test]
