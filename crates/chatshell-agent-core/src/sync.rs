@@ -412,21 +412,25 @@ fn decompress_file_zst(src: &Path, dst: &Path) -> Result<()> {
 /// file. Devices running pre-compression engines are out of scope by design:
 /// this lands inside the migration-free window before any sync-enabled
 /// release ships.
-pub fn publish_snapshot_compressed(conn: &Connection, target: &Path) -> Result<()> {
+pub fn publish_snapshot_compressed(conn: &Connection, target: &Path, staging: &Path) -> Result<()> {
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("provision staging dir {}", staging.display()))?;
     let zst_target = compressed_snapshot_name(target);
-    let tmp_plain = target.with_extension("tmp-publishing");
+    // Plaintext temps stage app-private (see publish_snapshot_encrypted):
+    // the cloud provider uploads whatever appears in the container.
+    // Unique per publish: a fixed name lets two engines (diagnostics, a
+    // future second process) sharing a staging dir delete each other's
+    // VACUUM output mid-write — the read then races a half-written or
+    // zero-extended file and publishes garbage (real-device finding).
+    let tmp_plain = staging.join(format!("snapshot-plain-{}.tmp", uuid::Uuid::now_v7()));
     if tmp_plain.exists() {
         std::fs::remove_file(&tmp_plain).context("remove stale temp snapshot")?;
     }
     conn.execute("VACUUM INTO ?1", [tmp_plain.to_string_lossy().as_ref()])
         .context("VACUUM INTO temp snapshot")?;
-    let tmp_zst = zst_target.with_extension("tmp-publishing");
-    if tmp_zst.exists() {
-        std::fs::remove_file(&tmp_zst).context("remove stale temp compressed snapshot")?;
-    }
+    let tmp_zst = zst_target.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
     compress_file_zst(&tmp_plain, &tmp_zst)?;
     std::fs::rename(&tmp_zst, &zst_target).context("atomic rename of compressed snapshot")?;
-    // The plain artifacts never travel; only `.zst` lives in the container.
     let _ = std::fs::remove_file(&tmp_plain);
     let _ = std::fs::remove_file(target);
     Ok(())
@@ -461,13 +465,29 @@ fn canonical_schema_version(conn: &Connection) -> u64 {
 /// rename over `snapshot.db.enc`. Compression is strictly before
 /// encryption. Legacy plaintext artifacts are dropped so the container
 /// converges on the encrypted form.
+///
+/// `staging` is an app-private directory for the PLAINTEXT temp: the
+/// cloud container must never hold plaintext bytes, not even transiently —
+/// the sync provider uploads whatever appears in the container, so a
+/// plaintext `VACUUM INTO` temp written there can travel (real-device
+/// finding on iOS: bird grabs new container files within seconds). Only
+/// the encrypted temp (harmless if uploaded) and the final artifact are
+/// written into the container; the encrypted temp's rename stays
+/// same-filesystem and therefore atomic.
 pub fn publish_snapshot_encrypted(
     conn: &Connection,
     target: &Path,
+    staging: &Path,
     crypto: &SyncCrypto,
 ) -> Result<()> {
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("provision staging dir {}", staging.display()))?;
     let enc_target = encrypted_snapshot_name(target);
-    let tmp_plain = target.with_extension("tmp-publishing");
+    // Unique per publish: a fixed name lets two engines (diagnostics, a
+    // future second process) sharing a staging dir delete each other's
+    // VACUUM output mid-write — the read then races a half-written or
+    // zero-extended file and publishes garbage (real-device finding).
+    let tmp_plain = staging.join(format!("snapshot-plain-{}.tmp", uuid::Uuid::now_v7()));
     if tmp_plain.exists() {
         std::fs::remove_file(&tmp_plain).context("remove stale temp snapshot")?;
     }
@@ -482,14 +502,13 @@ pub fn publish_snapshot_encrypted(
     let payload = sync_crypto::encrypt_snapshot_payload(crypto.keys(), &salt, &zst)
         .map_err(anyhow::Error::from)?;
     let artifact = sync_crypto::build_artifact(&header, &payload);
-    let tmp_enc = enc_target.with_extension("tmp-publishing");
-    if tmp_enc.exists() {
-        std::fs::remove_file(&tmp_enc).context("remove stale temp encrypted snapshot")?;
-    }
+    // Unique per publish — same rationale as the staging temp: concurrent
+    // engines in one process (or processes sharing the container) must not
+    // rename each other's temp away mid-publish.
+    let tmp_enc = enc_target.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
     std::fs::write(&tmp_enc, &artifact).context("write temp encrypted snapshot")?;
     std::fs::rename(&tmp_enc, &enc_target).context("atomic rename of encrypted snapshot")?;
-    // The plain temp never travels; legacy plaintext artifacts are cleaned
-    // out of the container by hand, never by code (no-compat window).
+    // The plaintext temp lived in app-private storage and never traveled.
     let _ = std::fs::remove_file(&tmp_plain);
     Ok(())
 }
@@ -696,10 +715,37 @@ pub struct SyncEngine {
     /// baseline.
     force_first_flush: bool,
 }
-
 /// Meta key recording whether the previous process ended with a successful
-/// publish. Absent/`0` at construction arms [`SyncEngine::force_first_flush`].
+/// publish (diagnostic only; the forced-flush decision uses
+/// [`META_SHIPPED_ROW_WATERMARK`]).
 const META_CLEAN_EXIT: &str = "sync_clean_exit";
+/// Meta key carrying the row-timestamp watermark (max `updated_at` over
+/// the merge registry) of the last publish; a fresh engine arms a forced
+/// flush when the current watermark differs (audit F2 — data_version is
+/// unusable for this: fresh WAL connections don't observe prior
+/// processes' commits).
+const META_SHIPPED_ROW_WATERMARK: &str = "sync_shipped_row_watermark";
+
+/// Max `updated_at` across the registry's tables ("" when all empty).
+/// RFC3339 stamps compare correctly as strings; the migration guaranteed
+/// `updated_at` on every synced table.
+fn row_watermark(conn: &Connection, tables: &[TableSpec]) -> String {
+    tables
+        .iter()
+        .filter_map(|spec| {
+            conn.query_row(
+                &format!(
+                    "SELECT COALESCE(MAX(updated_at), '') FROM {} WHERE deleted_at IS NULL",
+                    spec.name
+                ),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .max()
+        .unwrap_or_default()
+}
 
 /// Minimum wall-clock spacing between tick-driven publishes. Each publish is
 /// a full `VACUUM INTO` of the database plus a cloud upload, so an idle or
@@ -755,14 +801,21 @@ impl SyncEngine {
             force_first_flush: false,
         };
         engine.ensure_device_id()?;
-        // If the previous process did not end with a successful publish
-        // (killed, crashed, or pre-dating the marker), writes from that
-        // session may never have shipped - arm one forced flush. The first
-        // publish in this process re-arms the "clean" state.
-        let prior_clean = get_meta(&engine.conn, META_CLEAN_EXIT)?
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        engine.force_first_flush = !prior_clean && engine.current_version() != INITIAL_VERSION;
+        // Cross-process unshipped-write detection (audit F2, fixed
+        // 2026-08-27): `PRAGMA data_version` cannot serve here — a fresh
+        // WAL connection does not observe prior processes' commits (the
+        // header change counter only advances at checkpoints; verified
+        // empirically). Instead every publish persists a row-timestamp
+        // watermark (max updated_at over the registry); a fresh engine
+        // arms one forced flush when the current watermark is newer than
+        // the shipped one — some row changed that no publish carried.
+        // This replaces the old clean-exit marker, which missed the
+        // "published cleanly, THEN wrote while the engine was gone" case
+        // (confirmed live twice in real-device testing).
+        let shipped = get_meta(&engine.conn, META_SHIPPED_ROW_WATERMARK)?;
+        let watermark = row_watermark(&engine.conn, engine.tables);
+        engine.force_first_flush = engine.current_version() != INITIAL_VERSION
+            && shipped.as_deref().is_none_or(|seen| seen != watermark);
         set_meta(&engine.conn, META_CLEAN_EXIT, "0")?;
         validate_registry(&engine.conn, engine.tables)
             .context("sync registry validation against live schema")?;
@@ -847,6 +900,23 @@ impl SyncEngine {
     }
 
     fn publish_inner(&mut self, force_bump: bool) -> Result<()> {
+        // Rotation guard: when the live artifact declares a key version
+        // above this engine's chain, publishing would clobber the rotated
+        // artifact with old-key ciphertext and strand every peer holding
+        // the new key (real-device finding: a stale v1 publisher silently
+        // overwrote a v2 rotation). Fail loudly — the ladder owns recovery.
+        if let Some(crypto) = self.crypto.as_ref()
+            && let Ok(header) =
+                sync_crypto::read_artifact_header(&encrypted_snapshot_name(&self.snapshot_path()))
+            && header.key_version > crypto.keys().current_version()
+        {
+            bail!(
+                "refusing to publish under key v{} while the cloud artifact \
+                 is already v{} (rotated elsewhere; unlock required)",
+                crypto.keys().current_version(),
+                header.key_version
+            );
+        }
         if force_bump || self.dirty_since_last_publish()? {
             let counter = self
                 .current_version()
@@ -858,17 +928,31 @@ impl SyncEngine {
             set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
         }
         match self.crypto.as_ref() {
-            Some(crypto) => publish_snapshot_encrypted(&self.conn, &self.snapshot_path(), crypto)?,
-            None => publish_snapshot_compressed(&self.conn, &self.snapshot_path())?,
+            Some(crypto) => publish_snapshot_encrypted(
+                &self.conn,
+                &self.snapshot_path(),
+                &self.cache_dir,
+                crypto,
+            )?,
+            None => {
+                publish_snapshot_compressed(&self.conn, &self.snapshot_path(), &self.cache_dir)?
+            }
         }
         let seen = self.data_version()?;
         self.last_published_data_version = Some(seen);
         self.pool_baseline_data_version = seen;
         self.last_publish_at = Some(std::time::Instant::now());
         // Any successful publish ships everything this process knew about;
-        // the construction-time suspicion is resolved either way.
+        // the construction-time suspicion is resolved either way. Persist
+        // the shipped data_version so the NEXT engine process can detect
+        // writes committed after this publish (audit F2).
         self.force_first_flush = false;
         set_meta(&self.conn, META_CLEAN_EXIT, "1")?;
+        set_meta(
+            &self.conn,
+            META_SHIPPED_ROW_WATERMARK,
+            &row_watermark(&self.conn, self.tables),
+        )?;
         Ok(())
     }
 
@@ -913,15 +997,17 @@ impl SyncEngine {
         Ok(true)
     }
 
-    /// One sync pass against the cloud snapshot, if one exists.
-    ///
-    /// Encrypted transport (ADR 04 §1): **parse header → compare → decrypt
-    /// only on demand**. The remote header is read and the version compare
-    /// runs before any payload work; only an Adopt/Merge verdict stages
-    /// (decrypt + decompress) the snapshot, so idle ticks skip staging
-    /// entirely — the old engine decompressed the full artifact on every
-    /// tick even when up to date. The plaintext path (debug staging without
-    /// a content key) keeps the legacy stage-then-compare flow.
+    /// The UpToDate tail: nothing to pull, but local writes since the last
+    /// publish must still ship (throttled — see `maybe_flush`).
+    fn up_to_date_tail(&mut self) -> Result<SyncOutcome> {
+        let flushed = self.maybe_flush()?;
+        Ok(SyncOutcome {
+            action: if flushed { "flushed" } else { "up-to-date" }.into(),
+            rows_merged: 0,
+            republished: flushed,
+        })
+    }
+
     pub fn sync_now(&mut self) -> Result<SyncOutcome> {
         if self.crypto.is_some() {
             let enc = encrypted_snapshot_name(&self.snapshot_path());
@@ -969,16 +1055,6 @@ impl SyncEngine {
                 }
             }
         }
-    }
-
-    /// The UpToDate tail: nothing to pull, but local writes since the last
-    /// publish must still ship (throttled — see `maybe_flush`).
-    fn up_to_date_tail(&mut self) -> Result<SyncOutcome> {
-        let flushed = self.maybe_flush()?;
-        Ok(SyncOutcome {
-            action: if flushed { "flushed" } else { "up-to-date" }.into(),
-            ..Default::default()
-        })
     }
 
     /// Decrypt + decompress the encrypted artifact into the app-private
@@ -1129,6 +1205,12 @@ impl SyncEngine {
                 self.device_id()
             );
             set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
+            // The mint above IS the version bump; mark the current state
+            // as published-so-far so publish() republishes under THIS id
+            // instead of bumping a second time (audit F4: a fresh process
+            // merged once and shipped +2 counters).
+            let seen = self.data_version()?;
+            self.last_published_data_version = Some(seen);
             self.publish()?;
             Ok(SyncOutcome {
                 action: "merged".into(),
@@ -1171,6 +1253,85 @@ CREATE TABLE conversations (
     /// artifacts, staged under the test space's own cache dir.
     fn plain_engine(db: &Path, cloud: PathBuf, cache: PathBuf) -> SyncEngine {
         SyncEngine::new_with_tables(db, cloud, cache, None, ENGINE_TABLES).unwrap()
+    }
+
+    /// A stale-key holder must not clobber a rotated artifact: the
+    /// publish guard refuses when the live artifact's key version is above
+    /// the engine's chain (real-device finding 2026-08-27).
+    #[test]
+    fn stale_key_publisher_cannot_clobber_rotation() {
+        let space = dir("rot-guard");
+        let db = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let cache = space.path().join("cache");
+        seed(&db, "a1", "seed");
+
+        let passphrase = "rotation guard passphrase";
+        // Device A bootstraps and publishes under v1.
+        let mut a = SyncEngine::new_with_tables(
+            &db,
+            cloud.clone(),
+            cache.clone(),
+            Some(
+                SyncCrypto::bootstrap_with_params(
+                    passphrase,
+                    crate::sync_crypto::ArgonParams::test(),
+                )
+                .unwrap(),
+            ),
+            ENGINE_TABLES,
+        )
+        .unwrap();
+        a.publish().unwrap();
+
+        // Device A rotates to v2 and republishes.
+        a.crypto
+            .as_mut()
+            .unwrap()
+            .rotate_with_params(passphrase, crate::sync_crypto::ArgonParams::test())
+            .unwrap();
+        a.publish().unwrap();
+
+        // Device B still holds only the v1 chain (state cached pre-rotation).
+        let v1_state = {
+            let mut b = SyncEngine::new_with_tables(
+                &db,
+                cloud.clone(),
+                cache.clone(),
+                Some(
+                    SyncCrypto::bootstrap_with_params(
+                        passphrase,
+                        crate::sync_crypto::ArgonParams::test(),
+                    )
+                    .unwrap(),
+                ),
+                ENGINE_TABLES,
+            )
+            .unwrap();
+            b.crypto.as_ref().unwrap().encode_state()
+        };
+        let v1_crypto = SyncCrypto::decode_state(&v1_state).unwrap();
+        let mut b = SyncEngine::new_with_tables(
+            &db,
+            cloud.clone(),
+            cache.join("b"),
+            Some(v1_crypto),
+            ENGINE_TABLES,
+        )
+        .unwrap();
+
+        // The stale v1 engine must refuse to publish over the v2 artifact.
+        let err = b.publish().unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to publish under key"),
+            "unexpected error: {err:#}"
+        );
+        // The artifact on disk is still the rotated v2 one.
+        let header =
+            sync_crypto::read_artifact_header(&encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE)))
+                .unwrap();
+        assert_eq!(header.key_version, 2);
     }
 
     #[test]
@@ -1216,6 +1377,99 @@ CREATE TABLE conversations (
                 .unwrap();
             assert_eq!(n, 2);
         }
+    }
+
+    /// Audit F2: writes committed while no engine existed (previous process
+    /// after its last publish, or a harness) must ship on the next engine's
+    /// first pass — the shipped-data-version marker detects them across
+    /// process boundaries.
+    #[test]
+    fn cross_process_writes_ship_on_next_engine() {
+        let space = dir("f2");
+        let db = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        seed(&db, "f1", "first");
+
+        // Process 1: publish (records the shipped data_version), exit.
+        {
+            let mut e = plain_engine(&db, cloud.clone(), space.path().join("c1"));
+            assert_eq!(e.sync_now().unwrap().action, "published-initial");
+        }
+        let v1 = get_meta(&Connection::open(&db).unwrap(), META_SYNC_VERSION)
+            .unwrap()
+            .unwrap();
+
+        // Writes happen with NO engine alive (another connection commits).
+        let pool = Connection::open(&db).unwrap();
+        pool.execute(
+            "INSERT INTO conversations(id, title, created_at, updated_at)
+             VALUES('f2', 'second', '2026-08-27T12:00:00+00:00', '2026-08-27T12:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        drop(pool);
+
+        // Process 2: the first pass must force-publish the stranded write.
+        let mut e2 = plain_engine(&db, cloud.clone(), space.path().join("c2"));
+        let out = e2.sync_now().unwrap();
+        assert!(
+            out.republished,
+            "stranded cross-process write must ship: {out:?}"
+        );
+        let v2 = get_meta(e2.connection(), META_SYNC_VERSION)
+            .unwrap()
+            .unwrap();
+        assert_ne!(v1, v2, "the forced flush must mint a new version");
+
+        // The write is in the published artifact: a fresh reader merges it.
+        let reader_db = space.path().join("reader.db");
+        seed(&reader_db, "r1", "reader");
+        let mut reader = plain_engine(&reader_db, cloud.clone(), space.path().join("c3"));
+        let out_r = reader.sync_now().unwrap();
+        assert!(out_r.rows_merged >= 1, "{out_r:?}");
+        let n: i64 = reader
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert!(n >= 3, "reader must see the stranded row: {n}");
+    }
+
+    /// Audit F4: a fresh process's first MERGED publish bumps the counter
+    /// exactly once (the old behavior minted max+1 and then bumped again).
+    #[test]
+    fn merged_publish_bumps_counter_once() {
+        let space = dir("f4");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        seed(&a_path, "a1", "from A");
+        seed(&b_path, "b1", "from B");
+
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("ca"));
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+        let v_after_initial = counter_of(
+            &get_meta(a.connection(), META_SYNC_VERSION)
+                .unwrap()
+                .unwrap(),
+        );
+
+        // B's first pass merges A's snapshot and republishes: exactly one
+        // increment over the max it saw (was +2 before the fix).
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cb"));
+        let out = b.sync_now().unwrap();
+        assert!(out.rows_merged > 0 && out.republished);
+        let v_b = counter_of(
+            &get_meta(b.connection(), META_SYNC_VERSION)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            v_b,
+            v_after_initial + 1,
+            "merged publish must bump the counter exactly once"
+        );
     }
 
     #[test]

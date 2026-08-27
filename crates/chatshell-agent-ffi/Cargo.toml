@@ -16,6 +16,7 @@ tls-native = ["chatshell-agent-core/tls-native"]
 rustls = ["chatshell-agent-core/rustls"]
 
 [dependencies]
+zstd.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 chatshell-agent-core = { path = "../chatshell-agent-core", default-features = false }

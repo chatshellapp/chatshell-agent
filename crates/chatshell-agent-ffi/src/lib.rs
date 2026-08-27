@@ -1043,13 +1043,14 @@ fn classify_sync_error(e: anyhow::Error) -> SyncError {
         )
     {
         return SyncError::KeyMaterial {
-            message: e.to_string(),
+            message: format!("{e:#}"),
         };
     }
     SyncError::Failed {
-        message: e.to_string(),
+        message: format!("{e:#}"),
     }
 }
+
 impl From<core::sync::SyncOutcome> for SyncOutcome {
     fn from(outcome: core::sync::SyncOutcome) -> Self {
         Self {
@@ -1226,6 +1227,30 @@ pub fn parse_synchronizable_item(value: String) -> Option<SyncSynchronizableItem
     })
 }
 
+/// Decrypt + decompress an encrypted snapshot artifact into a plain SQLite
+/// file (diagnostics/verification; the payload must be readable with the
+/// given full-state chain).
+#[uniffi::export]
+pub fn decrypt_snapshot_artifact(
+    artifact_path: String,
+    chain: Vec<u8>,
+    output_path: String,
+) -> Result<(), SyncCryptoError> {
+    let state = core::sync_crypto::SyncCrypto::decode_state(&chain)?;
+    let artifact = std::fs::read(&artifact_path).map_err(|e| SyncCryptoError::Failed {
+        message: format!("read artifact: {e}"),
+    })?;
+    let (header, payload) = core::sync_crypto::split_artifact(&artifact)?;
+    let zst = core::sync_crypto::decrypt_snapshot_payload(state.keys(), &header, payload)?;
+    let plain = zstd::stream::decode_all(&zst[..]).map_err(|e| SyncCryptoError::Failed {
+        message: format!("zstd: {e}"),
+    })?;
+    std::fs::write(&output_path, plain).map_err(|e| SyncCryptoError::Failed {
+        message: format!("write: {e}"),
+    })?;
+    Ok(())
+}
+
 /// Plaintext header of an encrypted artifact, minus the slot payloads
 /// (hosts never need raw slot bytes — `SyncCrypto.from_chain` re-carries
 /// them from the artifact path itself).
@@ -1270,33 +1295,31 @@ impl SyncCrypto {
         })
     }
 
-    /// Rebuild from the device-local chain cache. When `artifact_path`
-    /// points at an existing remote artifact, its Argon2id slots are
-    /// carried forward verbatim so passphrase-only peers keep their
-    /// fallback (Apple platforms always set the marker slot).
+    /// Rebuild from the device-local state cache (keys AND wrapped slots —
+    /// the bootstrap device needs its slot to publish the FIRST artifact
+    /// when no artifact exists to carry slots from; real-device finding
+    /// 2026-08-27). When `artifact_path` points at an existing remote
+    /// artifact, any newer slot chain is carried forward (rotation on a
+    /// peer); a missing artifact is not an error — the first device
+    /// publishes before one exists.
     #[uniffi::constructor]
     pub fn from_chain(
         chain: Vec<u8>,
         artifact_path: Option<String>,
     ) -> Result<Self, SyncCryptoError> {
-        let keys = core::sync_crypto::ContentKeys::decode(&chain)?;
-        let slots = match artifact_path.as_deref().filter(|p| !p.is_empty()) {
-            Some(path) => {
-                let header = core::sync_crypto::read_artifact_header(std::path::Path::new(path))?;
-                header.slots
-            }
-            None => Vec::new(),
-        };
-        let inner = core::sync_crypto::SyncCrypto::from_keys(keys, slots, true)?;
+        let mut inner = core::sync_crypto::SyncCrypto::decode_state(&chain)?;
+        if let Some(path) = artifact_path.as_deref().filter(|p| !p.is_empty())
+            && let Ok(header) = core::sync_crypto::read_artifact_header(std::path::Path::new(path))
+        {
+            inner.carry_slots_from(&header);
+        }
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
         })
     }
 
-    /// Passphrase rung of the acquisition ladder: unwrap every slot of the
-    /// remote artifact header into the full chain (unioned with a locally
-    /// cached chain when supplied), e.g. after a rotation elsewhere or a
-    /// sync-group reset.
+    /// Passphrase rung: unwrap the remote artifact's slot chain into the
+    /// full key chain, unioned with the locally cached one.
     #[uniffi::constructor]
     pub fn unlock_from_artifact(
         artifact_path: String,
@@ -1305,7 +1328,11 @@ impl SyncCrypto {
     ) -> Result<Self, SyncCryptoError> {
         let header = core::sync_crypto::read_artifact_header(std::path::Path::new(&artifact_path))?;
         let known = match known_chain {
-            Some(bytes) => Some(core::sync_crypto::ContentKeys::decode(&bytes)?),
+            Some(bytes) => Some(
+                core::sync_crypto::SyncCrypto::decode_state(&bytes)?
+                    .keys()
+                    .clone(),
+            ),
             None => None,
         };
         let inner = core::sync_crypto::SyncCrypto::from_passphrase(
@@ -1319,9 +1346,10 @@ impl SyncCrypto {
         })
     }
 
-    /// Serialized chain for the device-local cache file.
+    /// Serialized full state (keys AND wrapped slots) for the device-local
+    /// cache file.
     pub fn chain_bytes(&self) -> Vec<u8> {
-        self.inner.lock().expect("crypto lock").keys().encode()
+        self.inner.lock().expect("crypto lock").encode_state()
     }
 
     /// Highest chain version — used for every new write.

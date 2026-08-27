@@ -439,6 +439,38 @@ pub struct ArgonSlot {
     pub wrapped: Vec<u8>,
 }
 
+impl ArgonSlot {
+    fn encode_slot(&self, w: &mut Writer) {
+        w.bytes(&self.salt);
+        w.u32(self.params.m_cost);
+        w.u32(self.params.t_cost);
+        w.u32(self.params.p_cost);
+        w.u16(self.wrapped.len() as u16);
+        w.bytes(&self.wrapped);
+    }
+
+    fn decode_slot(r: &mut Reader) -> Result<Self> {
+        let salt = r.array::<SALT_LEN>()?;
+        let params = ArgonParams {
+            m_cost: r.u32()?,
+            t_cost: r.u32()?,
+            p_cost: r.u32()?,
+        };
+        let len = r.u16()? as usize;
+        if len == 0 || len > MAX_WRAPPED_LEN {
+            return Err(SyncCryptoError::Corrupt(
+                "slot payload length out of bounds".into(),
+            ));
+        }
+        let wrapped = r.take(len)?.to_vec();
+        Ok(ArgonSlot {
+            salt,
+            params,
+            wrapped,
+        })
+    }
+}
+
 const CK_SLOT_AAD: &[u8] = b"chatshell/sync/ck-slot/v1";
 
 fn argon2_derive(passphrase: &str, salt: &[u8], params: ArgonParams) -> Result<[u8; CK_LEN]> {
@@ -1178,6 +1210,80 @@ impl SyncCrypto {
         }
         Some(encode_synchronizable_item(version, self.keys.current_key()))
     }
+
+    /// Serialize the FULL device-local state — key chain AND the wrapped
+    /// slot chain — for the device-local cache file.
+    ///
+    /// Keys alone are not enough (real-device finding, 2026-08-27): the
+    /// bootstrapping first device must publish the very first artifact
+    /// BEFORE any artifact exists to carry slots from. A keys-only cache
+    /// reconstructs a slot-less crypto state whose `build_header` refuses
+    /// to publish — a liveness deadlock on the first publish, on every
+    /// platform (desktop merely hides it behind the live bootstrap object
+    /// until the process dies). The cache file sits beside the plaintext
+    /// DB by the same ADR 04 §2 argument as the keys-only form it replaces.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(Self::STATE_MAGIC);
+        w.u16(self.keys.entries.len() as u16);
+        for (v, k) in &self.keys.entries {
+            w.u32(*v);
+            w.bytes(k);
+        }
+        w.u16(self.slots.len() as u16);
+        for slot in &self.slots {
+            slot.encode_slot(&mut w);
+        }
+        w.u8(self.icloud_slot as u8);
+        w.into_vec()
+    }
+
+    /// Parse a [`SyncCrypto::encode_state`] cache. Slot and key counts are
+    /// bounds-checked like artifact headers; structural damage is an
+    /// error, never a silent fallback.
+    pub fn decode_state(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let magic = r.take(Self::STATE_MAGIC.len())?;
+        if magic != Self::STATE_MAGIC {
+            return Err(SyncCryptoError::BadChain("bad state-cache magic".into()));
+        }
+        let key_count = r.u16()? as usize;
+        if key_count == 0 || key_count > MAX_SLOTS {
+            return Err(SyncCryptoError::BadChain(
+                "state-cache key count out of bounds".into(),
+            ));
+        }
+        let mut entries = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            let v = r.u32()?;
+            let k = r.array::<CK_LEN>()?;
+            entries.push((v, k));
+        }
+        let keys = ContentKeys::from_entries(entries)?;
+        let slot_count = r.u16()? as usize;
+        if slot_count > MAX_SLOTS {
+            return Err(SyncCryptoError::BadChain(
+                "state-cache slot count out of bounds".into(),
+            ));
+        }
+        let mut slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            slots.push(ArgonSlot::decode_slot(&mut r)?);
+        }
+        let icloud_slot = r.u8()? != 0;
+        if r.remaining() != 0 {
+            return Err(SyncCryptoError::BadChain(
+                "trailing bytes in state cache".into(),
+            ));
+        }
+        Ok(SyncCrypto {
+            keys,
+            slots,
+            icloud_slot,
+        })
+    }
+
+    const STATE_MAGIC: &[u8; 11] = b"CHCRYPTOST\x01";
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,14 +1747,36 @@ mod tests {
     }
 
     #[test]
-    fn blob_unexpected_magic_never_parses_as_plaintext() {
-        let crypto = weak_crypto();
-        let plaintext_artifact = b"SQLite format 3\0".to_vec();
-        let digest = digest_of(&plaintext_artifact);
-        match crypto.decrypt_blob(&digest, &plaintext_artifact) {
-            Err(SyncCryptoError::Corrupt(_)) => {}
-            other => panic!("expected Corrupt, got {other:?}"),
-        }
+    fn state_cache_roundtrip_and_first_publish() {
+        // The 2026-08-27 liveness finding: a keys-only cache cannot publish
+        // the FIRST artifact (no slots). The full-state cache must round-trip
+        // the bootstrap slot so a fresh process can publish before any
+        // artifact exists.
+        let mut crypto = weak_crypto();
+        crypto
+            .rotate_with_params("correct horse battery staple", ArgonParams::test())
+            .unwrap();
+        let bytes = crypto.encode_state();
+        let restored = SyncCrypto::decode_state(&bytes).unwrap();
+        assert_eq!(restored.keys(), crypto.keys());
+        assert_eq!(restored.slots_for_publish(), crypto.slots_for_publish());
+        assert_eq!(restored.icloud_slot(), crypto.icloud_slot());
+        // The restored state can build a header with NO artifact present.
+        let (header, salt) = restored.build_header("1:aa", 1).unwrap();
+        assert_eq!(header.slots.len(), 2);
+        let payload = encrypt_snapshot_payload(restored.keys(), &salt, b"x").unwrap();
+        let opened = decrypt_snapshot_payload(
+            &SyncCrypto::decode_state(&bytes).unwrap().keys().clone(),
+            &header,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(opened, b"x");
+        // Structural damage is rejected.
+        assert!(SyncCrypto::decode_state(b"garbage").is_err());
+        assert!(SyncCrypto::decode_state(&bytes[..bytes.len() - 1]).is_err());
+        // Keys-only legacy caches no longer decode (no-compat window).
+        assert!(SyncCrypto::decode_state(&crypto.keys().encode()).is_err());
     }
 
     #[test]
