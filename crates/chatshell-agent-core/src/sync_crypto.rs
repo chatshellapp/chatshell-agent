@@ -604,6 +604,40 @@ fn random_ck() -> [u8; CK_LEN] {
 }
 
 // ---------------------------------------------------------------------------
+// Apple-slot synchronizable item (ADR 04 §3, hardened by ADR 05)
+// ---------------------------------------------------------------------------
+
+/// Value format of the Apple-slot synchronizable item:
+/// `v<key version>:<base64(32-byte CK)>`.
+///
+/// The version rides along so the adoption rung can reject a stale item
+/// WITHOUT a decrypt attempt (ADR 05): after a rotation the artifact header
+/// declares a higher key version than the frozen item carries, and rung 1
+/// must fall through to the cached-chain rung instead of installing a
+/// wrong-key engine (which would bounce already-unlocked devices through
+/// the needs-unlock latch and delete their good cached chains).
+///
+/// Legacy bare-base64 values (pre-ADR-05) are rejected by
+/// [`parse_synchronizable_item`] — the no-compat window applies; a device
+/// holding one degrades to a single passphrase unlock, after which the
+/// item is rewritten in this format (version-1 groups only).
+pub fn encode_synchronizable_item(version: u32, key: &[u8; CK_LEN]) -> String {
+    use base64::{Engine as _, engine::general_purpose};
+    format!("v{}:{}", version, general_purpose::STANDARD.encode(key))
+}
+
+/// Parse a synchronizable-item value written by
+/// [`encode_synchronizable_item`]. `None` for anything else: legacy
+/// unversioned values, wrong lengths, malformed prefixes.
+pub fn parse_synchronizable_item(value: &str) -> Option<(u32, [u8; CK_LEN])> {
+    use base64::{Engine as _, engine::general_purpose};
+    let (version_part, key_part) = value.split_once(':')?;
+    let version = version_part.strip_prefix('v')?.parse().ok()?;
+    let bytes = general_purpose::STANDARD.decode(key_part).ok()?;
+    Some((version, bytes.try_into().ok()?))
+}
+
+// ---------------------------------------------------------------------------
 // Artifact header (age-style multi-slot)
 // ---------------------------------------------------------------------------
 
@@ -1028,14 +1062,19 @@ impl SyncCrypto {
     }
 
     pub fn rotate_with_params(&mut self, passphrase: &str, params: ArgonParams) -> Result<()> {
-        let ck = self.keys.rotate();
-        let slot = wrap_ck(&ck, passphrase, params)?;
-        self.slots.insert(0, slot);
-        if self.slots.len() > MAX_SLOTS {
+        // Validate everything BEFORE mutating: on failure the object must
+        // stay exactly as it was. Minting a key no slot can recover would
+        // make a later publish forever un-recoverable via passphrase.
+        if self.slots.len() + 1 > MAX_SLOTS {
             return Err(SyncCryptoError::BadChain(
                 "rotation chain exceeded the slot budget".into(),
             ));
         }
+        let next_version = self.keys.current_version() + 1;
+        let ck = random_ck();
+        let slot = wrap_ck(&ck, passphrase, params)?;
+        self.keys.entries.push((next_version, ck));
+        self.slots.insert(0, slot);
         Ok(())
     }
 
@@ -1117,6 +1156,27 @@ impl SyncCrypto {
 
     pub fn decrypt_blob(&self, digest_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>> {
         decrypt_blob(&self.keys, digest_hex, ciphertext)
+    }
+
+    /// Value for the Apple-slot synchronizable item, or `None` once the
+    /// group has rotated (`current_version >= 2`).
+    ///
+    /// **Freeze rule (ADR 05).** The item is the zero-ritual adoption
+    /// channel — and it synchronizes to every device under the Apple ID,
+    /// including a lost or compromised one. Writing a rotated CK into it
+    /// (e.g. after a passphrase unlock re-learned the chain) would
+    /// re-deliver the rotated key to exactly the devices the rotation was
+    /// meant to shut out, defeating forward-only revocation. The item may
+    /// therefore only ever carry the bootstrap-era key (v1); after any
+    /// rotation, joining a group requires the passphrase once per device —
+    /// the posture a user-initiated "suspected compromise / lost device"
+    /// action should produce.
+    pub fn synchronizable_item_value(&self) -> Option<String> {
+        let version = self.keys.current_version();
+        if version != 1 {
+            return None;
+        }
+        Some(encode_synchronizable_item(version, self.keys.current_key()))
     }
 }
 
@@ -1680,6 +1740,68 @@ mod tests {
             Err(SyncCryptoError::BadChain(_)) => {}
             other => panic!("expected BadChain, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn synchronizable_item_roundtrip_and_legacy_rejection() {
+        let key = [9u8; CK_LEN];
+        let value = encode_synchronizable_item(3, &key);
+        assert_eq!(parse_synchronizable_item(&value), Some((3, key)));
+        // Legacy bare-base64 (pre-ADR-05) items never adopt — the version
+        // is the anti-stale guard and must be mandatory.
+        use base64::{Engine as _, engine::general_purpose};
+        let legacy = general_purpose::STANDARD.encode(key);
+        assert_eq!(parse_synchronizable_item(&legacy), None);
+        // Malformed variants.
+        assert_eq!(parse_synchronizable_item("v1:not-base64!!"), None);
+        assert_eq!(parse_synchronizable_item("x1:AAAA"), None);
+        assert_eq!(parse_synchronizable_item("v1"), None);
+        assert_eq!(
+            parse_synchronizable_item(&format!(
+                "v1:{}",
+                general_purpose::STANDARD.encode([1u8; 31])
+            )),
+            None,
+            "wrong key length must not adopt"
+        );
+    }
+
+    #[test]
+    fn synchronizable_item_freezes_after_rotation() {
+        // ADR 05 freeze rule: only the bootstrap-era (v1) key may ride the
+        // zero-ritual item. Refreshing it after a rotation would re-deliver
+        // the rotated CK to every device under the Apple ID — including a
+        // lost one — defeating forward-only revocation.
+        let mut crypto = weak_crypto();
+        let v1_value = crypto.synchronizable_item_value().unwrap();
+        assert_eq!(parse_synchronizable_item(&v1_value).unwrap().0, 1);
+        crypto
+            .rotate_with_params("correct horse battery staple", ArgonParams::test())
+            .unwrap();
+        assert!(
+            crypto.synchronizable_item_value().is_none(),
+            "a rotated group must never refresh the item"
+        );
+    }
+
+    #[test]
+    fn rotate_budget_error_leaves_object_unchanged() {
+        // F3: the slot-budget rejection must fire BEFORE any mutation — a
+        // minted key with no matching wrapped slot would be publishable but
+        // never passphrase-recoverable.
+        let mut crypto = weak_crypto();
+        crypto.slots = (0..MAX_SLOTS)
+            .map(|_| crypto.slots[0].clone())
+            .collect::<Vec<_>>();
+        let keys_before = crypto.keys().clone();
+        let slots_before = crypto.slots.clone();
+        match crypto.rotate_with_params("p", ArgonParams::test()) {
+            Err(SyncCryptoError::BadChain(_)) => {}
+            other => panic!("expected BadChain, got {other:?}"),
+        }
+        assert_eq!(crypto.keys(), &keys_before);
+        assert_eq!(crypto.slots, slots_before);
+        assert_eq!(crypto.keys().current_version(), 1);
     }
 
     #[test]

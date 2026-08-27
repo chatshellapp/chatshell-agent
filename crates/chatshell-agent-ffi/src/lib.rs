@@ -1203,6 +1203,29 @@ pub fn sync_chain_from_single_key(
     Ok(keys.encode())
 }
 
+/// Parsed Apple-slot synchronizable-item value (ADR 05): the key version
+/// plus the raw CK. Hosts adopt the item ONLY on an exact version match
+/// with the artifact header's `key_version` — a stale item must fall
+/// through to the cached-chain rung, never install a wrong-key engine.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncSynchronizableItem {
+    pub version: u32,
+    pub key_b64: String,
+}
+
+/// Parse a synchronizable-item value (`v<version>:<base64 key>`). Returns
+/// `None` for legacy unversioned values and anything malformed; hosts
+/// treat `None` as "no item" (ladder rung 1 miss).
+#[uniffi::export]
+pub fn parse_synchronizable_item(value: String) -> Option<SyncSynchronizableItem> {
+    use base64::{Engine as _, engine::general_purpose};
+    let (version, key) = core::sync_crypto::parse_synchronizable_item(&value)?;
+    Some(SyncSynchronizableItem {
+        version,
+        key_b64: general_purpose::STANDARD.encode(key),
+    })
+}
+
 /// Plaintext header of an encrypted artifact, minus the slot payloads
 /// (hosts never need raw slot bytes — `SyncCrypto.from_chain` re-carries
 /// them from the artifact path itself).
@@ -1228,7 +1251,7 @@ pub fn read_artifact_header_info(path: String) -> Result<ArtifactHeaderInfo, Syn
 /// Transport-encryption state for one sync group: the content-key chain
 /// plus the Argon2id slot bytes carried in artifact headers. Hosts keep the
 /// chain in their own cache (`chain_bytes`) and the current key in a
-/// dedicated iCloud Keychain synchronizable item (`current_key_b64`).
+/// dedicated iCloud Keychain synchronizable item (`synchronizable_item_value`).
 #[derive(uniffi::Object)]
 pub struct SyncCrypto {
     inner: std::sync::Mutex<core::sync_crypto::SyncCrypto>,
@@ -1322,12 +1345,17 @@ impl SyncCrypto {
             .map_err(Into::into)
     }
 
-    /// Base64 of the current content key, for the dedicated iCloud
-    /// Keychain synchronizable item (separate from the master key's item).
-    pub fn current_key_b64(&self) -> String {
-        use base64::{Engine as _, engine::general_purpose};
-        general_purpose::STANDARD
-            .encode(self.inner.lock().expect("crypto lock").keys().current_key())
+    /// Value for the Apple-slot synchronizable item, or `None` once the
+    /// group has rotated (ADR 05 freeze rule): the item may only ever
+    /// carry the bootstrap-era (v1) key. Refreshing it after a rotation
+    /// would re-deliver the rotated CK to every device under the Apple ID —
+    /// including a lost one — defeating forward-only revocation. Hosts
+    /// write the item only when this returns a value.
+    pub fn synchronizable_item_value(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .synchronizable_item_value()
     }
 
     /// Encrypt attachment bytes for the blob sidecar (`BlobStore` stays
