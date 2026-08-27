@@ -33,8 +33,8 @@ pub use agent::{
 pub use history::{HistoryRole, HistoryRow, ToolCallRow, pair_history};
 pub use mcp::{McpConnection, McpHttpConfig, McpToolInfo, McpToolResult};
 pub use provider_registry::{
-    BuiltinProvider, builtin_providers, custom_provider, is_supported_fetch_provider,
-    requires_api_key_for_model_fetch,
+    BuiltinProvider, builtin_providers, custom_provider, is_builtin_provider_type,
+    is_supported_fetch_provider, requires_api_key_for_model_fetch,
 };
 pub use thinking::{ParsedContent, parse_thinking_content};
 pub use tool_definitions::{builtin_tool_definitions, web_fetch_definition, web_search_definition};

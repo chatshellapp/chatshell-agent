@@ -54,7 +54,7 @@ pub const SYNC_SCHEMA_SQL: &str = include_str!("sync_schema.sql");
 /// Monotonic version of [`SYNC_SCHEMA_SQL`]'s shape, recorded in the `meta`
 /// table under [`META_SCHEMA_VERSION`]. Bump on every shape change;
 /// [`ensure_sync_tables`] stamps it into fresh databases.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 1;
+pub const CANONICAL_SCHEMA_VERSION: i64 = 2;
 
 /// `meta` key holding [`CANONICAL_SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";

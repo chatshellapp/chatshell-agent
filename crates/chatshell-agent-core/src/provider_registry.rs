@@ -38,6 +38,15 @@ pub fn custom_provider() -> BuiltinProvider {
     }
 }
 
+/// Whether `provider_type` names a built-in provider template. Built-in
+/// provider rows are singletons by type: every device that adds "OpenAI"
+/// must produce the SAME row id, or cross-device merges duplicate the
+/// provider and the type-based singleton lookups silently pick the wrong
+/// twin (real-device finding: two MiniMax CN rows made model switching
+/// appear broken).
+pub fn is_builtin_provider_type(provider_type: &str) -> bool {
+    provider_type != "custom" && builtin_providers().iter().any(|p| p.id == provider_type)
+}
 /// All built-in provider templates, ordered as they should appear in the UI.
 pub fn builtin_providers() -> Vec<BuiltinProvider> {
     use BuiltinProvider as P;

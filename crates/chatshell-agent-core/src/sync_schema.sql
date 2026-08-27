@@ -30,19 +30,6 @@ CREATE TABLE IF NOT EXISTS users (
     deleted_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS user_relationships (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    related_user_id TEXT NOT NULL,
-    relationship_type TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    deleted_at TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (related_user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(user_id, related_user_id)
-);
-
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -142,18 +129,6 @@ CREATE TABLE IF NOT EXISTS skills (
     updated_at TEXT NOT NULL,
     deleted_at TEXT,
     UNIQUE(name, source)
-);
-
-CREATE TABLE IF NOT EXISTS knowledge_bases (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    content TEXT,
-    url TEXT,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompts (
@@ -363,18 +338,6 @@ CREATE TABLE IF NOT EXISTS message_prompts (
     UNIQUE(message_id, prompt_id)
 );
 
-CREATE TABLE IF NOT EXISTS message_knowledge_bases (
-    id TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL,
-    knowledge_base_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT '',
-    deleted_at TEXT,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
-    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    UNIQUE(message_id, knowledge_base_id)
-);
-
 CREATE TABLE IF NOT EXISTS message_tools (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,
@@ -409,18 +372,6 @@ CREATE TABLE IF NOT EXISTS assistant_skills (
     FOREIGN KEY (assistant_id) REFERENCES assistants(id) ON DELETE CASCADE,
     FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE,
     UNIQUE(assistant_id, skill_id)
-);
-
-CREATE TABLE IF NOT EXISTS assistant_knowledge_bases (
-    id TEXT PRIMARY KEY,
-    assistant_id TEXT NOT NULL,
-    knowledge_base_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT '',
-    deleted_at TEXT,
-    FOREIGN KEY (assistant_id) REFERENCES assistants(id) ON DELETE CASCADE,
-    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    UNIQUE(assistant_id, knowledge_base_id)
 );
 
 CREATE TABLE IF NOT EXISTS conversation_settings (
@@ -486,4 +437,3 @@ CREATE INDEX IF NOT EXISTS idx_search_decisions_message ON search_decisions(mess
 CREATE INDEX IF NOT EXISTS idx_search_results_message ON search_results(message_id);
 CREATE INDEX IF NOT EXISTS idx_thinking_steps_message ON thinking_steps(message_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id);
-CREATE INDEX IF NOT EXISTS idx_user_relationships_user ON user_relationships(user_id, relationship_type);
