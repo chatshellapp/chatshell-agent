@@ -492,7 +492,7 @@ pub fn publish_snapshot_encrypted(
     let (header, salt) = crypto
         .build_header(&hashed_sync_version(conn)?, canonical_schema_version(conn))
         .map_err(anyhow::Error::from)?;
-    let payload = sync_crypto::encrypt_snapshot_payload(crypto.keys(), &salt, &zst)
+    let payload = sync_crypto::encrypt_snapshot_payload(crypto.current_key(), &salt, &zst)
         .map_err(anyhow::Error::from)?;
     let artifact = sync_crypto::build_artifact(&header, &payload);
     // Unique per publish — same rationale as the staging temp: concurrent
@@ -892,24 +892,19 @@ impl SyncEngine {
         self.publish_inner(false)
     }
 
+    /// Manual escape hatch: publish unconditionally WITH a version bump,
+    /// even when the engine believes everything is up-to-date. The lineage
+    /// counter is the only merge ordering signal, and it can lie under
+    /// concurrent publishers (real-device counter-strand finding
+    /// 2026-08-28: a peer's rows became "stale remote" forever while every
+    /// pass reported up-to-date). A forced bump re-ships this device's full
+    /// state so stranded peers see it as newer. No data is destroyed — the
+    /// merge is the same lossless union as every other publish.
+    pub fn force_publish(&mut self) -> Result<()> {
+        self.publish_inner(true)
+    }
+
     fn publish_inner(&mut self, force_bump: bool) -> Result<()> {
-        // Rotation guard: when the live artifact declares a key version
-        // above this engine's chain, publishing would clobber the rotated
-        // artifact with old-key ciphertext and strand every peer holding
-        // the new key (real-device finding: a stale v1 publisher silently
-        // overwrote a v2 rotation). Fail loudly — the ladder owns recovery.
-        if let Some(crypto) = self.crypto.as_ref()
-            && let Ok(header) =
-                sync_crypto::read_artifact_header(&encrypted_snapshot_name(&self.snapshot_path()))
-            && header.key_version > crypto.keys().current_version()
-        {
-            bail!(
-                "refusing to publish under key v{} while the cloud artifact \
-                 is already v{} (rotated elsewhere; unlock required)",
-                crypto.keys().current_version(),
-                header.key_version
-            );
-        }
         if force_bump || self.dirty_since_last_publish()? {
             let counter = self
                 .current_version()
@@ -1015,7 +1010,7 @@ impl SyncEngine {
             }
             let header = sync_crypto::read_artifact_header(&enc).map_err(anyhow::Error::from)?;
             if let Some(crypto) = self.crypto.as_mut() {
-                crypto.carry_slots_from(&header);
+                crypto.adopt_slot_from(&header);
             }
             let action = plan_sync_header(&self.conn, &header)?;
             match action {
@@ -1059,8 +1054,12 @@ impl SyncEngine {
         };
         let bytes = std::fs::read(enc).context("read encrypted artifact")?;
         let (parsed, payload) = sync_crypto::split_artifact(&bytes).map_err(anyhow::Error::from)?;
-        let zst = sync_crypto::decrypt_snapshot_payload(crypto.keys(), &parsed, payload)
-            .map_err(anyhow::Error::from)?;
+        let zst = sync_crypto::decrypt_snapshot_payload(
+            crypto.current_key(),
+            &parsed.payload_salt,
+            payload,
+        )
+        .map_err(anyhow::Error::from)?;
         std::fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("provision cache dir {}", self.cache_dir.display()))?;
         let plain = self.cache_dir.join(format!(
@@ -1248,85 +1247,59 @@ CREATE TABLE conversations (
         SyncEngine::new_with_tables(db, cloud, cache, None, ENGINE_TABLES).unwrap()
     }
 
-    /// A stale-key holder must not clobber a rotated artifact: the
-    /// publish guard refuses when the live artifact's key version is above
-    /// the engine's chain (real-device finding 2026-08-27).
+    /// The manual escape hatch for the counter-strand failure mode: a
+    /// device whose rows were outranked by a peer's higher lineage counter
+    /// reports up-to-date forever; `force_publish` bumps and re-ships so
+    /// the stranded peer merges them (real-device finding 2026-08-28).
     #[test]
-    fn stale_key_publisher_cannot_clobber_rotation() {
-        let space = dir("rot-guard");
-        let db = space.path().join("a.db");
+    fn force_publish_rescues_stranded_peer() {
+        let space = dir("force-publish");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
         let cloud = space.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
-        let cache = space.path().join("cache");
-        seed(&db, "a1", "seed");
 
-        let passphrase = "rotation guard passphrase";
-        // Device A bootstraps and publishes under v1.
-        let mut a = SyncEngine::new_with_tables(
-            &db,
-            cloud.clone(),
-            cache.clone(),
-            Some(
-                SyncCrypto::bootstrap_with_params(
-                    passphrase,
-                    crate::sync_crypto::ArgonParams::test(),
-                )
-                .unwrap(),
-            ),
-            ENGINE_TABLES,
-        )
-        .unwrap();
-        a.publish().unwrap();
+        // A publishes; B pulls and converges.
+        seed(&a_path, "a1", "from A");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        a.sync_now().unwrap();
+        seed(&b_path, "a1", "from A");
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cache-b"));
+        assert_eq!(b.sync_now().unwrap().action, "converged");
 
-        // Device A rotates to v2 and republishes.
-        a.crypto
-            .as_mut()
-            .unwrap()
-            .rotate_with_params(passphrase, crate::sync_crypto::ArgonParams::test())
-            .unwrap();
-        a.publish().unwrap();
-
-        // Device B still holds only the v1 chain (state cached pre-rotation).
-        let v1_state = {
-            let mut b = SyncEngine::new_with_tables(
-                &db,
-                cloud.clone(),
-                cache.clone(),
-                Some(
-                    SyncCrypto::bootstrap_with_params(
-                        passphrase,
-                        crate::sync_crypto::ArgonParams::test(),
-                    )
-                    .unwrap(),
-                ),
-                ENGINE_TABLES,
+        // A ships a second row in v2:a...
+        a.connection()
+            .execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('a2', 'stranded', '2026-08-28T10:00:00+00:00',
+                        '2026-08-28T10:00:00+00:00')",
+                [],
             )
             .unwrap();
-            b.crypto.as_ref().unwrap().encode_state()
-        };
-        let v1_crypto = SyncCrypto::decode_state(&v1_state).unwrap();
-        let mut b = SyncEngine::new_with_tables(
-            &db,
-            cloud.clone(),
-            cache.join("b"),
-            Some(v1_crypto),
-            ENGINE_TABLES,
-        )
-        .unwrap();
+        a.force_publish().unwrap();
 
-        // The stale v1 engine must refuse to publish over the v2 artifact.
-        let err = b.publish().unwrap_err();
-        assert!(
-            err.to_string().contains("refusing to publish under key"),
-            "unexpected error: {err:#}"
-        );
-        // The artifact on disk is still the rotated v2 one.
-        let header =
-            sync_crypto::read_artifact_header(&encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE)))
-                .unwrap();
-        assert_eq!(header.key_version, 2);
+        // ...but B, unaware under propagation lag, flushes twice and its
+        // higher counters (v2:b, v3:b) swallow A's lineage file-level.
+        b.force_publish().unwrap();
+        b.force_publish().unwrap();
+
+        // Now A itself reports converged/up-to-date with a2 stranded: the
+        // zero-row adopt branch takes B's version id without republishing,
+        // and nothing B does ever pulls a2 in.
+        assert_eq!(a.sync_now().unwrap().action, "converged");
+        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+
+        // The escape hatch: A force-publishes, B merges the stranded row.
+        a.force_publish().unwrap();
+        let out = b.sync_now().unwrap();
+        assert_eq!(out.action, "merged");
+        assert_eq!(out.rows_merged, 1, "stranded row must land: {out:?}");
+        let n: i64 = b
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
     }
-
     #[test]
     fn two_engines_converge_via_cloud_snapshot() {
         let space = dir("engine");
@@ -1858,34 +1831,32 @@ CREATE TABLE conversations (
     }
 
     #[test]
-    fn engine_carries_slots_from_rotated_remote_header() {
-        // Device A rotates (with passphrase); device B, holding only the
-        // Keychain current key and no passphrase, adopts the carried slots
-        // from the next remote header and can keep publishing.
-        let space = dir("enc-carry");
+    fn engine_adopts_slot_for_keychain_adopter() {
+        // Device B holds ONLY the CK (Keychain path), no wrapped slot; its
+        // pass parses the remote header, adopts the slot, converges — and
+        // can afterwards publish a complete header itself (the 2026-08-27
+        // liveness finding, at engine level).
+        let space = dir("enc-adopt");
         let a_path = space.path().join("a.db");
         let b_path = space.path().join("b.db");
         let cloud = space.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
 
+        // A bootstraps the group and publishes the first artifact.
+        let crypto_a = weak_crypto();
+        // (cloned below for B — B adopts A's CK via the Keychain path)
         seed(&a_path, "a1", "from A");
-        let mut crypto_a = weak_crypto();
         let mut a = encrypted_engine(
             &a_path,
             cloud.clone(),
             space.path().join("cache-a"),
             crypto_a.clone(),
         );
-        a.sync_now().unwrap();
+        a.publish().unwrap();
 
-        // B adopts ONLY the current key (Keychain path), no slots carried
-        // from any artifact yet (fresh group view), and converges.
-        let keys_b =
-            sync_crypto::ContentKeys::from_entries(vec![(1, *crypto_a.keys().current_key())])
-                .unwrap();
-        let crypto_b = sync_crypto::SyncCrypto::from_keys(keys_b, vec![], true).unwrap();
-        // Publishing with zero slots while claiming version 1 is allowed
-        // only when the chain has exactly one version — it does here.
+        // B adopts ONLY A's CK (Keychain path), zero slots, and converges.
+        let crypto_b =
+            sync_crypto::SyncCrypto::from_keys(*crypto_a.current_key(), None, true).unwrap();
         seed(&b_path, "a1", "from A");
         let mut b = encrypted_engine(
             &b_path,
@@ -1895,21 +1866,23 @@ CREATE TABLE conversations (
         );
         assert_eq!(b.sync_now().unwrap().action, "converged");
 
-        // A rotates; its next publish carries TWO slots.
-        crypto_a
-            .rotate_with_params("engine test passphrase", sync_crypto::ArgonParams::test())
-            .unwrap();
-        a.set_crypto(crypto_a);
-        a.publish().unwrap();
-
-        // B's next pass plans from the rotated header (unknown key version
-        // → error) — but first, the header carry itself: simulate the
-        // platform ladder having unwrapped nothing; B's engine still picked
-        // up the carried slots during the failed-pass header parse.
         let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
         let header = sync_crypto::read_artifact_header(&enc).unwrap();
-        assert_eq!(header.key_version, 2);
-        assert_eq!(header.slots.len(), 2);
+        assert_eq!(header.key_version, 1);
+        assert_eq!(header.slots.len(), 1);
+        // The adopter's engine picked up the slot during the pass and can
+        // now publish a complete header (B's row ships under a bumped id).
+        b.connection()
+            .execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('b1', 'from B', '2026-08-28T11:00:00+00:00',
+                        '2026-08-28T11:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        b.force_publish().unwrap();
+        let header_after = sync_crypto::read_artifact_header(&enc).unwrap();
+        assert_eq!(header_after.slots.len(), 1, "adopter publishes the slot");
     }
 
     #[test]

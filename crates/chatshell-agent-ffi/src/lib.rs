@@ -1036,11 +1036,7 @@ pub struct SyncOutcome {
 /// core's typed `SyncCryptoError` carries through anyhow.
 fn classify_sync_error(e: anyhow::Error) -> SyncError {
     if let Some(core_err) = e.downcast_ref::<core::sync_crypto::SyncCryptoError>()
-        && matches!(
-            core_err,
-            core::sync_crypto::SyncCryptoError::Auth
-                | core::sync_crypto::SyncCryptoError::UnknownKeyVersion(_)
-        )
+        && matches!(core_err, core::sync_crypto::SyncCryptoError::Auth)
     {
         return SyncError::KeyMaterial {
             message: format!("{e:#}"),
@@ -1112,6 +1108,17 @@ impl SyncEngine {
             .map_err(classify_sync_error)
     }
 
+    /// Manual escape hatch: publish unconditionally WITH a version bump,
+    /// even when the engine believes everything is up-to-date (the
+    /// counter-strand rescue — see the core `force_publish` docs).
+    pub fn force_publish(&self) -> Result<(), SyncError> {
+        self.inner
+            .lock()
+            .map_err(|_| SyncError::Unavailable)?
+            .force_publish()
+            .map_err(classify_sync_error)
+    }
+
     /// One sync pass: merge remote changes, then republish when needed.
     pub fn sync_now(&self) -> Result<SyncOutcome, SyncError> {
         self.inner
@@ -1122,14 +1129,15 @@ impl SyncEngine {
             .map_err(classify_sync_error)
     }
 
-    /// The engine's current content-key chain (may have gained carried
-    /// slots after a pass saw a rotated remote header), serialized for the
-    /// device-local cache file. `None` when this engine does not encrypt.
+    /// The engine's current crypto state (may have gained carried slots
+    /// after a pass saw a legacy multi-slot remote header), serialized for
+    /// the device-local cache file in the same full-state format
+    /// `from_chain` decodes. `None` when this engine does not encrypt.
     pub fn sync_crypto_chain(&self) -> Option<Vec<u8>> {
         self.inner
             .lock()
             .ok()
-            .and_then(|engine| engine.crypto().map(|c| c.keys().encode()))
+            .and_then(|engine| engine.crypto().map(|c| c.encode_state()))
     }
 }
 
@@ -1146,8 +1154,6 @@ pub enum SyncCryptoError {
     Corrupt { message: String },
     #[error("unsupported transport format version {version}")]
     UnsupportedFormat { version: u16 },
-    #[error("content key version {version} is not held on this device")]
-    UnknownKeyVersion { version: u32 },
     #[error("decryption failed (wrong key or tampered data)")]
     Auth,
     #[error("wrong passphrase")]
@@ -1162,9 +1168,6 @@ impl From<core::sync_crypto::SyncCryptoError> for SyncCryptoError {
             }
             core::sync_crypto::SyncCryptoError::UnsupportedFormat(v) => {
                 SyncCryptoError::UnsupportedFormat { version: v }
-            }
-            core::sync_crypto::SyncCryptoError::UnknownKeyVersion(v) => {
-                SyncCryptoError::UnknownKeyVersion { version: v }
             }
             core::sync_crypto::SyncCryptoError::Auth => SyncCryptoError::Auth,
             core::sync_crypto::SyncCryptoError::WrongPassphrase => SyncCryptoError::WrongPassphrase,
@@ -1182,14 +1185,10 @@ pub fn generate_sync_passphrase() -> String {
     core::sync_crypto::generate_passphrase()
 }
 
-/// Serialize a single-entry chain (Keychain adoption: the item holds only
-/// the current key; its version comes from the artifact header). Keeps the
-/// cache format owned by Rust.
+/// Serialize a single-key crypto state (Keychain adoption: the item holds
+/// only the CK). Keeps the cache format owned by Rust.
 #[uniffi::export]
-pub fn sync_chain_from_single_key(
-    version: u32,
-    key_b64: String,
-) -> Result<Vec<u8>, SyncCryptoError> {
+pub fn sync_chain_from_single_key(key_b64: String) -> Result<Vec<u8>, SyncCryptoError> {
     use base64::{Engine as _, engine::general_purpose};
     let key: [u8; core::sync_crypto::CK_LEN] = general_purpose::STANDARD
         .decode(key_b64)
@@ -1200,29 +1199,24 @@ pub fn sync_chain_from_single_key(
         .map_err(|_| SyncCryptoError::Failed {
             message: "content key must be base64 of 32 bytes".into(),
         })?;
-    let keys = core::sync_crypto::ContentKeys::from_entries(vec![(version, key)])?;
-    Ok(keys.encode())
+    let crypto = core::sync_crypto::SyncCrypto::from_keys(key, None, true)?;
+    Ok(crypto.encode_state())
 }
 
-/// Parsed Apple-slot synchronizable-item value (ADR 05): the key version
-/// plus the raw CK. Hosts adopt the item ONLY on an exact version match
-/// with the artifact header's `key_version` — a stale item must fall
-/// through to the cached-chain rung, never install a wrong-key engine.
+/// Parsed Apple-slot synchronizable-item value: the raw CK. `None` for
+/// legacy bare-base64 values, rotation-era versions, and anything
+/// malformed — hosts treat `None` as "no item" (ladder rung 1 miss).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncSynchronizableItem {
-    pub version: u32,
     pub key_b64: String,
 }
 
-/// Parse a synchronizable-item value (`v<version>:<base64 key>`). Returns
-/// `None` for legacy unversioned values and anything malformed; hosts
-/// treat `None` as "no item" (ladder rung 1 miss).
+/// Parse a synchronizable-item value (`v1:<base64 key>`).
 #[uniffi::export]
 pub fn parse_synchronizable_item(value: String) -> Option<SyncSynchronizableItem> {
     use base64::{Engine as _, engine::general_purpose};
-    let (version, key) = core::sync_crypto::parse_synchronizable_item(&value)?;
+    let key = core::sync_crypto::parse_synchronizable_item(&value)?;
     Some(SyncSynchronizableItem {
-        version,
         key_b64: general_purpose::STANDARD.encode(key),
     })
 }
@@ -1241,7 +1235,11 @@ pub fn decrypt_snapshot_artifact(
         message: format!("read artifact: {e}"),
     })?;
     let (header, payload) = core::sync_crypto::split_artifact(&artifact)?;
-    let zst = core::sync_crypto::decrypt_snapshot_payload(state.keys(), &header, payload)?;
+    let zst = core::sync_crypto::decrypt_snapshot_payload(
+        state.current_key(),
+        &header.payload_salt,
+        payload,
+    )?;
     let plain = zstd::stream::decode_all(&zst[..]).map_err(|e| SyncCryptoError::Failed {
         message: format!("zstd: {e}"),
     })?;
@@ -1273,10 +1271,10 @@ pub fn read_artifact_header_info(path: String) -> Result<ArtifactHeaderInfo, Syn
     })
 }
 
-/// Transport-encryption state for one sync group: the content-key chain
-/// plus the Argon2id slot bytes carried in artifact headers. Hosts keep the
-/// chain in their own cache (`chain_bytes`) and the current key in a
-/// dedicated iCloud Keychain synchronizable item (`synchronizable_item_value`).
+/// Transport-encryption state for one sync group: the content key plus the
+/// Argon2id slot wrapping it under the group passphrase. Hosts keep the
+/// state in their own cache (`chain_bytes`) and the CK in a dedicated
+/// iCloud Keychain synchronizable item (`synchronizable_item_value`).
 #[derive(uniffi::Object)]
 pub struct SyncCrypto {
     inner: std::sync::Mutex<core::sync_crypto::SyncCrypto>,
@@ -1295,13 +1293,13 @@ impl SyncCrypto {
         })
     }
 
-    /// Rebuild from the device-local state cache (keys AND wrapped slots —
+    /// Rebuild from the device-local state cache (CK AND wrapped slot —
     /// the bootstrap device needs its slot to publish the FIRST artifact
-    /// when no artifact exists to carry slots from; real-device finding
+    /// when no artifact exists to adopt one from; real-device finding
     /// 2026-08-27). When `artifact_path` points at an existing remote
-    /// artifact, any newer slot chain is carried forward (rotation on a
-    /// peer); a missing artifact is not an error — the first device
-    /// publishes before one exists.
+    /// artifact and this state holds no slot yet, the slot is adopted from
+    /// it; a missing artifact is not an error — the first device publishes
+    /// before one exists.
     #[uniffi::constructor]
     pub fn from_chain(
         chain: Vec<u8>,
@@ -1311,75 +1309,35 @@ impl SyncCrypto {
         if let Some(path) = artifact_path.as_deref().filter(|p| !p.is_empty())
             && let Ok(header) = core::sync_crypto::read_artifact_header(std::path::Path::new(path))
         {
-            inner.carry_slots_from(&header);
+            inner.adopt_slot_from(&header);
         }
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
         })
     }
 
-    /// Passphrase rung: unwrap the remote artifact's slot chain into the
-    /// full key chain, unioned with the locally cached one.
+    /// Passphrase rung: unwrap the remote artifact's single slot into the
+    /// CK. A wrong passphrase fails typed as `WrongPassphrase`.
     #[uniffi::constructor]
     pub fn unlock_from_artifact(
         artifact_path: String,
         passphrase: String,
-        known_chain: Option<Vec<u8>>,
     ) -> Result<Self, SyncCryptoError> {
         let header = core::sync_crypto::read_artifact_header(std::path::Path::new(&artifact_path))?;
-        let known = match known_chain {
-            Some(bytes) => Some(
-                core::sync_crypto::SyncCrypto::decode_state(&bytes)?
-                    .keys()
-                    .clone(),
-            ),
-            None => None,
-        };
-        let inner = core::sync_crypto::SyncCrypto::from_passphrase(
-            &header,
-            &passphrase,
-            known.as_ref(),
-            true,
-        )?;
+        let inner = core::sync_crypto::SyncCrypto::from_passphrase(&header, &passphrase, true)?;
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
         })
     }
 
-    /// Serialized full state (keys AND wrapped slots) for the device-local
+    /// Serialized full state (CK AND wrapped slot) for the device-local
     /// cache file.
     pub fn chain_bytes(&self) -> Vec<u8> {
         self.inner.lock().expect("crypto lock").encode_state()
     }
 
-    /// Highest chain version — used for every new write.
-    pub fn current_key_version(&self) -> u32 {
-        self.inner
-            .lock()
-            .expect("crypto lock")
-            .keys()
-            .current_version()
-    }
-
-    /// Explicit user action (suspected compromise, lost device): mint the
-    /// next CK under the passphrase. Forward-only revocation — ADR 04 §5.
-    /// The carried slots come from the artifact the object was built with,
-    /// so the caller must publish promptly after rotating.
-    pub fn rotate(&self, passphrase: String) -> Result<(), SyncCryptoError> {
-        self.inner
-            .lock()
-            .expect("crypto lock")
-            .rotate(passphrase.trim())
-            .map_err(Into::into)
-    }
-
-    /// Value for the Apple-slot synchronizable item, or `None` once the
-    /// group has rotated (ADR 05 freeze rule): the item may only ever
-    /// carry the bootstrap-era (v1) key. Refreshing it after a rotation
-    /// would re-deliver the rotated CK to every device under the Apple ID —
-    /// including a lost one — defeating forward-only revocation. Hosts
-    /// write the item only when this returns a value.
-    pub fn synchronizable_item_value(&self) -> Option<String> {
+    /// Value for the Apple-slot synchronizable item (`v1:<base64 CK>`).
+    pub fn synchronizable_item_value(&self) -> String {
         self.inner
             .lock()
             .expect("crypto lock")

@@ -26,12 +26,13 @@
 //! truncation, reorder, substitution, and cross-record splices all fail the
 //! tag check.
 //!
-//! The artifact carries an age-style multi-slot plaintext header ahead of the
-//! ciphertext payload so `plan_sync` can run the version compare without
-//! touching the payload. Invariant: **no slot carries key material
+//! The artifact carries a plaintext header ahead of the ciphertext payload
+//! so `plan_sync` can run the version compare without touching the payload.
+//! Exactly ONE Argon2id slot wraps the CK under the group passphrase (key
+//! rotation was removed — ADR 06); **no slot carries key material
 //! recoverable from the artifact alone** — the Apple slot is a pure type
-//! marker (the CK itself lives in a dedicated iCloud Keychain synchronizable
-//! item), and every Argon2id slot wraps the CK under the group passphrase.
+//! marker (the CK itself lives in a dedicated iCloud Keychain
+//! synchronizable item).
 //!
 //! Content ids are canonicalized once: for blobs, the ASCII bytes of the bare
 //! lowercase hex digest (exactly the filename under `blobs/`); for the
@@ -94,8 +95,6 @@ pub enum SyncCryptoError {
     Corrupt(String),
     #[error("unsupported transport format version {0}")]
     UnsupportedFormat(u16),
-    #[error("content key version {0} is not held on this device")]
-    UnknownKeyVersion(u32),
     #[error("decryption failed (wrong key or tampered data)")]
     Auth,
     #[error("content hash mismatch: expected {expected}, got {actual}")]
@@ -403,7 +402,7 @@ pub fn open_chunks(
 }
 
 // ---------------------------------------------------------------------------
-// Content keys and the rotation chain
+// Content keys (single-version groups; legacy chains stay readable)
 // ---------------------------------------------------------------------------
 
 /// Argon2id cost parameters, carried inside every slot so future cost bumps
@@ -519,116 +518,6 @@ pub fn unwrap_ck(slot: &ArgonSlot, passphrase: &str) -> Result<[u8; CK_LEN]> {
     plain.try_into().map_err(|_| SyncCryptoError::Auth)
 }
 
-/// The CK chain held on this device. Versions are strictly ascending and
-/// unique; a partial chain (only the current key, adopted from the Keychain
-/// item) is legal — old blobs then need the passphrase ladder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentKeys {
-    entries: Vec<(u32, [u8; CK_LEN])>,
-}
-
-impl ContentKeys {
-    /// Mint a fresh group: one random CK at version 1.
-    pub fn bootstrap() -> Self {
-        ContentKeys {
-            entries: vec![(1, random_ck())],
-        }
-    }
-
-    /// Build from explicit material (Keychain adoption). `entries` must be
-    /// non-empty with strictly ascending unique versions.
-    pub fn from_entries(entries: Vec<(u32, [u8; CK_LEN])>) -> Result<Self> {
-        if entries.is_empty() {
-            return Err(SyncCryptoError::BadChain("empty key chain".into()));
-        }
-        for pair in entries.windows(2) {
-            if pair[0].0 >= pair[1].0 {
-                return Err(SyncCryptoError::BadChain(
-                    "versions must be strictly ascending".into(),
-                ));
-            }
-        }
-        Ok(ContentKeys { entries })
-    }
-
-    /// Highest version — used for every new write.
-    pub fn current_version(&self) -> u32 {
-        self.entries.last().map(|(v, _)| *v).unwrap_or(0)
-    }
-
-    pub fn current_key(&self) -> &[u8; CK_LEN] {
-        &self.entries.last().expect("chain is never empty").1
-    }
-
-    pub fn key_for_version(&self, version: u32) -> Option<&[u8; CK_LEN]> {
-        self.entries
-            .iter()
-            .find(|(v, _)| *v == version)
-            .map(|(_, k)| k)
-    }
-
-    /// Union in keys we lack (ascending, deduped). Used when unwrapping the
-    /// full slot chain merges with a partial local chain.
-    pub fn merge_from(&mut self, other: &ContentKeys) {
-        let mut merged = self.entries.clone();
-        for (v, k) in &other.entries {
-            if !merged.iter().any(|(lv, _)| lv == v) {
-                merged.push((*v, *k));
-            }
-        }
-        merged.sort_by_key(|(v, _)| *v);
-        if !merged.is_empty() {
-            self.entries = merged;
-        }
-    }
-
-    /// Rotate: mint the next CK (explicit user action only — suspected
-    /// compromise, lost device; ADR 04 §5). Old keys stay for decrypt-only.
-    pub fn rotate(&mut self) -> [u8; CK_LEN] {
-        let next = self.current_version() + 1;
-        let ck = random_ck();
-        self.entries.push((next, ck));
-        ck
-    }
-
-    // -- cache serialization --------------------------------------------
-
-    const CHAIN_MAGIC: &[u8; 10] = b"CHCKCHAIN\x01";
-
-    /// Serialize for the device-local cache file (kept beside the plaintext
-    /// DB — explicitly permitted by ADR 04 §2; the cache protects only the
-    /// cloud copy).
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.bytes(Self::CHAIN_MAGIC);
-        w.u16(self.entries.len() as u16);
-        for (v, k) in &self.entries {
-            w.u32(*v);
-            w.bytes(k);
-        }
-        w.into_vec()
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes);
-        let magic = r.take(Self::CHAIN_MAGIC.len())?;
-        if magic != Self::CHAIN_MAGIC {
-            return Err(SyncCryptoError::BadChain("bad cache magic".into()));
-        }
-        let count = r.u16()? as usize;
-        if count == 0 || count > MAX_SLOTS {
-            return Err(SyncCryptoError::BadChain("slot count out of bounds".into()));
-        }
-        let mut entries = Vec::with_capacity(count);
-        for _ in 0..count {
-            let v = r.u32()?;
-            let k = r.array::<CK_LEN>()?;
-            entries.push((v, k));
-        }
-        Self::from_entries(entries)
-    }
-}
-
 fn random_ck() -> [u8; CK_LEN] {
     let mut ck = [0u8; CK_LEN];
     rand::rngs::OsRng.fill_bytes(&mut ck);
@@ -636,51 +525,45 @@ fn random_ck() -> [u8; CK_LEN] {
 }
 
 // ---------------------------------------------------------------------------
-// Apple-slot synchronizable item (ADR 04 §3, hardened by ADR 05)
+// Apple-slot synchronizable item (ADR 04 §3)
 // ---------------------------------------------------------------------------
 
 /// Value format of the Apple-slot synchronizable item:
-/// `v<key version>:<base64(32-byte CK)>`.
+/// `v1:<base64(32-byte CK)>`.
 ///
-/// The version rides along so the adoption rung can reject a stale item
-/// WITHOUT a decrypt attempt (ADR 05): after a rotation the artifact header
-/// declares a higher key version than the frozen item carries, and rung 1
-/// must fall through to the cached-chain rung instead of installing a
-/// wrong-key engine (which would bounce already-unlocked devices through
-/// the needs-unlock latch and delete their good cached chains).
-///
-/// Legacy bare-base64 values (pre-ADR-05) are rejected by
-/// [`parse_synchronizable_item`] — the no-compat window applies; a device
-/// holding one degrades to a single passphrase unlock, after which the
-/// item is rewritten in this format (version-1 groups only).
-pub fn encode_synchronizable_item(version: u32, key: &[u8; CK_LEN]) -> String {
+/// The `v1:` prefix is a format marker: bare-base64 legacy values and
+/// non-1 versions (stale items from rotation-era groups) are rejected by
+/// [`parse_synchronizable_item`] instead of adopting.
+pub fn encode_synchronizable_item(key: &[u8; CK_LEN]) -> String {
     use base64::{Engine as _, engine::general_purpose};
-    format!("v{}:{}", version, general_purpose::STANDARD.encode(key))
+    format!("v1:{}", general_purpose::STANDARD.encode(key))
 }
 
 /// Parse a synchronizable-item value written by
-/// [`encode_synchronizable_item`]. `None` for anything else: legacy
-/// unversioned values, wrong lengths, malformed prefixes.
-pub fn parse_synchronizable_item(value: &str) -> Option<(u32, [u8; CK_LEN])> {
+/// [`encode_synchronizable_item`]. `None` for anything else: bare-base64
+/// legacy values, non-1 versions (rotation-era), wrong lengths, malformed
+/// prefixes.
+pub fn parse_synchronizable_item(value: &str) -> Option<[u8; CK_LEN]> {
     use base64::{Engine as _, engine::general_purpose};
     let (version_part, key_part) = value.split_once(':')?;
-    let version = version_part.strip_prefix('v')?.parse().ok()?;
+    if version_part != "v1" {
+        return None;
+    }
     let bytes = general_purpose::STANDARD.decode(key_part).ok()?;
-    Some((version, bytes.try_into().ok()?))
+    bytes.try_into().ok()
 }
 
 // ---------------------------------------------------------------------------
-// Artifact header (age-style multi-slot)
+// Artifact header (single-slot, plaintext)
 // ---------------------------------------------------------------------------
 
 /// Parsed plaintext header of the encrypted snapshot artifact.
 ///
-/// Slot ordering invariant: `slots[0]` wraps the current CK
-/// (`key_version`), `slots[i]` wraps version `key_version - i`. Devices
-/// that never learned the passphrase carry the slot bytes forward verbatim
-/// from a previously seen artifact header — the slots are public ciphertext
-/// and every publish must keep the fallback path alive for passphrase-only
-/// devices.
+/// Exactly one Argon2id slot wraps the CK under the group passphrase. A
+/// Keychain adopter that never learned the passphrase re-adopts the slot
+/// bytes verbatim from the artifact header (`adopt_slot_from`) — the slot
+/// is public ciphertext, and every publish must keep the passphrase
+/// fallback alive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHeader {
     /// `<counter>:<blake3_hex(device_id)>` — device ids are hashed out of
@@ -690,14 +573,16 @@ pub struct ArtifactHeader {
     /// Canonical schema version of the publishing database (diagnostic
     /// provenance, mirrors the in-DB `meta.schema_version` stamp).
     pub schema_version: u64,
-    /// CK version the payload is sealed under.
+    /// CK version the payload is sealed under — always 1 (rotation removed,
+    /// ADR 06). Kept on the wire so legacy rotation-era artifacts (v >= 2)
+    /// fail with a clear message instead of misparsing.
     pub key_version: u32,
     /// Per-publish random stream id for the payload's chunk nonces.
     pub payload_salt: [u8; SALT_LEN],
     /// Whether the Apple marker slot is present (the CK itself lives in the
     /// iCloud Keychain synchronizable item, never in the artifact).
     pub icloud_slot: bool,
-    /// Argon2id-wrapped CK chain, current first (see type docs).
+    /// The single Argon2id-wrapped CK.
     pub slots: Vec<ArgonSlot>,
 }
 
@@ -781,10 +666,17 @@ impl ArtifactHeader {
                 wrapped,
             });
         }
-        if key_version < slot_count as u32 {
-            return Err(SyncCryptoError::Corrupt(
-                "slot chain longer than the declared key version".into(),
-            ));
+        if key_version != 1 {
+            return Err(SyncCryptoError::Corrupt(format!(
+                "legacy rotation-era artifact (key version {key_version}) is no \
+                 longer supported — delete the cloud data and re-enable sync"
+            )));
+        }
+        if slot_count != 1 {
+            return Err(SyncCryptoError::Corrupt(format!(
+                "legacy multi-slot artifact ({slot_count} slots) is no longer \
+                 supported — delete the cloud data and re-enable sync"
+            )));
         }
         Ok((
             ArtifactHeader {
@@ -831,42 +723,27 @@ pub fn read_artifact_header(path: &std::path::Path) -> Result<ArtifactHeader> {
 // Snapshot payload + full artifact
 // ---------------------------------------------------------------------------
 
-/// Seal the zstd-compressed snapshot bytes as the artifact payload under the
-/// chain's current key. The caller supplies the per-publish random salt that
-/// also goes into the header.
+/// Seal the zstd-compressed snapshot bytes as the artifact payload under
+/// the group CK. The caller supplies the per-publish random salt that also
+/// goes into the header.
 pub fn encrypt_snapshot_payload(
-    keys: &ContentKeys,
+    ck: &[u8; CK_LEN],
     salt: &[u8; SALT_LEN],
     compressed: &[u8],
 ) -> Result<Vec<u8>> {
-    let parent = derive_snapshot_key(keys.current_key());
-    seal_chunks(
-        &parent,
-        salt,
-        SNAPSHOT_CONTENT_ID,
-        keys.current_version(),
-        compressed,
-    )
+    let parent = derive_snapshot_key(ck);
+    seal_chunks(&parent, salt, SNAPSHOT_CONTENT_ID, 1, compressed)
 }
 
-/// Open the artifact payload. Uses the header's key version and salt, so a
-/// device holding older keys (post-rotation) still decrypts.
+/// Open the artifact payload under the group CK and the header's
+/// per-publish salt.
 pub fn decrypt_snapshot_payload(
-    keys: &ContentKeys,
-    header: &ArtifactHeader,
+    ck: &[u8; CK_LEN],
+    salt: &[u8; SALT_LEN],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    let ck = keys
-        .key_for_version(header.key_version)
-        .ok_or(SyncCryptoError::UnknownKeyVersion(header.key_version))?;
     let parent = derive_snapshot_key(ck);
-    open_chunks(
-        &parent,
-        &header.payload_salt,
-        SNAPSHOT_CONTENT_ID,
-        header.key_version,
-        payload,
-    )
+    open_chunks(&parent, salt, SNAPSHOT_CONTENT_ID, 1, payload)
 }
 
 /// Assemble the complete artifact bytes: header + payload.
@@ -903,7 +780,7 @@ const BLOB_KIND_STREAM: u8 = 2;
 /// Deterministic by construction: concurrent uploads of the same attachment
 /// from two devices produce byte-identical files (no iCloud conflict copies)
 /// and uploads stay idempotent end-to-end.
-pub fn encrypt_blob(keys: &ContentKeys, digest_hex: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn encrypt_blob(ck: &[u8; CK_LEN], digest_hex: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
     let actual = crate::crypto::blake3_hex(plaintext);
     if actual != digest_hex {
         return Err(SyncCryptoError::HashMismatch {
@@ -911,8 +788,6 @@ pub fn encrypt_blob(keys: &ContentKeys, digest_hex: &str, plaintext: &[u8]) -> R
             actual,
         });
     }
-    let version = keys.current_version();
-    let ck = keys.current_key();
     let mut w = Writer::new();
     w.bytes(BLOB_MAGIC);
     w.u16(FORMAT_VERSION);
@@ -921,7 +796,7 @@ pub fn encrypt_blob(keys: &ContentKeys, digest_hex: &str, plaintext: &[u8]) -> R
         let nonce = blob_nonce(&parent, digest_hex.as_bytes());
         let sealed = seal(&parent, &nonce, plaintext, digest_hex.as_bytes())?;
         w.u8(BLOB_KIND_SINGLE);
-        w.u32(version);
+        w.u32(1);
         w.bytes(&nonce);
         w.bytes(&sealed);
     } else {
@@ -930,21 +805,21 @@ pub fn encrypt_blob(keys: &ContentKeys, digest_hex: &str, plaintext: &[u8]) -> R
             &parent,
             digest_hex.as_bytes(),
             digest_hex.as_bytes(),
-            version,
+            1,
             plaintext,
         )?;
         w.u8(BLOB_KIND_STREAM);
-        w.u32(version);
+        w.u32(1);
         w.bytes(&chunks);
     }
     Ok(w.into_vec())
 }
 
 /// Decrypt a blob sidecar file. Enforces the magic (an unexpected magic
-/// means corrupt or foreign: error, never a plaintext parse), resolves the
-/// CK by the header's key version, and verifies `blake3(plaintext) ==
-/// digest_hex` after decryption.
-pub fn decrypt_blob(keys: &ContentKeys, digest_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>> {
+/// means corrupt or foreign: error, never a plaintext parse), rejects
+/// non-v1 headers (legacy rotation-era blobs), and verifies
+/// `blake3(plaintext) == digest_hex` after decryption.
+pub fn decrypt_blob(ck: &[u8; CK_LEN], digest_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>> {
     let mut r = Reader::new(ciphertext);
     let magic = r.take(BLOB_MAGIC.len())?;
     if magic != BLOB_MAGIC {
@@ -959,25 +834,26 @@ pub fn decrypt_blob(keys: &ContentKeys, digest_hex: &str, ciphertext: &[u8]) -> 
     }
     let kind = r.u8()?;
     let version = r.u32()?;
-    let ck = keys
-        .key_for_version(version)
-        .ok_or(SyncCryptoError::UnknownKeyVersion(version))?
-        .to_owned();
+    if version != 1 {
+        return Err(SyncCryptoError::Corrupt(format!(
+            "legacy rotation-era blob (key version {version}) is no longer supported"
+        )));
+    }
     let plain = match kind {
         BLOB_KIND_SINGLE => {
             let nonce = r.array::<NONCE_LEN>()?;
             let sealed = r.rest();
-            let parent = derive_blob_single_key(&ck);
+            let parent = derive_blob_single_key(ck);
             open(&parent, &nonce, sealed, digest_hex.as_bytes())?
         }
         BLOB_KIND_STREAM => {
             let frames = r.rest();
-            let parent = derive_blob_stream_key(&ck);
+            let parent = derive_blob_stream_key(ck);
             open_chunks(
                 &parent,
                 digest_hex.as_bytes(),
                 digest_hex.as_bytes(),
-                version,
+                1,
                 frames,
             )?
         }
@@ -1001,23 +877,23 @@ pub fn decrypt_blob(keys: &ContentKeys, digest_hex: &str, ciphertext: &[u8]) -> 
 // SyncCrypto: what the engine and the blob paths hold
 // ---------------------------------------------------------------------------
 
-/// Everything a device needs to publish and open transport artifacts:
-/// the CK chain plus the Argon2id slot bytes to carry in headers.
+/// Everything a device needs to publish and open transport artifacts: the
+/// group CK plus the Argon2id slot wrapping it under the group passphrase.
 ///
-/// Devices that adopted the CK from the Keychain item hold only the current
-/// key but still carry the full slot chain forward from the last-seen
-/// artifact header — those bytes are public ciphertext, and republishing
-/// must keep the passphrase fallback alive for every peer.
+/// A device that adopted the CK from the Keychain item holds no slot
+/// initially — it re-adopts the slot bytes verbatim from the first artifact
+/// header it parses ([`SyncCrypto::adopt_slot_from`]); the slot is public
+/// ciphertext, and every publish must keep the passphrase fallback alive.
 #[derive(Debug, Clone)]
 pub struct SyncCrypto {
-    keys: ContentKeys,
-    slots: Vec<ArgonSlot>,
+    key: [u8; CK_LEN],
+    slot: Option<ArgonSlot>,
     icloud_slot: bool,
 }
 
 impl SyncCrypto {
-    /// First device of a sync group: mint CK v1, wrap it under the group
-    /// passphrase. Bootstrap must set the passphrase even on Apple
+    /// First device of a sync group: mint the CK and wrap it under the
+    /// group passphrase. Bootstrap must set the passphrase even on Apple
     /// platforms (ADR 04 §3 rule 1) — otherwise the fallback does not exist
     /// when the Keychain slot fails.
     pub fn bootstrap(passphrase: &str) -> Result<Self> {
@@ -1025,120 +901,69 @@ impl SyncCrypto {
     }
 
     pub fn bootstrap_with_params(passphrase: &str, params: ArgonParams) -> Result<Self> {
-        let keys = ContentKeys::bootstrap();
-        let slot = wrap_ck(keys.current_key(), passphrase, params)?;
+        let key = random_ck();
+        let slot = wrap_ck(&key, passphrase, params)?;
         Ok(SyncCrypto {
-            keys,
-            slots: vec![slot],
+            key,
+            slot: Some(slot),
             icloud_slot: true,
         })
     }
 
-    /// Adoption path: keys from the Keychain item / local cache (possibly
-    /// partial — only the current version), slots carried from a previously
-    /// seen artifact header. `slots` may be empty when no artifact exists
-    /// yet (this device bootstraps a fresh group instead).
-    pub fn from_keys(keys: ContentKeys, slots: Vec<ArgonSlot>, icloud_slot: bool) -> Result<Self> {
-        if slots.len() > MAX_SLOTS {
-            return Err(SyncCryptoError::BadChain("too many carried slots".into()));
-        }
+    /// Adoption path: the CK from the Keychain item / local cache. `slot`
+    /// is `None` until an artifact header supplies it
+    /// ([`SyncCrypto::adopt_slot_from`]).
+    pub fn from_keys(
+        key: [u8; CK_LEN],
+        slot: Option<ArgonSlot>,
+        icloud_slot: bool,
+    ) -> Result<Self> {
         Ok(SyncCrypto {
-            keys,
-            slots,
+            key,
+            slot,
             icloud_slot,
         })
     }
 
-    /// Passphrase path: unwrap every slot of a remote artifact header into
-    /// the full chain, unioned with `known` (locally cached keys survive).
+    /// Passphrase path: unwrap the artifact's single slot into the CK.
+    /// Any unwrap failure is a wrong passphrase (or tampering) — a
+    /// deterministic, locally rate-limitable outcome.
     pub fn from_passphrase(
         header: &ArtifactHeader,
         passphrase: &str,
-        known: Option<&ContentKeys>,
         icloud_slot: bool,
     ) -> Result<Self> {
-        let mut keys = known.cloned().unwrap_or_else(|| ContentKeys {
-            entries: Vec::new(),
-        });
-        let mut unwrapped = Vec::with_capacity(header.slots.len());
-        for (i, slot) in header.slots.iter().enumerate() {
-            let version =
-                header
-                    .key_version
-                    .checked_sub(i as u32)
-                    .ok_or(SyncCryptoError::Corrupt(
-                        "slot chain underflows key version".into(),
-                    ))?;
-            let ck = unwrap_ck(slot, passphrase)?;
-            unwrapped.push((version, ck));
-        }
-        unwrapped.sort_by_key(|(v, _)| *v);
-        let unwrapped = ContentKeys::from_entries(unwrapped)?;
-        keys.merge_from(&unwrapped);
-        if keys.entries.is_empty() {
-            return Err(SyncCryptoError::BadChain("no keys after unwrap".into()));
-        }
+        let slot = header
+            .slots
+            .first()
+            .ok_or(SyncCryptoError::Corrupt("artifact carries no slot".into()))?;
+        // Wrong passphrase and a tampered slot are indistinguishable by
+        // design (AEAD) — surface the actionable error.
+        let key = unwrap_ck(slot, passphrase).map_err(|_| SyncCryptoError::WrongPassphrase)?;
         Ok(SyncCrypto {
-            keys,
-            slots: header.slots.clone(),
+            key,
+            slot: Some(slot.clone()),
             icloud_slot,
         })
     }
 
-    /// Explicit user action (suspected compromise, lost device): mint the
-    /// next CK and wrap it under the passphrase. Forward-only revocation —
-    /// new snapshots and blobs are protected from a holder of the old CK;
-    /// blobs last written before the rotation stay readable to them.
-    pub fn rotate(&mut self, passphrase: &str) -> Result<()> {
-        self.rotate_with_params(passphrase, DEFAULT_ARGON_PARAMS)
-    }
-
-    pub fn rotate_with_params(&mut self, passphrase: &str, params: ArgonParams) -> Result<()> {
-        // Validate everything BEFORE mutating: on failure the object must
-        // stay exactly as it was. Minting a key no slot can recover would
-        // make a later publish forever un-recoverable via passphrase.
-        if self.slots.len() + 1 > MAX_SLOTS {
-            return Err(SyncCryptoError::BadChain(
-                "rotation chain exceeded the slot budget".into(),
-            ));
-        }
-        let next_version = self.keys.current_version() + 1;
-        let ck = random_ck();
-        let slot = wrap_ck(&ck, passphrase, params)?;
-        self.keys.entries.push((next_version, ck));
-        self.slots.insert(0, slot);
-        Ok(())
-    }
-
-    pub fn keys(&self) -> &ContentKeys {
-        &self.keys
-    }
-
-    /// Slots to write into the next published header: the tail of the
-    /// carried chain matching this device's current key version, current
-    /// first.
-    pub fn slots_for_publish(&self) -> &[ArgonSlot] {
-        let current = self.keys.current_version() as usize;
-        if self.slots.len() <= current {
-            &self.slots
-        } else {
-            &self.slots[self.slots.len() - current..]
-        }
+    pub fn current_key(&self) -> &[u8; CK_LEN] {
+        &self.key
     }
 
     pub fn icloud_slot(&self) -> bool {
         self.icloud_slot
     }
 
-    /// Refresh the carried slot chain from a remote header the engine just
-    /// parsed (rotation happened elsewhere). Only a longer chain replaces
-    /// ours — a shorter remote chain must not drop slots this device needs
-    /// to publish. Called by the engine on every successful header read, so
-    /// Keychain adopters pick up new wrapped slots without ever entering
-    /// the passphrase.
-    pub fn carry_slots_from(&mut self, header: &ArtifactHeader) {
-        if header.slots.len() > self.slots.len() {
-            self.slots = header.slots.clone();
+    /// Adopt the wrapped slot from a remote header the engine just parsed.
+    /// Called on every successful header read so Keychain adopters (no
+    /// passphrase) can publish complete headers. Never overwrites a slot
+    /// this device already holds.
+    pub fn adopt_slot_from(&mut self, header: &ArtifactHeader) {
+        if self.slot.is_none()
+            && let Some(slot) = header.slots.first()
+        {
+            self.slot = Some(slot.clone());
         }
         self.icloud_slot = self.icloud_slot || header.icloud_slot;
     }
@@ -1150,25 +975,21 @@ impl SyncCrypto {
         sync_version: &str,
         schema_version: u64,
     ) -> Result<(ArtifactHeader, [u8; SALT_LEN])> {
+        let Some(slot) = self.slot.as_ref() else {
+            return Err(SyncCryptoError::BadChain(
+                "no wrapped slot on this device — bootstrap or unlock sync first".into(),
+            ));
+        };
         let mut payload_salt = [0u8; SALT_LEN];
         rand::rngs::OsRng.fill_bytes(&mut payload_salt);
-        let slots = self.slots_for_publish();
-        if slots.len() != self.keys.current_version() as usize {
-            return Err(SyncCryptoError::BadChain(format!(
-                "slot chain ({} slots) does not cover key version {} — \
-                 enter the sync passphrase to unwrap the full chain",
-                slots.len(),
-                self.keys.current_version()
-            )));
-        }
         Ok((
             ArtifactHeader {
                 sync_version: sync_version.to_string(),
                 schema_version,
-                key_version: self.keys.current_version(),
+                key_version: 1,
                 payload_salt,
                 icloud_slot: self.icloud_slot,
-                slots: slots.to_vec(),
+                slots: vec![slot.clone()],
             },
             payload_salt,
         ))
@@ -1183,93 +1004,60 @@ impl SyncCrypto {
     }
 
     pub fn encrypt_blob(&self, digest_hex: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        encrypt_blob(&self.keys, digest_hex, plaintext)
+        encrypt_blob(&self.key, digest_hex, plaintext)
     }
 
     pub fn decrypt_blob(&self, digest_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        decrypt_blob(&self.keys, digest_hex, ciphertext)
+        decrypt_blob(&self.key, digest_hex, ciphertext)
     }
 
-    /// Value for the Apple-slot synchronizable item, or `None` once the
-    /// group has rotated (`current_version >= 2`).
-    ///
-    /// **Freeze rule (ADR 05).** The item is the zero-ritual adoption
-    /// channel — and it synchronizes to every device under the Apple ID,
-    /// including a lost or compromised one. Writing a rotated CK into it
-    /// (e.g. after a passphrase unlock re-learned the chain) would
-    /// re-deliver the rotated key to exactly the devices the rotation was
-    /// meant to shut out, defeating forward-only revocation. The item may
-    /// therefore only ever carry the bootstrap-era key (v1); after any
-    /// rotation, joining a group requires the passphrase once per device —
-    /// the posture a user-initiated "suspected compromise / lost device"
-    /// action should produce.
-    pub fn synchronizable_item_value(&self) -> Option<String> {
-        let version = self.keys.current_version();
-        if version != 1 {
-            return None;
-        }
-        Some(encode_synchronizable_item(version, self.keys.current_key()))
+    /// Value for the Apple-slot synchronizable item (`v1:<base64 CK>`).
+    /// The item is the zero-ritual adoption channel for the whole Apple ID
+    /// (ADR 04 §3); there is exactly one key version now, so it always
+    /// carries it.
+    pub fn synchronizable_item_value(&self) -> String {
+        encode_synchronizable_item(&self.key)
     }
 
-    /// Serialize the FULL device-local state — key chain AND the wrapped
-    /// slot chain — for the device-local cache file.
+    /// Serialize the FULL device-local state — CK AND the wrapped slot —
+    /// for the device-local cache file.
     ///
-    /// Keys alone are not enough (real-device finding, 2026-08-27): the
-    /// bootstrapping first device must publish the very first artifact
-    /// BEFORE any artifact exists to carry slots from. A keys-only cache
+    /// The slot must ride along (real-device finding, 2026-08-27): the
+    /// bootstrapping first device publishes the very first artifact BEFORE
+    /// any artifact exists to adopt a slot from. A keys-only cache
     /// reconstructs a slot-less crypto state whose `build_header` refuses
     /// to publish — a liveness deadlock on the first publish, on every
-    /// platform (desktop merely hides it behind the live bootstrap object
-    /// until the process dies). The cache file sits beside the plaintext
-    /// DB by the same ADR 04 §2 argument as the keys-only form it replaces.
+    /// platform. The cache file sits beside the plaintext DB by the ADR 04
+    /// §2 argument: it protects only the cloud copy.
     pub fn encode_state(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(Self::STATE_MAGIC);
-        w.u16(self.keys.entries.len() as u16);
-        for (v, k) in &self.keys.entries {
-            w.u32(*v);
-            w.bytes(k);
-        }
-        w.u16(self.slots.len() as u16);
-        for slot in &self.slots {
+        w.bytes(&self.key);
+        w.u8(self.slot.is_some() as u8);
+        if let Some(slot) = &self.slot {
             slot.encode_slot(&mut w);
         }
         w.u8(self.icloud_slot as u8);
         w.into_vec()
     }
 
-    /// Parse a [`SyncCrypto::encode_state`] cache. Slot and key counts are
-    /// bounds-checked like artifact headers; structural damage is an
-    /// error, never a silent fallback.
+    /// Parse a [`SyncCrypto::encode_state`] cache. Structural damage is an
+    /// error, never a silent fallback (a legacy rotation-era cache fails
+    /// the magic and is treated as absent — the ladder falls through to
+    /// the passphrase rung).
     pub fn decode_state(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let magic = r.take(Self::STATE_MAGIC.len())?;
         if magic != Self::STATE_MAGIC {
             return Err(SyncCryptoError::BadChain("bad state-cache magic".into()));
         }
-        let key_count = r.u16()? as usize;
-        if key_count == 0 || key_count > MAX_SLOTS {
-            return Err(SyncCryptoError::BadChain(
-                "state-cache key count out of bounds".into(),
-            ));
-        }
-        let mut entries = Vec::with_capacity(key_count);
-        for _ in 0..key_count {
-            let v = r.u32()?;
-            let k = r.array::<CK_LEN>()?;
-            entries.push((v, k));
-        }
-        let keys = ContentKeys::from_entries(entries)?;
-        let slot_count = r.u16()? as usize;
-        if slot_count > MAX_SLOTS {
-            return Err(SyncCryptoError::BadChain(
-                "state-cache slot count out of bounds".into(),
-            ));
-        }
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            slots.push(ArgonSlot::decode_slot(&mut r)?);
-        }
+        let key = r.array::<CK_LEN>()?;
+        let has_slot = r.u8()? != 0;
+        let slot = if has_slot {
+            Some(ArgonSlot::decode_slot(&mut r)?)
+        } else {
+            None
+        };
         let icloud_slot = r.u8()? != 0;
         if r.remaining() != 0 {
             return Err(SyncCryptoError::BadChain(
@@ -1277,13 +1065,13 @@ impl SyncCrypto {
             ));
         }
         Ok(SyncCrypto {
-            keys,
-            slots,
+            key,
+            slot,
             icloud_slot,
         })
     }
 
-    const STATE_MAGIC: &[u8; 11] = b"CHCRYPTOST\x01";
+    const STATE_MAGIC: &[u8; 11] = b"CHCRYPTOST\x02";
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,25 +1537,22 @@ mod tests {
     #[test]
     fn state_cache_roundtrip_and_first_publish() {
         // The 2026-08-27 liveness finding: a keys-only cache cannot publish
-        // the FIRST artifact (no slots). The full-state cache must round-trip
+        // the FIRST artifact (no slot). The full-state cache must round-trip
         // the bootstrap slot so a fresh process can publish before any
         // artifact exists.
-        let mut crypto = weak_crypto();
-        crypto
-            .rotate_with_params("correct horse battery staple", ArgonParams::test())
-            .unwrap();
+        let crypto = weak_crypto();
         let bytes = crypto.encode_state();
         let restored = SyncCrypto::decode_state(&bytes).unwrap();
-        assert_eq!(restored.keys(), crypto.keys());
-        assert_eq!(restored.slots_for_publish(), crypto.slots_for_publish());
+        assert_eq!(restored.current_key(), crypto.current_key());
         assert_eq!(restored.icloud_slot(), crypto.icloud_slot());
         // The restored state can build a header with NO artifact present.
         let (header, salt) = restored.build_header("1:aa", 1).unwrap();
-        assert_eq!(header.slots.len(), 2);
-        let payload = encrypt_snapshot_payload(restored.keys(), &salt, b"x").unwrap();
+        assert_eq!(header.key_version, 1);
+        assert_eq!(header.slots.len(), 1);
+        let payload = encrypt_snapshot_payload(restored.current_key(), &salt, b"x").unwrap();
         let opened = decrypt_snapshot_payload(
-            &SyncCrypto::decode_state(&bytes).unwrap().keys().clone(),
-            &header,
+            SyncCrypto::decode_state(&bytes).unwrap().current_key(),
+            &header.payload_salt,
             &payload,
         )
         .unwrap();
@@ -1775,8 +1560,11 @@ mod tests {
         // Structural damage is rejected.
         assert!(SyncCrypto::decode_state(b"garbage").is_err());
         assert!(SyncCrypto::decode_state(&bytes[..bytes.len() - 1]).is_err());
-        // Keys-only legacy caches no longer decode (no-compat window).
-        assert!(SyncCrypto::decode_state(&crypto.keys().encode()).is_err());
+        // The rotation-era cache layout (\x01 magic) no longer decodes —
+        // the ladder treats such a cache as absent (no-compat window).
+        let mut legacy_magic = bytes.clone();
+        legacy_magic[10] = 1;
+        assert!(SyncCrypto::decode_state(&legacy_magic).is_err());
     }
 
     #[test]
@@ -1794,92 +1582,101 @@ mod tests {
     }
 
     #[test]
-    fn rotation_keeps_old_keys_decrypt_only() {
-        let mut crypto = weak_crypto();
-        let old_data = b"blob written before rotation".to_vec();
-        let old_digest = digest_of(&old_data);
-        let old_sealed = crypto.encrypt_blob(&old_digest, &old_data).unwrap();
-        crypto
-            .rotate_with_params("correct horse battery staple", ArgonParams::test())
-            .unwrap();
-        assert_eq!(crypto.keys().current_version(), 2);
-        // Old blob still decrypts (old key rides forward).
-        assert_eq!(
-            crypto.decrypt_blob(&old_digest, &old_sealed).unwrap(),
-            old_data
-        );
-        // New writes use the new version.
-        let new_data = b"blob written after rotation".to_vec();
-        let new_digest = digest_of(&new_data);
-        let new_sealed = crypto.encrypt_blob(&new_digest, &new_data).unwrap();
-        // A holder of only the old key (fresh chain with just v1) cannot
-        // decrypt new writes.
-        let keys_v1 = ContentKeys::from_entries(vec![(
-            1,
-            crypto.keys().key_for_version(1).unwrap().to_owned(),
-        )])
-        .unwrap();
-        let old_only = SyncCrypto::from_keys(keys_v1, vec![], false).unwrap();
-        match old_only.decrypt_blob(&new_digest, &new_sealed) {
-            Err(SyncCryptoError::UnknownKeyVersion(2)) => {}
-            other => panic!("expected UnknownKeyVersion(2), got {other:?}"),
+    fn legacy_artifact_headers_rejected() {
+        // Rotation-era artifacts (key_version >= 2 or multi-slot) are
+        // rejected at parse with actionable copy — read compatibility was
+        // dropped by design (ADR 06).
+        let crypto = weak_crypto();
+        let (header, _) = crypto.build_header("1:aa", 1).unwrap();
+
+        let mut v2 = header.clone();
+        v2.key_version = 2;
+        match ArtifactHeader::parse(&v2.to_bytes()) {
+            Err(SyncCryptoError::Corrupt(msg)) => assert!(msg.contains("key version 2")),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        let mut multi = header.clone();
+        multi.slots.push(multi.slots[0].clone());
+        match ArtifactHeader::parse(&multi.to_bytes()) {
+            Err(SyncCryptoError::Corrupt(msg)) => assert!(msg.contains("multi-slot")),
+            other => panic!("expected Corrupt, got {other:?}"),
         }
     }
 
     #[test]
-    fn slot_chain_carries_forward_without_passphrase() {
-        // Bootstrap on device A, rotate once; device B adopts the CURRENT
-        // key from the Keychain and carries A's slot bytes verbatim — it can
-        // still publish a complete header.
-        let mut a = weak_crypto();
-        a.rotate_with_params("correct horse battery staple", ArgonParams::test())
-            .unwrap();
+    fn legacy_blob_version_rejected() {
+        let crypto = weak_crypto();
+        let data = b"blob".to_vec();
+        let digest = digest_of(&data);
+        let sealed = crypto.encrypt_blob(&digest, &data).unwrap();
+        // Blob layout: magic(8) + format u16(2) + kind u8(1) + key_version
+        // u32(4) — patch the version field to a rotation-era value.
+        let mut legacy = sealed.clone();
+        legacy[11..15].copy_from_slice(&2u32.to_le_bytes());
+        match crypto.decrypt_blob(&digest, &legacy) {
+            Err(SyncCryptoError::Corrupt(msg)) => assert!(msg.contains("key version 2")),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slot_adopted_from_artifact_without_passphrase() {
+        // The Keychain adopter holds ONLY the CK; it adopts the wrapped
+        // slot bytes verbatim from the artifact header and can then
+        // publish a complete header — the passphrase fallback stays alive.
+        let a = weak_crypto();
         let (header, _salt) = a.build_header("3:cafe", 1).unwrap();
-        assert_eq!(header.key_version, 2);
-        assert_eq!(header.slots.len(), 2);
+        assert_eq!(header.key_version, 1);
+        assert_eq!(header.slots.len(), 1);
 
-        let keys_b = ContentKeys::from_entries(vec![(2, *a.keys().current_key())]).unwrap();
-        let b = SyncCrypto::from_keys(keys_b, header.slots.clone(), true).unwrap();
+        let mut b = SyncCrypto::from_keys(*a.current_key(), None, true).unwrap();
+        // Without a slot the adopter cannot publish...
+        assert!(matches!(
+            b.build_header("4:beef", 1),
+            Err(SyncCryptoError::BadChain(_))
+        ));
+        // ...and adoption from the next remote header fixes exactly that.
+        b.adopt_slot_from(&header);
         let (header_b, _) = b.build_header("4:beef", 1).unwrap();
-        assert_eq!(header_b.key_version, 2);
-        assert_eq!(header_b.slots.len(), 2);
-        // The carried slots unwrap under the passphrase to the full chain.
+        assert_eq!(header_b.key_version, 1);
+        assert_eq!(header_b.slots.len(), 1);
+        // The adopted slot unwraps under the passphrase to A's key.
         let recovered =
-            SyncCrypto::from_passphrase(&header_b, "correct horse battery staple", None, true)
-                .unwrap();
-        assert_eq!(recovered.keys(), a.keys());
+            SyncCrypto::from_passphrase(&header_b, "correct horse battery staple", true).unwrap();
+        assert_eq!(recovered.current_key(), a.current_key());
     }
 
     #[test]
-    fn partial_chain_cannot_publish_missing_slots() {
-        let mut a = weak_crypto();
-        a.rotate_with_params("correct horse battery staple", ArgonParams::test())
-            .unwrap();
-        // Device holds the full rotated chain but only the pre-rotation
-        // slots (1 slot for version 2): publishing must fail loudly.
-        let keys_b = ContentKeys::from_entries(vec![
-            (1, *a.keys().key_for_version(1).unwrap()),
-            (2, *a.keys().current_key()),
-        ])
-        .unwrap();
-        let slots_v1 = a.slots_for_publish()[1..].to_vec();
-        let b = SyncCrypto::from_keys(keys_b, slots_v1, true).unwrap();
-        match b.build_header("5:f00d", 1) {
-            Err(SyncCryptoError::BadChain(_)) => {}
-            other => panic!("expected BadChain, got {other:?}"),
-        }
+    fn adopt_never_overwrites_held_slot() {
+        let a = weak_crypto();
+        let (header, _) = a.build_header("1:aa", 1).unwrap();
+        let mut b =
+            SyncCrypto::bootstrap_with_params("a different passphrase", ArgonParams::test())
+                .unwrap();
+        b.adopt_slot_from(&header);
+        let (hb, _) = b.build_header("2:bb", 1).unwrap();
+        let opened = SyncCrypto::from_passphrase(&hb, "correct horse battery staple", true);
+        assert!(
+            opened.is_err(),
+            "the foreign slot must not replace the held one"
+        );
     }
 
     #[test]
     fn synchronizable_item_roundtrip_and_legacy_rejection() {
         let key = [9u8; CK_LEN];
-        let value = encode_synchronizable_item(3, &key);
-        assert_eq!(parse_synchronizable_item(&value), Some((3, key)));
-        // Legacy bare-base64 (pre-ADR-05) items never adopt — the version
-        // is the anti-stale guard and must be mandatory.
+        let value = encode_synchronizable_item(&key);
+        assert_eq!(parse_synchronizable_item(&value), Some(key));
+        // Legacy bare-base64 items never adopt.
         use base64::{Engine as _, engine::general_purpose};
         let legacy = general_purpose::STANDARD.encode(key);
         assert_eq!(parse_synchronizable_item(&legacy), None);
+        // Rotation-era versions never adopt.
+        assert_eq!(
+            parse_synchronizable_item(&format!("v2:{}", general_purpose::STANDARD.encode(key))),
+            None
+        );
         // Malformed variants.
         assert_eq!(parse_synchronizable_item("v1:not-base64!!"), None);
         assert_eq!(parse_synchronizable_item("x1:AAAA"), None);
@@ -1895,56 +1692,31 @@ mod tests {
     }
 
     #[test]
-    fn synchronizable_item_freezes_after_rotation() {
-        // ADR 05 freeze rule: only the bootstrap-era (v1) key may ride the
-        // zero-ritual item. Refreshing it after a rotation would re-deliver
-        // the rotated CK to every device under the Apple ID — including a
-        // lost one — defeating forward-only revocation.
-        let mut crypto = weak_crypto();
-        let v1_value = crypto.synchronizable_item_value().unwrap();
-        assert_eq!(parse_synchronizable_item(&v1_value).unwrap().0, 1);
-        crypto
-            .rotate_with_params("correct horse battery staple", ArgonParams::test())
-            .unwrap();
-        assert!(
-            crypto.synchronizable_item_value().is_none(),
-            "a rotated group must never refresh the item"
+    fn synchronizable_item_always_carries_the_key() {
+        // One key version exists; the item always carries it.
+        let crypto = weak_crypto();
+        let value = crypto.synchronizable_item_value();
+        assert_eq!(
+            parse_synchronizable_item(&value),
+            Some(*crypto.current_key())
         );
     }
 
     #[test]
-    fn rotate_budget_error_leaves_object_unchanged() {
-        // F3: the slot-budget rejection must fire BEFORE any mutation — a
-        // minted key with no matching wrapped slot would be publishable but
-        // never passphrase-recoverable.
-        let mut crypto = weak_crypto();
-        crypto.slots = (0..MAX_SLOTS)
-            .map(|_| crypto.slots[0].clone())
-            .collect::<Vec<_>>();
-        let keys_before = crypto.keys().clone();
-        let slots_before = crypto.slots.clone();
-        match crypto.rotate_with_params("p", ArgonParams::test()) {
-            Err(SyncCryptoError::BadChain(_)) => {}
-            other => panic!("expected BadChain, got {other:?}"),
-        }
-        assert_eq!(crypto.keys(), &keys_before);
-        assert_eq!(crypto.slots, slots_before);
-        assert_eq!(crypto.keys().current_version(), 1);
-    }
-
-    #[test]
     fn artifact_roundtrip() {
-        let mut crypto = weak_crypto();
-        crypto
-            .rotate_with_params("pass phrase two words", ArgonParams::test())
-            .unwrap();
+        let crypto = weak_crypto();
         let (header, salt) = crypto.build_header("7:abcd", 3).unwrap();
-        let payload = encrypt_snapshot_payload(crypto.keys(), &salt, b"zstd-bytes-here").unwrap();
+        let payload =
+            encrypt_snapshot_payload(crypto.current_key(), &salt, b"zstd-bytes-here").unwrap();
         let artifact = build_artifact(&header, &payload);
         let (parsed_header, parsed_payload) = split_artifact(&artifact).unwrap();
         assert_eq!(parsed_header, header);
-        let opened =
-            decrypt_snapshot_payload(crypto.keys(), &parsed_header, parsed_payload).unwrap();
+        let opened = decrypt_snapshot_payload(
+            crypto.current_key(),
+            &parsed_header.payload_salt,
+            parsed_payload,
+        )
+        .unwrap();
         assert_eq!(opened, b"zstd-bytes-here");
     }
 
@@ -1952,11 +1724,14 @@ mod tests {
     fn artifact_wrong_passphrase_and_corruption() {
         let crypto = weak_crypto();
         let (header, salt) = crypto.build_header("1:aa", 1).unwrap();
-        let payload = encrypt_snapshot_payload(crypto.keys(), &salt, b"data").unwrap();
+        let payload = encrypt_snapshot_payload(crypto.current_key(), &salt, b"data").unwrap();
         let artifact = build_artifact(&header, &payload);
 
-        // Wrong passphrase fails on unwrap (AEAD tag failure).
-        assert!(SyncCrypto::from_passphrase(&header, "wrong", None, true).is_err());
+        // Wrong passphrase fails on unwrap — typed, not a generic Auth.
+        assert!(matches!(
+            SyncCrypto::from_passphrase(&header, "wrong", true),
+            Err(SyncCryptoError::WrongPassphrase)
+        ));
 
         // Garbage magic never parses.
         let mut foreign = artifact.clone();
@@ -1968,7 +1743,7 @@ mod tests {
         let (h, p) = split_artifact(&artifact).unwrap();
         let mut bad = h.clone();
         bad.payload_salt[0] ^= 1;
-        assert!(decrypt_snapshot_payload(crypto.keys(), &bad, p).is_err());
+        assert!(decrypt_snapshot_payload(crypto.current_key(), &bad.payload_salt, p).is_err());
     }
 
     #[test]
@@ -1984,29 +1759,16 @@ mod tests {
     }
 
     #[test]
-    fn chain_encode_decode_roundtrip() {
-        let mut crypto = weak_crypto();
-        crypto.rotate_with_params("p", ArgonParams::test()).unwrap();
-        let encoded = crypto.keys().encode();
-        let decoded = ContentKeys::decode(&encoded).unwrap();
-        assert_eq!(decoded, *crypto.keys());
-        // The cache file is intentionally AEAD-free material beside a
-        // plaintext DB (ADR 04 §2); corruption surfaces as a wrong key at
-        // first use, but structural damage must still be rejected.
-        assert!(ContentKeys::decode(b"garbage").is_err());
-        let truncated = &encoded[..encoded.len() - 1];
-        assert!(ContentKeys::decode(truncated).is_err());
-    }
-
-    #[test]
-    fn from_passphrase_recovers_full_chain() {
+    fn from_passphrase_recovers_the_key() {
         let crypto = weak_crypto();
         let (header, _) = crypto.build_header("9:cc", 1).unwrap();
         let recovered =
-            SyncCrypto::from_passphrase(&header, "correct horse battery staple", None, true)
-                .unwrap();
-        assert_eq!(recovered.keys(), crypto.keys());
+            SyncCrypto::from_passphrase(&header, "correct horse battery staple", true).unwrap();
+        assert_eq!(recovered.current_key(), crypto.current_key());
+        // The recovered state can publish immediately.
+        assert!(recovered.build_header("10:dd", 1).is_ok());
     }
+
     #[test]
     fn passphrase_shape() {
         let mut seen = std::collections::HashSet::new();
