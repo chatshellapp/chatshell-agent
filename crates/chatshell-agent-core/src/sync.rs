@@ -707,43 +707,105 @@ pub struct SyncEngine {
     /// `maybe_flush`, which then forces a publish regardless of the pool
     /// baseline.
     force_first_flush: bool,
+    /// Age threshold for [`sweep_stale_staged`]; tests shrink it to zero.
+    staged_max_age: std::time::Duration,
 }
 /// Meta key recording whether the previous process ended with a successful
 /// publish (diagnostic only; the forced-flush decision uses
 /// [`META_SHIPPED_ROW_WATERMARK`]).
 const META_CLEAN_EXIT: &str = "sync_clean_exit";
-/// Meta key carrying the row-timestamp watermark (max `updated_at` over
-/// the merge registry) of the last publish; a fresh engine arms a forced
-/// flush when the current watermark differs (audit F2 — data_version is
-/// unusable for this: fresh WAL connections don't observe prior
-/// processes' commits).
+/// Meta key carrying the row watermark of the last publish; a fresh engine
+/// arms a forced flush when the current watermark differs (audit F2 —
+/// data_version is unusable for this: fresh WAL connections don't observe
+/// prior processes' commits). Value format is opaque ([`row_watermark`]).
 const META_SHIPPED_ROW_WATERMARK: &str = "sync_shipped_row_watermark";
 
-/// Max `updated_at` across the registry's tables ("" when all empty).
-/// RFC3339 stamps compare correctly as strings; the migration guaranteed
-/// `updated_at` on every synced table.
+/// Change detector over the registry's live rows: `<count>:<sum>` where
+/// `sum` adds the julianday-normalized `updated_at` of every live row.
+///
+/// The merge path compares timestamps via `julianday()` because desktop
+/// (`+00:00` suffix, variable fraction width) and iOS (`Z` suffix) stamp
+/// shapes do not order lexicographically across devices; the previous
+/// raw-string `MAX(updated_at)` watermark inherited exactly that flaw —
+/// under cross-device clock skew, a new or edited row whose stamp sorts
+/// below the current max moved nothing and stranded as "shipped", even
+/// across engine restarts and manual passes (audit 2026-08-28, M1).
+///
+/// Count catches inserts and soft-deletes independent of stamps; the sum
+/// (millisecond resolution, matching `julianday`) catches any edit because
+/// an edit always advances that row's stamp. Unparseable stamps coalesce
+/// to 0.0, as in the merge's LWW compare. A watermark stored by an older
+/// engine (raw string) simply mismatches once, arming one idempotent
+/// republish on the first pass after the upgrade.
 fn row_watermark(conn: &Connection, tables: &[TableSpec]) -> String {
-    tables
-        .iter()
-        .filter_map(|spec| {
-            conn.query_row(
-                &format!(
-                    "SELECT COALESCE(MAX(updated_at), '') FROM {} WHERE deleted_at IS NULL",
-                    spec.name
-                ),
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        })
-        .max()
-        .unwrap_or_default()
+    let mut count: u64 = 0;
+    let mut sum: f64 = 0.0;
+    for spec in tables {
+        let Ok((rows, stamped)) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), \
+                 COALESCE(SUM(COALESCE(julianday(updated_at), 0.0)), 0.0) \
+                 FROM {} WHERE deleted_at IS NULL",
+                spec.name
+            ),
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        ) else {
+            continue;
+        };
+        count += rows.max(0) as u64;
+        sum += stamped;
+    }
+    format!("{count}:{sum:.3}")
 }
 
 /// Minimum wall-clock spacing between tick-driven publishes. Each publish is
 /// a full `VACUUM INTO` of the database plus a cloud upload, so an idle or
 /// lightly-used app must not republish on every timer tick.
 const PUBLISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Age at which leftover staging files in the cache dir become sweepable
+/// (audit 2026-08-28, low): a crashed pass can leave decrypted snapshots
+/// behind because per-pass cleanup is best-effort. Only files older than
+/// this are touched, so a concurrent pass in another process is never
+/// sabotaged. Tests shrink this to zero.
+const STALE_STAGED_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// File-name prefixes this engine's staging paths use inside the cache
+/// dir: decrypted remote snapshots (`chatshell-staged-*` / the legacy
+/// `chatshell-snapshot-*`) and publish-time plaintext temps
+/// (`snapshot-plain-*`).
+const STAGED_PREFIXES: [&str; 3] = [
+    "chatshell-staged-",
+    "chatshell-snapshot-",
+    "snapshot-plain-",
+];
+
+/// Best-effort removal of staging leftovers older than `max_age`. Failures
+/// are ignored: the sweep is hygiene, never a pass precondition.
+fn sweep_stale_staged(cache_dir: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !STAGED_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// Placeholder version id before a device mints its first real version.
 const INITIAL_VERSION: &str = "0:local";
@@ -792,6 +854,7 @@ impl SyncEngine {
             min_publish_interval: PUBLISH_MIN_INTERVAL,
             last_publish_at: None,
             force_first_flush: false,
+            staged_max_age: STALE_STAGED_AGE,
         };
         engine.ensure_device_id()?;
         // Cross-process unshipped-write detection (audit F2, fixed
@@ -810,6 +873,7 @@ impl SyncEngine {
         engine.force_first_flush = engine.current_version() != INITIAL_VERSION
             && shipped.as_deref().is_none_or(|seen| seen != watermark);
         set_meta(&engine.conn, META_CLEAN_EXIT, "0")?;
+        sweep_stale_staged(&engine.cache_dir, engine.staged_max_age);
         validate_registry(&engine.conn, engine.tables)
             .context("sync registry validation against live schema")?;
         Ok(engine)
@@ -1457,6 +1521,85 @@ CREATE TABLE conversations (
         // And after the healing publish, bookkeeping converges: the next
         // pass is a quiet up-to-date.
         assert_eq!(a.sync_now().unwrap().action, "up-to-date");
+    }
+
+    #[test]
+    fn skewed_timestamp_write_still_ships() {
+        // Audit 2026-08-28 M1: the watermark used to be the raw string
+        // MAX(updated_at). A row stamped below the current lexicographic
+        // max — cross-device clock skew, or a peer row carrying a future
+        // stamp — moved nothing, stranding the write as "shipped" across
+        // engine restarts and manual passes. The count+sum watermark must
+        // detect it via the row count alone.
+        let space = dir("skew");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        // A peer-origin row with a far-future stamp dominates any string
+        // comparison a local write could win.
+        seed(&a_path, "future", "peer clock ahead");
+        restamp(&a_path, "future", "2030-01-01T00:00:00+00:00");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+
+        // With NO engine alive, a local write lands whose stamp sorts far
+        // BELOW the future row (skewed local clock).
+        let pool = Connection::open(&a_path).unwrap();
+        pool.execute(
+            "INSERT INTO conversations(id, title, created_at, updated_at)
+             VALUES('skewed', 'below the max', '2026-08-21T09:00:00+00:00',
+                    '2026-08-21T09:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        drop(pool);
+
+        // The next engine's first pass must ship it — the string max is
+        // unchanged, so only the count/sum detector can see the row.
+        let mut a2 = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        let out = a2.sync_now().unwrap();
+        assert!(out.republished, "skewed write must ship: {out:?}");
+
+        let reader_db = space.path().join("reader.db");
+        seed(&reader_db, "r1", "reader");
+        let mut reader = plain_engine(&reader_db, cloud.clone(), space.path().join("cache-r"));
+        reader.sync_now().unwrap();
+        let n: i64 = reader
+            .connection()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert!(n >= 3, "reader must see the skewed row: {n}");
+    }
+
+    /// Test helper: rewrite one row's `updated_at` (simulating a peer
+    /// stamp shape the plain seeding helper cannot express).
+    fn restamp(db: &Path, id: &str, stamp: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![stamp, id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_staged_files_are_swept() {
+        let space = dir("sweep");
+        let cache = space.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("chatshell-staged-1-2.db"), b"stale").unwrap();
+        std::fs::write(cache.join("snapshot-plain-x.tmp"), b"stale").unwrap();
+        std::fs::write(cache.join("unrelated.txt"), b"keep").unwrap();
+
+        sweep_stale_staged(&cache, std::time::Duration::ZERO);
+
+        assert!(!cache.join("chatshell-staged-1-2.db").exists());
+        assert!(!cache.join("snapshot-plain-x.tmp").exists());
+        assert!(
+            cache.join("unrelated.txt").exists(),
+            "non-staging files stay"
+        );
     }
 
     #[test]
