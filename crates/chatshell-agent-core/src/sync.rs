@@ -915,6 +915,15 @@ impl SyncEngine {
             let new_version = format!("{}:{}", counter + 1, self.device_id());
             set_meta(&self.conn, META_SYNC_VERSION, &new_version)?;
         }
+        // Capture the row watermark BEFORE serializing the snapshot
+        // (real-device finding 2026-08-28 #4: capturing it after meant a
+        // write racing the serialization advanced the watermark past rows
+        // the snapshot did NOT contain — `shipped == local` forever, rows
+        // stranded until a later unrelated publish). The pre-read can only
+        // err the other way: a racy write lands IN the snapshot while the
+        // watermark says unshipped, and the next pass republishes once —
+        // idempotent, never lossy.
+        let shipped_watermark = row_watermark(&self.conn, self.tables);
         match self.crypto.as_ref() {
             Some(crypto) => publish_snapshot_encrypted(
                 &self.conn,
@@ -936,11 +945,7 @@ impl SyncEngine {
         // writes committed after this publish (audit F2).
         self.force_first_flush = false;
         set_meta(&self.conn, META_CLEAN_EXIT, "1")?;
-        set_meta(
-            &self.conn,
-            META_SHIPPED_ROW_WATERMARK,
-            &row_watermark(&self.conn, self.tables),
-        )?;
+        set_meta(&self.conn, META_SHIPPED_ROW_WATERMARK, &shipped_watermark)?;
         Ok(())
     }
 
@@ -956,11 +961,24 @@ impl SyncEngine {
         Ok(self.data_version()? != self.pool_baseline_data_version)
     }
 
-    /// Throttled flush for timer-driven ticks: publish pending local writes
-    /// only when the app pool actually committed since the last publish AND
-    /// the last publish is older than the configured interval. Returns true
-    /// when a snapshot was published.
-    fn maybe_flush(&mut self) -> Result<bool> {
+    /// True when rows exist that no publish carried: the live row
+    /// watermark differs from the shipped one (real-device finding
+    /// 2026-08-28 #4/#6). Unlike `pool_has_unshipped_writes` this sees
+    /// commits from ANY connection — including the engine's own and
+    /// same-session writes that `data_version` baselines absorbed — so a
+    /// pass can never strand local rows as "shipped".
+    fn unshipped_by_watermark(&self) -> Result<bool> {
+        if self.current_version() == INITIAL_VERSION {
+            return Ok(false);
+        }
+        let shipped = get_meta(&self.conn, META_SHIPPED_ROW_WATERMARK)?;
+        Ok(shipped.as_deref() != Some(row_watermark(&self.conn, self.tables).as_str()))
+    }
+
+    /// Throttled flush for timer-driven ticks; `manual` (a user-triggered
+    /// pass) bypasses the interval so same-session writes ship immediately.
+    /// Returns true when a snapshot was published.
+    fn maybe_flush(&mut self, manual: bool) -> Result<bool> {
         // Armed at construction: the previous process may have died with
         // unshipped writes that the pool baseline cannot see. Consume the
         // flag once and force the publish (bypassing the throttle - this is
@@ -970,10 +988,11 @@ impl SyncEngine {
             self.publish_inner(true)?;
             return Ok(true);
         }
-        if !self.pool_has_unshipped_writes()? {
+        if !self.pool_has_unshipped_writes()? && !self.unshipped_by_watermark()? {
             return Ok(false);
         }
-        if let Some(at) = self.last_publish_at
+        if !manual
+            && let Some(at) = self.last_publish_at
             && at.elapsed() < self.min_publish_interval
         {
             return Ok(false);
@@ -986,17 +1005,35 @@ impl SyncEngine {
     }
 
     /// The UpToDate tail: nothing to pull, but local writes since the last
-    /// publish must still ship (throttled — see `maybe_flush`).
-    fn up_to_date_tail(&mut self) -> Result<SyncOutcome> {
-        let flushed = self.maybe_flush()?;
+    /// publish must still ship (throttled for ticks, immediate when
+    /// `manual` — see `maybe_flush`).
+    fn up_to_date_tail(&mut self, manual: bool) -> Result<SyncOutcome> {
+        let flushed = self.maybe_flush(manual)?;
         Ok(SyncOutcome {
             action: if flushed { "flushed" } else { "up-to-date" }.into(),
             rows_merged: 0,
             republished: flushed,
         })
     }
+}
 
+impl SyncEngine {
+    /// One scheduled pass: merge remote changes, then republish when
+    /// needed. Tick-driven flushes honor the publish throttle.
     pub fn sync_now(&mut self) -> Result<SyncOutcome> {
+        self.sync_now_inner(false)
+    }
+
+    /// One user-triggered pass (Settings → Sync Now): identical to
+    /// [`SyncEngine::sync_now`] except the flush ignores the publish
+    /// throttle — a manual pass must ship same-session writes immediately
+    /// (real-device finding 2026-08-28 #6: writes only ever shipped on
+    /// relaunch).
+    pub fn sync_now_manual(&mut self) -> Result<SyncOutcome> {
+        self.sync_now_inner(true)
+    }
+
+    fn sync_now_inner(&mut self, manual: bool) -> Result<SyncOutcome> {
         if self.crypto.is_some() {
             let enc = encrypted_snapshot_name(&self.snapshot_path());
             if !enc.exists() {
@@ -1014,10 +1051,10 @@ impl SyncEngine {
             }
             let action = plan_sync_header(&self.conn, &header)?;
             match action {
-                SyncAction::UpToDate => self.up_to_date_tail(),
+                SyncAction::UpToDate => self.up_to_date_tail(manual),
                 SyncAction::Adopt | SyncAction::Merge => {
                     let staged = self.stage_encrypted(&enc)?;
-                    let outcome = self.merge_against_staged(&staged, Some(&header), action);
+                    let outcome = self.merge_against_staged(&staged, Some(&header), action, manual);
                     let _ = std::fs::remove_file(&staged);
                     outcome
                 }
@@ -1026,7 +1063,7 @@ impl SyncEngine {
             let staged = self.stage_remote_snapshot()?;
             match staged {
                 Some((snapshot, is_temp)) => {
-                    let result = self.sync_against(&snapshot);
+                    let result = self.sync_against(&snapshot, manual);
                     if is_temp {
                         let _ = std::fs::remove_file(&snapshot);
                     }
@@ -1099,15 +1136,15 @@ impl SyncEngine {
         }
     }
 
-    fn sync_against(&mut self, snapshot: &Path) -> Result<SyncOutcome> {
+    fn sync_against(&mut self, snapshot: &Path, manual: bool) -> Result<SyncOutcome> {
         let remote = Connection::open(snapshot)?;
         let action = plan_sync(&self.conn, &remote)?;
         drop(remote);
 
         match action {
-            SyncAction::UpToDate => self.up_to_date_tail(),
+            SyncAction::UpToDate => self.up_to_date_tail(manual),
             SyncAction::Adopt | SyncAction::Merge => {
-                self.merge_against_staged(snapshot, None, action)
+                self.merge_against_staged(snapshot, None, action, manual)
             }
         }
     }
@@ -1123,6 +1160,7 @@ impl SyncEngine {
         snapshot: &Path,
         header: Option<&ArtifactHeader>,
         _action: SyncAction,
+        manual: bool,
     ) -> Result<SyncOutcome> {
         if let Some(header) = header {
             let staged = Connection::open(snapshot).ok();
@@ -1163,16 +1201,25 @@ impl SyncEngine {
         if rows_merged == 0 {
             // Content already equal: adopt the remote version id and
             // converge - republishing under a new id would ping-pong.
-            // `pool_baseline_data_version` is intentionally NOT
-            // refreshed here: pool writes since construction are
-            // still unshipped and must stay detectable below.
+            // Adoption proves local content == the remote snapshot, so
+            // every local row IS shipped: mark the watermark accordingly
+            // or the unshipped-rows heal would republish on the next pass.
+            // `pool_baseline_data_version` is intentionally NOT refreshed
+            // here: pool writes since construction are still unshipped and
+            // must stay detectable below.
             set_meta(&self.conn, META_SYNC_VERSION, &remote_version)?;
+            set_meta(
+                &self.conn,
+                META_SHIPPED_ROW_WATERMARK,
+                &row_watermark(&self.conn, self.tables),
+            )?;
             let seen = self.data_version()?;
             self.last_published_data_version = Some(seen);
             // Adoption alone must not strand local writes made while
             // the app was running (e.g. a conversation created since
-            // the last publish): ship them via the throttled flush.
-            let flushed = self.maybe_flush()?;
+            // the last publish): ship them via the (possibly unthrottled)
+            // flush.
+            let flushed = self.maybe_flush(manual)?;
             Ok(SyncOutcome {
                 action: if flushed { "flushed" } else { "converged" }.into(),
                 rows_merged: 0,
@@ -1300,6 +1347,118 @@ CREATE TABLE conversations (
             .unwrap();
         assert_eq!(n, 2);
     }
+
+    #[test]
+    fn own_connection_writes_ship_on_next_pass() {
+        // Real-device finding 2026-08-28 #6: commits from the engine's OWN
+        // connection (and any commit the data_version baseline absorbed)
+        // are invisible to the pool-dirty check — writes used to sit until
+        // an unrelated publish. The watermark heal must catch them.
+        let space = dir("watermark-heal");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        a.sync_now().unwrap(); // published-initial
+        seed(&b_path, "a1", "from A");
+        let mut b = plain_engine(&b_path, cloud.clone(), space.path().join("cache-b"));
+        assert_eq!(b.sync_now().unwrap().action, "converged");
+
+        // A writes through its own engine connection — data_version cannot
+        // see this. The next tick (throttle window elapsed) must ship it,
+        // no restart, no manual flag.
+        a.min_publish_interval = std::time::Duration::ZERO;
+        a.connection()
+            .execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('a2', 'own-conn write', '2026-08-28T12:00:00+00:00',
+                        '2026-08-28T12:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        let out = a.sync_now().unwrap();
+        assert_eq!(out.action, "flushed", "watermark heal must ship: {out:?}");
+        assert!(out.republished);
+
+        let out_b = b.sync_now().unwrap();
+        assert_eq!(
+            out_b.rows_merged, 1,
+            "peer must pull the healed row: {out_b:?}"
+        );
+    }
+
+    #[test]
+    fn manual_pass_flushes_despite_throttle() {
+        // Real-device finding 2026-08-28 #6: a user-triggered pass must
+        // ship same-session writes immediately, not after the 5-minute
+        // publish throttle.
+        let space = dir("manual-flush");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        a.sync_now().unwrap();
+
+        // Write via a SEPARATE connection (pool-visible dirty) right after
+        // the publish: the scheduled pass is throttled, the manual one is
+        // not.
+        {
+            let writer = Connection::open(&a_path).unwrap();
+            writer
+                .execute(
+                    "INSERT INTO conversations(id, title, created_at, updated_at)
+                     VALUES('a2', 'pool write', '2026-08-28T12:30:00+00:00',
+                            '2026-08-28T12:30:00+00:00')",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            a.sync_now().unwrap().action,
+            "up-to-date",
+            "tick stays throttled"
+        );
+        assert_eq!(
+            a.sync_now_manual().unwrap().action,
+            "flushed",
+            "manual pass bypasses the throttle"
+        );
+    }
+
+    #[test]
+    fn stale_shipped_watermark_heals_on_next_pass() {
+        // Real-device finding 2026-08-28 #4: bookkeeping that claims rows
+        // shipped when they are not (the pre-fix watermark race recorded
+        // the POST-snapshot watermark). Simulate the divergence — shipped
+        // watermark behind the live rows, pool-dirty clean — and prove the
+        // next pass re-ships.
+        let space = dir("stale-watermark");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "a1", "from A");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        a.min_publish_interval = std::time::Duration::ZERO;
+        a.sync_now().unwrap();
+
+        // Bookkeeping claims nothing was ever shipped...
+        set_meta(a.connection(), META_SHIPPED_ROW_WATERMARK, "").unwrap();
+        // ...while the engine holds no pool-dirty signal (its own publish
+        // refreshed the baseline). The heal must fire anyway.
+        let out = a.sync_now().unwrap();
+        assert_eq!(out.action, "flushed", "stale watermark must heal: {out:?}");
+
+        // And after the healing publish, bookkeeping converges: the next
+        // pass is a quiet up-to-date.
+        assert_eq!(a.sync_now().unwrap().action, "up-to-date");
+    }
+
     #[test]
     fn two_engines_converge_via_cloud_snapshot() {
         let space = dir("engine");

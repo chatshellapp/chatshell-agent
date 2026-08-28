@@ -93,16 +93,18 @@ const MAX_WRAPPED_LEN: usize = 4096;
 pub enum SyncCryptoError {
     #[error("artifact is corrupt or foreign: {0}")]
     Corrupt(String),
+    #[error("invalid sync passphrase: {0}")]
+    InvalidPassphrase(String),
     #[error("unsupported transport format version {0}")]
     UnsupportedFormat(u16),
-    #[error("decryption failed (wrong key or tampered data)")]
-    Auth,
     #[error("content hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
     #[error("malformed content-key chain: {0}")]
     BadChain(String),
     #[error("wrong passphrase")]
     WrongPassphrase,
+    #[error("decryption failed (wrong key or tampered data)")]
+    Auth,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -901,6 +903,13 @@ impl SyncCrypto {
     }
 
     pub fn bootstrap_with_params(passphrase: &str, params: ArgonParams) -> Result<Self> {
+        if passphrase.trim().is_empty() {
+            // Real-device finding 2026-08-28 #5: `bootstrap ""` used to
+            // succeed — a group whose fallback passphrase unlocks nothing.
+            return Err(SyncCryptoError::InvalidPassphrase(
+                "must not be empty".into(),
+            ));
+        }
         let key = random_ck();
         let slot = wrap_ck(&key, passphrase, params)?;
         Ok(SyncCrypto {
@@ -933,6 +942,10 @@ impl SyncCrypto {
         passphrase: &str,
         icloud_slot: bool,
     ) -> Result<Self> {
+        if passphrase.trim().is_empty() {
+            // Skip the Argon2 work: an empty entry is definitionally wrong.
+            return Err(SyncCryptoError::WrongPassphrase);
+        }
         let slot = header
             .slots
             .first()
@@ -1794,5 +1807,18 @@ mod tests {
     #[test]
     fn weak_test_params_are_not_default() {
         assert!(DEFAULT_ARGON_PARAMS.m_cost > ArgonParams::test().m_cost);
+    }
+
+    #[test]
+    fn bootstrap_rejects_empty_passphrase() {
+        // Real-device finding 2026-08-28 #5: `bootstrap ""` used to mint a
+        // group whose fallback passphrase unlocks nothing.
+        for empty in ["", "   ", "\n\t"] {
+            match SyncCrypto::bootstrap_with_params(empty, ArgonParams::test()) {
+                Err(SyncCryptoError::InvalidPassphrase(_)) => {}
+                other => panic!("expected InvalidPassphrase for {empty:?}, got {other:?}"),
+            }
+        }
+        assert!(SyncCrypto::bootstrap_with_params("  real phrase  ", ArgonParams::test()).is_ok());
     }
 }

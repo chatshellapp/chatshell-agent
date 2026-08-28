@@ -1129,10 +1129,22 @@ impl SyncEngine {
             .map_err(classify_sync_error)
     }
 
-    /// The engine's current crypto state (may have gained carried slots
-    /// after a pass saw a legacy multi-slot remote header), serialized for
-    /// the device-local cache file in the same full-state format
-    /// `from_chain` decodes. `None` when this engine does not encrypt.
+    /// One user-triggered pass (Settings -> Sync Now): same as `sync_now`
+    /// except the flush ignores the publish throttle, so same-session
+    /// writes ship immediately.
+    pub fn sync_now_manual(&self) -> Result<SyncOutcome, SyncError> {
+        self.inner
+            .lock()
+            .map_err(|_| SyncError::Unavailable)?
+            .sync_now_manual()
+            .map(Into::into)
+            .map_err(classify_sync_error)
+    }
+
+    /// The engine's current crypto state (may have adopted its slot from a
+    /// remote header), serialized for the device-local cache file in the
+    /// same full-state format `from_chain` decodes. `None` when this
+    /// engine does not encrypt.
     pub fn sync_crypto_chain(&self) -> Option<Vec<u8>> {
         self.inner
             .lock()
@@ -1170,7 +1182,9 @@ impl From<core::sync_crypto::SyncCryptoError> for SyncCryptoError {
                 SyncCryptoError::UnsupportedFormat { version: v }
             }
             core::sync_crypto::SyncCryptoError::Auth => SyncCryptoError::Auth,
-            core::sync_crypto::SyncCryptoError::WrongPassphrase => SyncCryptoError::WrongPassphrase,
+            core::sync_crypto::SyncCryptoError::InvalidPassphrase(m) => {
+                SyncCryptoError::Failed { message: m }
+            }
             other => SyncCryptoError::Failed {
                 message: other.to_string(),
             },
