@@ -1330,6 +1330,25 @@ impl SyncCrypto {
         })
     }
 
+    /// Publishability predicate: build the publish header from the current
+    /// state and discard it (the engine builds the real header internally).
+    /// Fails with `BadChain("no wrapped slot …")` when this device holds no
+    /// wrapped slot — with no remote artifact there is nothing to adopt a
+    /// slot from, so a keys-only device cannot publish the FIRST artifact
+    /// (real-device finding 2026-08-28; the ladder's cache-first rule
+    /// prevents exactly this).
+    pub fn build_header(
+        &self,
+        sync_version: String,
+        schema_version: u64,
+    ) -> Result<(), SyncCryptoError> {
+        self.inner
+            .lock()
+            .expect("crypto lock")
+            .build_header(&sync_version, schema_version)?;
+        Ok(())
+    }
+
     /// Passphrase rung: unwrap the remote artifact's single slot into the
     /// CK. A wrong passphrase fails typed as `WrongPassphrase`.
     #[uniffi::constructor]
