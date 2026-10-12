@@ -93,6 +93,11 @@ const MAX_WRAPPED_LEN: usize = 4096;
 pub enum SyncCryptoError {
     #[error("artifact is corrupt or foreign: {0}")]
     Corrupt(String),
+    /// The byte cursor ran out before the structure was complete — used by
+    /// the buffered artifact-header reader to distinguish "read more" from
+    /// a definitive parse failure.
+    #[error("unexpected end of data")]
+    Truncated,
     #[error("invalid sync passphrase: {0}")]
     InvalidPassphrase(String),
     #[error("unsupported transport format version {0}")]
@@ -160,7 +165,7 @@ impl<'a> Reader<'a> {
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.remaining() < n {
-            return Err(SyncCryptoError::Corrupt("unexpected end of data".into()));
+            return Err(SyncCryptoError::Truncated);
         }
         let out = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -703,22 +708,39 @@ pub fn read_artifact_header(path: &std::path::Path) -> Result<ArtifactHeader> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     loop {
+        match ArtifactHeader::parse(&buf) {
+            Ok((header, _)) => return Ok(header),
+            // Not enough bytes buffered yet — grow and retry.
+            Err(SyncCryptoError::Truncated) => {}
+            // A definitive defect (bad magic, unsupported format, legacy
+            // key version, out-of-bounds fields). Return it as-is:
+            // swallowing it behind the size cap used to bury the
+            // actionable legacy rejection under "header exceeds 256 KiB"
+            // (S10, 2026-09-12).
+            Err(definitive) => return Err(definitive),
+        }
         if buf.len() > 256 * 1024 {
             return Err(SyncCryptoError::Corrupt(
                 "artifact header exceeds 256 KiB".into(),
             ));
         }
         match file.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                // File exhausted while the header still parses short: the
+                // artifact is truncated, full stop.
+                return ArtifactHeader::parse(&buf)
+                    .map_err(|e| match e {
+                        SyncCryptoError::Truncated => {
+                            SyncCryptoError::Corrupt("unexpected end of data".into())
+                        }
+                        other => other,
+                    })
+                    .map(|(header, _)| header);
+            }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) => return Err(SyncCryptoError::Io(e)),
         }
-        if let Ok((header, _)) = ArtifactHeader::parse(&buf) {
-            return Ok(header);
-        }
     }
-    let (header, _) = ArtifactHeader::parse(&buf)?;
-    Ok(header)
 }
 
 // ---------------------------------------------------------------------------
@@ -1820,5 +1842,34 @@ mod tests {
             }
         }
         assert!(SyncCrypto::bootstrap_with_params("  real phrase  ", ArgonParams::test()).is_ok());
+    }
+
+    #[test]
+    fn forged_legacy_key_version_surfaces_rejection() {
+        // S10 (2026-09-12): the buffered header reader used to bury the
+        // actionable legacy rejection under "artifact header exceeds 256
+        // KiB" — a definitive parse error must surface as-is; only
+        // truncation keeps the read growing.
+        let crypto = weak_crypto();
+        let (header, salt) = crypto.build_header("1:test-device", 1).unwrap();
+        let payload =
+            encrypt_snapshot_payload(crypto.current_key(), &salt, b"snapshot bytes").unwrap();
+        let mut artifact = header.to_bytes();
+        artifact.extend_from_slice(&payload);
+        // Artifact layout: magic(8) u16 format u16 sv_len sync_version u64
+        // schema u32 key_version — patch the key_version to a rotation-era
+        // value, exactly like the S10 forge.
+        let sv_len = u16::from_le_bytes([artifact[10], artifact[11]]) as usize;
+        let off = 20 + sv_len;
+        artifact[off..off + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db.enc");
+        std::fs::write(&path, &artifact).unwrap();
+        let err = read_artifact_header(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy rotation-era artifact"),
+            "expected the legacy rejection copy, got: {err}"
+        );
     }
 }
