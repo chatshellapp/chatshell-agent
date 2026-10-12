@@ -12,6 +12,7 @@ use rig::agent::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::image_question::{ImageInput, ImageQuestionResponder};
 use crate::path_policy;
 use crate::tool_fs::{Fs, StdFs};
 
@@ -32,6 +33,12 @@ pub struct ReadArgs {
     /// Number of lines to read. Defaults to 2000.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Optional natural-language question about an image file. When set,
+    /// the image is analyzed by a vision-capable model and the answer is
+    /// returned as text instead of the image data. Only supported for
+    /// image files; `offset`/`limit` are ignored.
+    #[serde(default)]
+    pub question: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +55,14 @@ pub struct ReadTool {
     project_root: Option<PathBuf>,
     #[serde(skip, default = "default_fs")]
     fs: Arc<dyn Fs>,
+    /// Host-injected vision-model call for image questions.
+    #[serde(skip, default)]
+    image_question: Option<Arc<dyn ImageQuestionResponder>>,
+    /// Whether the conversation's main model accepts image input. `None`
+    /// keeps legacy inline behavior; `Some(false)` returns metadata plus
+    /// guidance instead of pixels the main model cannot use.
+    #[serde(skip, default)]
+    main_model_vision: Option<bool>,
 }
 
 impl Default for ReadTool {
@@ -61,6 +76,8 @@ impl ReadTool {
         Self {
             project_root: None,
             fs: Arc::new(StdFs),
+            image_question: None,
+            main_model_vision: None,
         }
     }
 
@@ -75,6 +92,63 @@ impl ReadTool {
     pub fn with_fs(mut self, fs: Arc<dyn Fs>) -> Self {
         self.fs = fs;
         self
+    }
+
+    /// Route image questions through a host-provided vision model.
+    pub fn with_image_question(mut self, responder: Arc<dyn ImageQuestionResponder>) -> Self {
+        self.image_question = Some(responder);
+        self
+    }
+
+    /// Declare whether the conversation's main model accepts image input.
+    /// When `false`, plain image reads return metadata plus guidance
+    /// instead of base64 pixels the main model would drop.
+    pub fn with_main_model_vision(mut self, supports: bool) -> Self {
+        self.main_model_vision = Some(supports);
+        self
+    }
+
+    /// Answer a question about an image via the injected vision responder.
+    async fn answer_image_question(
+        &self,
+        path: &std::path::Path,
+        ext: &str,
+        question: &str,
+    ) -> Result<String, ReadError> {
+        let image = load_image(self.fs.as_ref(), path, ext)?;
+
+        let Some(responder) = self.image_question.as_ref() else {
+            return Ok(format!(
+                "{}\nNo vision model is configured to answer image questions. \
+                 Configure one under Settings → Auxiliary Models, or read this \
+                 file again without \"question\".",
+                image.header
+            ));
+        };
+
+        tracing::info!(
+            "🔧 [tool-call] read: image question \"{}\" ({})",
+            path.display(),
+            question
+        );
+        let input = ImageInput {
+            bytes: image.bytes,
+            mime_type: image.mime.to_string(),
+        };
+        match responder.answer(input, question.to_string()).await {
+            Ok(answer) => {
+                tracing::info!("🔧 [tool-result] read: image question answered");
+                Ok(format!(
+                    "{} (analyzed by a vision model)\nQuestion: {}\nAnswer:\n{}",
+                    image.header, question, answer
+                ))
+            }
+            Err(error) => Err(ReadError(format!(
+                "Image question failed: {}. Read the file again without \
+                 \"question\" for its normal content.",
+                error
+            ))),
+        }
     }
 }
 
@@ -93,7 +167,7 @@ fn is_pdf_extension(ext: &str) -> bool {
     ext == "pdf"
 }
 
-fn mime_from_extension(ext: &str) -> &str {
+fn mime_from_extension(ext: &str) -> &'static str {
     match ext {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -225,8 +299,12 @@ impl Tool for ReadTool {
                 For image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data. \
                 For PDF files, extracts and returns the text content. \
                 Supports reading specific line ranges for large text files. \
-                Use negative offset to read from the end of a file (e.g. -20 reads the last 20 lines)."
-                .to_string()
+                Use negative offset to read from the end of a file (e.g. -20 reads the last 20 lines). \
+                For image files, an optional \"question\" argument returns a text answer from a \
+                vision-capable model instead of the image data — use it when the image's contents \
+                should be analyzed or summarized rather than shown, or when reading images for a \
+                model that cannot accept image input."
+            .to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -244,6 +322,10 @@ impl Tool for ReadTool {
                 "limit": {
                     "type": "number",
                     "description": "Maximum number of lines to read. Defaults to 2000. Only applies to text files."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Optional natural-language question about an image file. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for image files; offset/limit are ignored."
                 }
             },
             "required": ["path"]
@@ -256,10 +338,11 @@ impl Tool for ReadTool {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         tracing::info!(
-            "🔧 [tool-call] read: path=\"{}\" offset={:?} limit={:?}",
+            "🔧 [tool-call] read: path=\"{}\" offset={:?} limit={:?} question={:?}",
             args.path,
             args.offset,
-            args.limit
+            args.limit,
+            args.question
         );
 
         let path = std::path::Path::new(&args.path);
@@ -286,8 +369,38 @@ impl Tool for ReadTool {
             .unwrap_or("")
             .to_lowercase();
 
+        // Image questions: answer via the vision seam instead of returning
+        // pixels. Only images qualify; anything else is an explicit error.
+        let question = args
+            .question
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        if let Some(question) = question {
+            if !is_image_extension(&ext) {
+                return Err(ReadError(format!(
+                    "The \"question\" argument only supports image files, not \
+                     \"{}\" files. Read the file without \"question\" for its \
+                     normal content.",
+                    ext
+                )));
+            }
+            return self.answer_image_question(path, &ext, question).await;
+        }
+
         // Dispatch by file type
         if is_image_extension(&ext) {
+            // SVG source is plain text any model can read; raster pixels are
+            // useless to a main model without image input — return metadata
+            // and point at the question path instead.
+            if ext != "svg" && self.main_model_vision == Some(false) {
+                return read_image_metadata(
+                    self.fs.as_ref(),
+                    path,
+                    &ext,
+                    self.image_question.is_some(),
+                );
+            }
             return read_image(self.fs.as_ref(), path, &ext);
         }
         if is_pdf_extension(&ext) {
@@ -395,8 +508,15 @@ fn read_text(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Str
     Ok(output)
 }
 
-/// Read an image file: return metadata and base64-encoded data.
-fn read_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<String, ReadError> {
+/// Image bytes plus the shared `[Image: …]` metadata header.
+struct LoadedImage {
+    bytes: Vec<u8>,
+    mime: &'static str,
+    header: String,
+}
+
+/// Load an image (size-capped) and render its metadata header.
+fn load_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<LoadedImage, ReadError> {
     let metadata = fs
         .metadata(path)
         .map_err(|e| ReadError(format!("Failed to read image metadata: {}", e)))?;
@@ -414,45 +534,83 @@ fn read_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<String, 
         .read(path)
         .map_err(|e| ReadError(format!("Failed to read image: {}", e)))?;
 
-    let mime = mime_from_extension(ext);
-
     let dims = parse_image_dimensions(&raw_bytes, ext);
     let dim_str = dims
         .map(|(w, h)| format!("{}x{}", w, h))
         .unwrap_or_else(|| "unknown".to_string());
 
+    Ok(LoadedImage {
+        bytes: raw_bytes,
+        mime: mime_from_extension(ext),
+        header: format!(
+            "[Image: {}, {}, {}]",
+            ext.to_uppercase(),
+            dim_str,
+            format_file_size(file_size)
+        ),
+    })
+}
+
+/// Read an image file: return metadata and base64-encoded data.
+fn read_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<String, ReadError> {
+    let image = load_image(fs, path, ext)?;
+
     // SVG files are text-based; return content directly instead of base64
     if ext == "svg" {
-        let svg_text = String::from_utf8_lossy(&raw_bytes);
+        let svg_text = String::from_utf8_lossy(&image.bytes);
+        let size = format_file_size(image.bytes.len() as u64);
         tracing::info!(
             "🔧 [tool-result] read: SVG image \"{}\" ({})",
             path.display(),
-            format_file_size(file_size)
+            size
         );
-        return Ok(format!(
-            "[Image: SVG, {}]\n\n{}",
-            format_file_size(file_size),
-            svg_text
-        ));
+        return Ok(format!("[Image: SVG, {}]\n\n{}", size, svg_text));
     }
 
-    let b64 = BASE64.encode(&raw_bytes);
+    let b64 = BASE64.encode(&image.bytes);
 
     tracing::info!(
-        "🔧 [tool-result] read: image \"{}\" ({}, {}, {})",
+        "🔧 [tool-result] read: image \"{}\" ({})",
         path.display(),
-        ext.to_uppercase(),
-        dim_str,
-        format_file_size(file_size)
+        image.header
     );
 
     Ok(format!(
-        "[Image: {}, {}, {}]\ndata:{};base64,{}",
-        ext.to_uppercase(),
-        dim_str,
-        format_file_size(file_size),
-        mime,
-        b64
+        "{}\ndata:{};base64,{}",
+        image.header, image.mime, b64
+    ))
+}
+
+/// Image read for a main model that cannot accept image input: metadata
+/// plus guidance instead of pixels.
+fn read_image_metadata(
+    fs: &dyn Fs,
+    path: &std::path::Path,
+    ext: &str,
+    question_available: bool,
+) -> Result<String, ReadError> {
+    let image = load_image(fs, path, ext)?;
+
+    tracing::info!(
+        "🔧 [tool-result] read: image metadata \"{}\" (main model has no image input)",
+        path.display()
+    );
+
+    let guidance = if question_available {
+        "To ask about this image, read it again with the \"question\" argument \
+         (e.g. {\"path\": \"<this file>\", \"question\": \"what does this \
+         screenshot show?\"}) — a vision model answers and the answer is \
+         returned as text."
+    } else {
+        "No vision model is configured, so this image cannot be analyzed. \
+         Configure one under Settings → Auxiliary Models to enable image \
+         questions."
+    };
+
+    Ok(format!(
+        "{}\nThe current conversation model does not accept image input, so \
+         the image content is omitted.\n{}",
+        image.header, guidance
     ))
 }
 
@@ -544,5 +702,151 @@ mod tests {
 
         assert!(!out.contains("more lines"), "no recovery footer: {out}");
         assert!(!out.contains("showing lines"));
+    }
+
+    // ---- image question seam ----
+
+    struct MockVisionResponder {
+        fail: bool,
+    }
+
+    impl super::super::image_question::ImageQuestionResponder for MockVisionResponder {
+        fn answer(
+            &self,
+            _image: super::super::image_question::ImageInput,
+            _question: String,
+        ) -> futures::future::BoxFuture<'static, Result<String, String>> {
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err("vision call failed".to_string())
+                } else {
+                    Ok("a sleeping cat".to_string())
+                }
+            })
+        }
+    }
+
+    fn write_temp_image() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, b"fake-png-bytes").unwrap();
+        (dir, path)
+    }
+
+    fn image_args(path: &std::path::Path, question: Option<&str>) -> ReadArgs {
+        ReadArgs {
+            path: path.to_string_lossy().to_string(),
+            offset: None,
+            limit: None,
+            question: question.map(str::to_string),
+        }
+    }
+
+    async fn call_read(tool: &ReadTool, args: ReadArgs) -> Result<String, ReadError> {
+        use rig::agent::tool::Tool as _;
+        let mut ctx = rig::agent::tool::ToolContext::default();
+        tool.call(&mut ctx, args).await
+    }
+
+    #[tokio::test]
+    async fn question_on_text_file_is_an_explicit_error() {
+        let (_dir, path) = write_temp("plain text\n");
+        let tool = ReadTool::new()
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: false }));
+
+        let err = call_read(&tool, image_args(&path, Some("what is this?")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("only supports image files"),
+            "error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn question_on_image_returns_vision_answer_without_pixels() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new()
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: false }));
+
+        let out = call_read(&tool, image_args(&path, Some("what is shown?")))
+            .await
+            .unwrap();
+        assert!(out.contains("a sleeping cat"), "answer: {out}");
+        assert!(out.contains("Question: what is shown?"));
+        assert!(!out.contains("base64"), "no pixel payload: {out}");
+    }
+
+    #[tokio::test]
+    async fn question_without_responder_returns_guidance() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new();
+
+        let out = call_read(&tool, image_args(&path, Some("what is shown?")))
+            .await
+            .unwrap();
+        assert!(out.contains("[Image: PNG"), "metadata header: {out}");
+        assert!(out.contains("No vision model is configured"));
+    }
+
+    #[tokio::test]
+    async fn responder_failure_is_an_error_with_recovery_hint() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new()
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: true }));
+
+        let err = call_read(&tool, image_args(&path, Some("what is shown?")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vision call failed"), "err: {err}");
+        assert!(err.to_string().contains("without \"question\""));
+    }
+
+    #[tokio::test]
+    async fn text_only_main_model_gets_metadata_and_question_hint() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new()
+            .with_main_model_vision(false)
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: false }));
+
+        let out = call_read(&tool, image_args(&path, None)).await.unwrap();
+        assert!(out.contains("does not accept image input"), "out: {out}");
+        assert!(out.contains("\"question\" argument"), "hint: {out}");
+        assert!(!out.contains("base64"), "no pixel payload: {out}");
+    }
+
+    #[tokio::test]
+    async fn text_only_main_model_without_responder_points_at_settings() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new().with_main_model_vision(false);
+
+        let out = call_read(&tool, image_args(&path, None)).await.unwrap();
+        assert!(out.contains("No vision model is configured"), "out: {out}");
+        assert!(!out.contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn vision_capable_main_model_still_gets_inline_pixels() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new().with_main_model_vision(true);
+
+        let out = call_read(&tool, image_args(&path, None)).await.unwrap();
+        assert!(
+            out.contains("data:image/png;base64,"),
+            "inline pixels: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_without_vision_flag_keeps_inline_pixels() {
+        let (_dir, path) = write_temp_image();
+        let tool = ReadTool::new();
+
+        let out = call_read(&tool, image_args(&path, None)).await.unwrap();
+        assert!(
+            out.contains("data:image/png;base64,"),
+            "legacy behavior kept: {out}"
+        );
     }
 }

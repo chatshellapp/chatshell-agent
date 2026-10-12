@@ -613,6 +613,7 @@ mod tests {
                     path: path.to_string(),
                     offset: None,
                     limit: None,
+                    question: None,
                 },
             )
             .await
