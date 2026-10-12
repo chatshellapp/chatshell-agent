@@ -87,10 +87,20 @@ impl Fs for StdFs {
     }
 
     fn set_executable(&self, path: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        std::fs::set_permissions(path, perms)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(perms.mode() | 0o755);
+            std::fs::set_permissions(path, perms)
+        }
+        #[cfg(not(unix))]
+        {
+            // No exec bit on Windows: executability follows the file
+            // extension, so there is nothing to set.
+            let _ = path;
+            Ok(())
+        }
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
