@@ -2,7 +2,9 @@
 //!
 //! A content search tool powered by ripgrep's core crates (grep-regex, grep-searcher, ignore).
 //! Performs fast, in-process regex searching without requiring external binaries.
-
+//! Files whose content lines are displayed also mint a content anchor in
+//! the shared anchor store, so a following `edit` detects external drift
+//! (upstream search records seen lines).
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +30,9 @@ const SINGLE_FILE_MATCHES: usize = 200;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// How many skipped-file paths to list in the footer.
 const MAX_SKIPPED_PATHS_LISTED: usize = 5;
+/// Cap on files minting content anchors after a search: each mint re-reads
+/// the file, so a huge match set must not double the search's IO.
+const MAX_ANCHOR_MINT_FILES: usize = 32;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrepArgs {
@@ -308,6 +313,7 @@ fn run_search(fs: Arc<dyn Fs>, args: &GrepArgs, search_path: &str) -> Result<Str
         skipped_oversized: Vec::new(),
         hit_head_limit: false,
         hit_output_cap: false,
+        displayed_files: Vec::new(),
     };
     let mut output = String::new();
 
@@ -367,6 +373,8 @@ fn run_search(fs: Arc<dyn Fs>, args: &GrepArgs, search_path: &str) -> Result<Str
             );
         }
     }
+
+    mint_displayed_anchors(fs.as_ref(), &run.displayed_files);
 
     let files_shown = run.files_matched - run.files_skipped_by_page;
     let next_skip = skip + files_shown;
@@ -484,6 +492,8 @@ struct SearchRun<'a> {
     skipped_oversized: Vec<String>,
     hit_head_limit: bool,
     hit_output_cap: bool,
+    /// Files whose content lines were appended to the output (content mode).
+    displayed_files: Vec<PathBuf>,
 }
 
 /// Search one file into a per-file buffer, then either append it to the run
@@ -565,13 +575,36 @@ fn search_file(
             file_matches, run.per_file_match_limit
         );
     }
+    if run.output_mode == "content" {
+        run.displayed_files.push(path.to_path_buf());
+    }
     output.push_str(&file_output);
-
     if run.total_matches >= run.head_limit {
         run.hit_head_limit = true;
     }
     if output.len() > MAX_OUTPUT_CHARS {
         run.hit_output_cap = true;
+    }
+}
+
+/// Mint content anchors for the files whose lines were just displayed
+/// (upstream: search output records seen lines). Silent by design - the
+/// ripgrep-style output format stays unchanged.
+fn mint_displayed_anchors(fs: &dyn Fs, files: &[PathBuf]) {
+    for path in files.iter().take(MAX_ANCHOR_MINT_FILES) {
+        let size_ok = fs
+            .metadata(path)
+            .is_ok_and(|meta| meta.is_file && meta.len <= MAX_FILE_BYTES);
+        if !size_ok {
+            continue;
+        }
+        let Ok(bytes) = fs.read(path) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        crate::anchor_store::record_anchor(path, &text);
     }
 }
 

@@ -15,6 +15,7 @@
 //!   is configured;
 //! - edits are exclusive: one read-modify-write at a time.
 
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,22 +43,62 @@ const MAX_PREVIEW_MATCHES: usize = 5;
 const SUFFIX_WALK_MAX_DEPTH: usize = 20;
 const SUFFIX_WALK_MAX_FILES: usize = 10_000;
 const SUFFIX_MAX_CANDIDATES: usize = 5;
+/// Max items accepted in one `edits` array call.
+const MAX_BATCH_EDITS: usize = 32;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EditArgs {
     /// Absolute path to the file to edit
     pub path: String,
     /// The exact text to find and replace (must be unique unless replace_all is true)
-    pub old_string: String,
+    #[serde(default)]
+    pub old_string: Option<String>,
     /// The replacement text (must differ from old_string)
-    pub new_string: String,
+    #[serde(default)]
+    pub new_string: Option<String>,
     /// Replace all occurrences instead of requiring uniqueness (default: false)
     #[serde(default)]
     pub replace_all: Option<bool>,
+    /// Ordered batch of replacements applied in one atomic call; either this
+    /// or old_string/new_string, never both
+    #[serde(default)]
+    pub edits: Option<Vec<EditItem>>,
     /// Optional content tag from the latest `[path#TAG]` read/write/edit
     /// header for this file; detects stale anchors
     #[serde(default)]
     pub tag: Option<String>,
+}
+
+/// One replacement inside an `edits` batch.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditItem {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: Option<bool>,
+}
+
+/// A validated edit ready to apply.
+struct PendingEdit {
+    old_string: String,
+    new_string: String,
+    replace_all: bool,
+}
+
+/// Per-item outcome staged in memory while a batch is assembled.
+struct StagedEdit {
+    /// Byte offset of the inserted text in the content state right after
+    /// this edit applied.
+    start: usize,
+    /// Byte length of the replaced text in that same pre-edit state.
+    old_len: usize,
+    /// Byte length of the inserted text.
+    new_len: usize,
+    occurrences: usize,
+    /// Similarity when only a fuzzy match located the text.
+    fuzzy_confidence: Option<f64>,
+    /// Line count of the inserted text (for the re-grounding window).
+    new_lines: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -213,28 +254,158 @@ fn anchor_warnings(
     warnings
 }
 
+/// Normalize tool args into the ordered edits to apply: either the legacy
+/// single pair or the `edits` array, never both.
+fn normalize_edits(args: &EditArgs) -> Result<Vec<PendingEdit>, EditError> {
+    let legacy_old = args.old_string.as_deref();
+    let legacy_new = args.new_string.as_deref();
+    let has_legacy = legacy_old.is_some() || legacy_new.is_some();
+
+    let Some(edits) = args.edits.as_deref() else {
+        return match (legacy_old, legacy_new) {
+            (Some(old), Some(new)) => {
+                if old == new {
+                    return Err(EditError(
+                        "old_string and new_string are identical; nothing to change".into(),
+                    ));
+                }
+                Ok(vec![PendingEdit {
+                    old_string: old.to_string(),
+                    new_string: new.to_string(),
+                    replace_all: args.replace_all.unwrap_or(false),
+                }])
+            }
+            _ => Err(EditError(
+                "Provide either old_string + new_string, or an edits array of replacements".into(),
+            )),
+        };
+    };
+
+    if has_legacy {
+        return Err(EditError(
+            "Pass either edits (array) or old_string/new_string, not both".into(),
+        ));
+    }
+    if edits.is_empty() {
+        return Err(EditError("edits must be a non-empty array".into()));
+    }
+    if edits.len() > MAX_BATCH_EDITS {
+        return Err(EditError(format!(
+            "edits supports at most {} items; split the work across calls",
+            MAX_BATCH_EDITS
+        )));
+    }
+    edits
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            if item.old_string == item.new_string {
+                return Err(EditError(format!(
+                    "edits[{index}]: old_string and new_string are identical; nothing to change"
+                )));
+            }
+            Ok(PendingEdit {
+                old_string: item.old_string.clone(),
+                new_string: item.new_string.clone(),
+                replace_all: item.replace_all.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// Error prefix naming the failing item (empty for single-edit calls so
+/// model-facing messages stay unchanged).
+fn batch_label(len: usize, index: usize) -> String {
+    if len == 1 {
+        String::new()
+    } else {
+        format!("edits[{index}]: ")
+    }
+}
+
+/// No-op guard key over the whole raw payload (upstream: keyed by the
+/// model-authored bytes so a different payload earns a fresh soft hint).
+fn payload_fingerprint(items: &[PendingEdit]) -> u64 {
+    if items.len() == 1 {
+        return anchor::edit_input_fingerprint(&items[0].old_string, &items[0].new_string);
+    }
+    let olds: Vec<&str> = items.iter().map(|item| item.old_string.as_str()).collect();
+    let news: Vec<&str> = items.iter().map(|item| item.new_string.as_str()).collect();
+    anchor::edit_input_fingerprint(&olds.join("\u{0}"), &news.join("\u{0}"))
+}
+
+/// Closest-candidate diagnostics for an old_string with no exact match
+/// (shared fuzzy-matcher report plus a numbered preview window).
+fn fuzzy_diagnostics(
+    path_display: &str,
+    item: &PendingEdit,
+    content: &str,
+    outcome: &fuzzy_match::MatchOutcome,
+) -> String {
+    let mut message = fuzzy_match::format_match_error(
+        path_display,
+        &item.old_string,
+        outcome,
+        true,
+        (fuzzy_match::DEFAULT_FUZZY_THRESHOLD * 100.0) as i32,
+    );
+    if let Some(closest) = outcome.closest.as_ref() {
+        message.push_str("\n\nClosest candidate:\n");
+        message.push_str(&anchor::render_preview_windows(
+            content,
+            &[closest.start_line],
+            PREVIEW_CONTEXT_LINES,
+            PREVIEW_MAX_LINE_CHARS,
+        ));
+    }
+    message
+}
+
+/// Map a staged edit's inserted-text offset (valid in the content state
+/// right after that edit) into a final-content line number by replaying the
+/// byte shifts of later edits. `None` when a later edit overlapped the
+/// region; callers re-locate the new text instead.
+fn final_line(staged: &[StagedEdit], index: usize, final_content: &str) -> Option<usize> {
+    let mut offset = staged[index].start;
+    for later in staged.iter().skip(index + 1) {
+        if later.start < offset {
+            if offset < later.start + later.old_len {
+                return None;
+            }
+            offset += later.new_len;
+            offset -= later.old_len;
+        }
+    }
+    Some(final_content[..offset].split('\n').count())
+}
+
 /// The re-grounding section returned with every successful edit: fresh
-/// `[path#TAG]` header plus a numbered context window around the edit.
+/// `[path#TAG]` header plus a numbered context window around each edited
+/// region.
 fn reground_section(
     path_display: &str,
     new_content: &str,
     new_tag: Option<String>,
-    start_line: usize,
-    region_lines: usize,
+    regions: &[(usize, usize)],
 ) -> String {
     let mut section = String::new();
     if let Some(tag) = new_tag {
         section.push_str(&anchor::tag_header(path_display, &tag));
         section.push('\n');
     }
-    let end_line = start_line + region_lines.saturating_sub(1);
-    section.push_str(&anchor::render_context_window(
-        new_content,
-        start_line,
-        end_line,
-        REGROUND_CONTEXT_LINES,
-        REGROUND_MAX_LINE_CHARS,
-    ));
+    for (start_line, region_lines) in regions {
+        if !section.is_empty() && !section.ends_with('\n') {
+            section.push('\n');
+        }
+        let end_line = start_line + region_lines.saturating_sub(1);
+        section.push_str(&anchor::render_context_window(
+            new_content,
+            *start_line,
+            end_line,
+            REGROUND_CONTEXT_LINES,
+            REGROUND_MAX_LINE_CHARS,
+        ));
+    }
     section
 }
 
@@ -247,15 +418,18 @@ impl Tool for EditTool {
 
     fn description(&self) -> String {
         "Make precise text replacements in a file. \
-                Specify the exact text to find (old_string) and its replacement (new_string). \
+                Specify the exact text to find (old_string) and its replacement (new_string), \
+                or pass an edits array of {old_string, new_string} pairs to apply several \
+                replacements in one atomic call (later pairs match the content earlier pairs produced). \
                 The old_string must match the file content exactly, including whitespace and indentation; \
                 when no exact match exists, a whitespace/indentation-tolerant fuzzy match is attempted \
-                (reported with its similarity when it succeeds). \
+                (reported with its similarity when it succeeds) - but never when the file changed since \
+                it was last read/written: an exact match or a re-read is required instead. \
                 By default old_string must appear exactly once in the file; use replace_all to change every occurrence. \
                 Pass the tag from the latest [path#TAG] header for this file (read/write/edit output) as `tag` \
                 to detect stale content: a fresh tag validates the file is unchanged, a stale one triggers \
                 recovery or a re-read demand. \
-                The response includes a fresh [path#TAG] header plus the edited region with surrounding \
+                The response includes a fresh [path#TAG] header plus the edited region(s) with surrounding \
                 line numbers - anchor follow-up edits on it. \
                 Always use the `read` tool first to see the current file content before editing."
             .to_string()
@@ -271,11 +445,34 @@ impl Tool for EditTool {
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "The exact text to find in the file. Must match including whitespace and indentation."
+                    "description": "The exact text to find in the file. Must match including whitespace and indentation. Use this or the edits array, not both."
                 },
                 "new_string": {
                     "type": "string",
                     "description": "The text to replace old_string with. Must differ from old_string."
+                },
+                "edits": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "description": "Ordered replacements applied in one atomic call. Provide this or old_string/new_string, not both. Each old_string is matched against the content produced by earlier items; if any item fails, nothing is written.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": "The exact text to find. Must match including whitespace and indentation."
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "The replacement text. Must differ from old_string."
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "description": "If true, replace all occurrences of this item's old_string. Defaults to false."
+                            }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
                 },
                 "replace_all": {
                     "type": "boolean",
@@ -286,7 +483,7 @@ impl Tool for EditTool {
                     "description": "Optional content tag from the latest [path#TAG] header for this file. Detects stale anchors."
                 }
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path"]
         })
     }
 
@@ -295,22 +492,14 @@ impl Tool for EditTool {
         _context: &mut rig::agent::tool::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let replace_all = args.replace_all.unwrap_or(false);
+        let items = normalize_edits(&args)?;
 
         tracing::info!(
-            "🔧 [tool-call] edit: path=\"{}\" old_len={} new_len={} replace_all={} tag={:?}",
+            "🔧 [tool-call] edit: path=\"{}\" edits={} tag={:?}",
             args.path,
-            args.old_string.len(),
-            args.new_string.len(),
-            replace_all,
+            items.len(),
             args.tag
         );
-
-        if args.old_string == args.new_string {
-            return Err(EditError(
-                "old_string and new_string are identical; nothing to change".into(),
-            ));
-        }
 
         // One edit at a time (upstream: edit concurrency = "exclusive"). The whole
         // read-modify-write below is synchronous, so a std mutex held across
@@ -355,7 +544,7 @@ impl Tool for EditTool {
             return Err(EditError(format!("Not a file: {}", path.display())));
         }
 
-        let content = String::from_utf8(
+        let original = String::from_utf8(
             self.fs
                 .read(&path)
                 .map_err(|e| EditError(format!("Failed to read file: {}", e)))?,
@@ -365,164 +554,158 @@ impl Tool for EditTool {
         // Anchor validation (upstream snapshot-tag semantics): the tag hashes the
         // live content, so a mismatch means the file changed since the read
         // that minted the tag.
-        let current_tag = anchor::content_tag(&content);
+        let current_tag = anchor::content_tag(&original);
         let tag_stale = args.tag.as_ref().is_some_and(|tag| tag != &current_tag);
         let drifted_since_served = matches!(
-            anchor_state::check_anchor(&path, &content),
+            anchor_state::check_anchor(&path, &original),
             anchor::AnchorStatus::Drifted
         );
 
-        let count = content.matches(&args.old_string).count();
+        // Stage every item in memory against the evolving content; the file
+        // is written once after all items applied (atomic batch).
+        let mut content = original.clone();
+        let mut staged: Vec<StagedEdit> = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let label = batch_label(items.len(), index);
+            let count = content.matches(&item.old_string).count();
 
-        // Stale tag AND the remembered text is gone: refuse and demand a
-        // re-read instead of fuzzy-editing a misremembered file.
-        if count == 0 && tag_stale {
-            return Err(EditError(format!(
-                "Content anchor is stale: the file no longer hashes to tag {} (current {}). \
-                 old_string was not found either - the file changed since it was read. \
-                 Re-read the file and retry with the fresh tag.",
-                args.tag.as_deref().unwrap_or("?"),
-                current_tag
-            )));
-        }
-
-        if count == 0 {
-            // Exact miss: fall back to the shared fuzzy matcher before failing.
-            let outcome = fuzzy_match::find_match(
-                &content,
-                &args.old_string,
-                true,
-                fuzzy_match::DEFAULT_FUZZY_THRESHOLD,
-            );
-            let Some(matched) = outcome.matched.clone() else {
-                let mut message = fuzzy_match::format_match_error(
-                    &args.path,
-                    &args.old_string,
-                    &outcome,
-                    true,
-                    (fuzzy_match::DEFAULT_FUZZY_THRESHOLD * 100.0) as i32,
-                );
-                if let Some(closest) = outcome.closest.as_ref() {
-                    message.push_str("\n\nClosest candidate:\n");
-                    message.push_str(&anchor::render_preview_windows(
-                        &content,
-                        &[closest.start_line],
-                        PREVIEW_CONTEXT_LINES,
-                        PREVIEW_MAX_LINE_CHARS,
-                    ));
-                }
-                return Err(EditError(message));
-            };
-
-            let end = matched.start_index + matched.actual_text.len();
-            let mut new_content = String::with_capacity(content.len() + args.new_string.len());
-            new_content.push_str(&content[..matched.start_index]);
-            new_content.push_str(&args.new_string);
-            new_content.push_str(&content[end..]);
-
-            if new_content == content {
-                // Byte-identical result: the model re-issued (a fuzzy variant
-                // of) what is already there. Soft hint first; identical
-                // repeats escalate (upstream no-op loop guard).
-                let verdict = anchor_state::record_noop(
-                    &path,
-                    anchor::edit_input_fingerprint(&args.old_string, &args.new_string),
-                );
-                return Err(EditError(if verdict.escalate {
-                    format!(
-                        "This identical no-op edit was already attempted {} times. \
-                         Stop retrying: re-read the file, or state that no change is needed.",
-                        verdict.count
-                    )
-                } else {
-                    "The edit would leave the file byte-identical: the matched text already \
-                     equals new_string. Re-read the file and edit the actual current content."
-                        .to_string()
-                }));
+            // Stale tag AND the remembered text is gone: refuse and demand a
+            // re-read instead of fuzzy-editing a misremembered file.
+            if count == 0 && tag_stale {
+                return Err(EditError(format!(
+                    "{label}Content anchor is stale: the file no longer hashes to tag {} (current {}). \
+                     old_string was not found either - the file changed since it was read. \
+                     Re-read the file and retry with the fresh tag.",
+                    args.tag.as_deref().unwrap_or("?"),
+                    current_tag
+                )));
             }
 
-            self.fs
-                .write(&path, new_content.as_bytes())
-                .map_err(|e| EditError(format!("Failed to write file: {}", e)))?;
-            anchor_state::reset_noop(&path);
-            let new_tag = anchor_state::record_anchor(&path, &new_content);
-
-            tracing::info!(
-                "🔧 [tool-result] edit: fuzzy-replaced 1 occurrence in \"{}\" ({:.0}% similar, line {})",
-                path.display(),
-                matched.confidence * 100.0,
-                matched.start_line
-            );
-
-            let warnings = anchor_warnings(
-                path_note.as_deref(),
-                false,
-                drifted_since_served,
-                args.tag.as_deref(),
-                &current_tag,
-            );
-            let mut message = format!(
-                "Replaced 1 fuzzy-matched occurrence in {} (line {}, {:.0}% similar to old_string; \
-                 whitespace/indentation differences were tolerated){}",
-                args.path,
-                matched.start_line,
-                matched.confidence * 100.0,
-                warnings
-            );
-            message.push('\n');
-            message.push_str(&reground_section(
-                &args.path,
-                &new_content,
-                new_tag,
-                matched.start_line,
-                args.new_string.lines().count().max(1),
-            ));
-            return Ok(message);
-        }
-
-        if !replace_all && count > 1 {
-            let occurrence_lines: Vec<usize> = content
-                .match_indices(&args.old_string)
-                .take(MAX_PREVIEW_MATCHES)
-                .map(|(index, _)| content[..index].split('\n').count())
-                .collect();
-            return Err(EditError(format!(
-                "old_string appears {} times in {}. Provide more surrounding context to make it unique, \
-                 or set replace_all to true. Occurrences:\n{}",
-                count,
-                path.display(),
-                anchor::render_preview_windows(
+            if count == 0 {
+                // Exact miss: fall back to the shared fuzzy matcher before failing.
+                let outcome = fuzzy_match::find_match(
                     &content,
-                    &occurrence_lines,
-                    PREVIEW_CONTEXT_LINES,
-                    PREVIEW_MAX_LINE_CHARS
-                )
-            )));
+                    &item.old_string,
+                    true,
+                    fuzzy_match::DEFAULT_FUZZY_THRESHOLD,
+                );
+                // No fuzzy edits on a drifted file: without a fresh tag
+                // proving otherwise, the model may be editing a misremembered
+                // version. Demand an exact match or a re-read instead.
+                if drifted_since_served {
+                    return Err(EditError(format!(
+                        "{label}The file changed since it was last read/written by this app and \
+                         old_string has no exact match in the current content; fuzzy matching is \
+                         not applied to changed content because it may target a misremembered \
+                         location. Re-read the file and retry with the fresh tag.\n\n{}",
+                        fuzzy_diagnostics(&args.path, item, &content, &outcome)
+                    )));
+                }
+                let Some(matched) = outcome.matched.clone() else {
+                    return Err(EditError(format!(
+                        "{label}{}",
+                        fuzzy_diagnostics(&args.path, item, &content, &outcome)
+                    )));
+                };
+
+                let start = matched.start_index;
+                let old_len = matched.actual_text.len();
+                let mut next = String::with_capacity(content.len() + item.new_string.len());
+                next.push_str(&content[..start]);
+                next.push_str(&item.new_string);
+                next.push_str(&content[start + old_len..]);
+                staged.push(StagedEdit {
+                    start,
+                    old_len,
+                    new_len: item.new_string.len(),
+                    occurrences: 1,
+                    fuzzy_confidence: Some(matched.confidence),
+                    new_lines: item.new_string.lines().count().max(1),
+                });
+                content = next;
+                continue;
+            }
+
+            if !item.replace_all && count > 1 {
+                let occurrence_lines: Vec<usize> = content
+                    .match_indices(&item.old_string)
+                    .take(MAX_PREVIEW_MATCHES)
+                    .map(|(offset, _)| content[..offset].split('\n').count())
+                    .collect();
+                return Err(EditError(format!(
+                    "{label}old_string appears {} times in {}. Provide more surrounding context to make it unique, \
+                     or set replace_all to true. Occurrences:\n{}",
+                    count,
+                    path.display(),
+                    anchor::render_preview_windows(
+                        &content,
+                        &occurrence_lines,
+                        PREVIEW_CONTEXT_LINES,
+                        PREVIEW_MAX_LINE_CHARS
+                    )
+                )));
+            }
+
+            let start = content.find(&item.old_string).expect("count > 0");
+            let old_len = item.old_string.len();
+            content = if item.replace_all {
+                content.replace(&item.old_string, &item.new_string)
+            } else {
+                content.replacen(&item.old_string, &item.new_string, 1)
+            };
+            staged.push(StagedEdit {
+                start,
+                old_len,
+                new_len: item.new_string.len(),
+                occurrences: if item.replace_all { count } else { 1 },
+                fuzzy_confidence: None,
+                new_lines: item.new_string.lines().count().max(1),
+            });
         }
 
-        let new_content = if replace_all {
-            content.replace(&args.old_string, &args.new_string)
-        } else {
-            content.replacen(&args.old_string, &args.new_string, 1)
-        };
+        if content == original {
+            // Byte-identical result: the model re-issued (a fuzzy variant of)
+            // what is already there. Soft hint first; identical repeats
+            // escalate (upstream no-op loop guard).
+            let verdict = anchor_state::record_noop(&path, payload_fingerprint(&items));
+            return Err(EditError(if verdict.escalate {
+                format!(
+                    "This identical no-op edit was already attempted {} times. \
+                     Stop retrying: re-read the file, or state that no change is needed.",
+                    verdict.count
+                )
+            } else {
+                "The edit would leave the file byte-identical: the matched text already \
+                 equals new_string. Re-read the file and edit the actual current content."
+                    .to_string()
+            }));
+        }
 
         self.fs
-            .write(&path, new_content.as_bytes())
+            .write(&path, content.as_bytes())
             .map_err(|e| EditError(format!("Failed to write file: {}", e)))?;
         anchor_state::reset_noop(&path);
-        let new_tag = anchor_state::record_anchor(&path, &new_content);
+        let new_tag = anchor_state::record_anchor(&path, &content);
 
-        let replacements = if replace_all { count } else { 1 };
-        let first_line = content
-            .find(&args.old_string)
-            .map(|index| content[..index].split('\n').count())
-            .unwrap_or(1);
-
-        tracing::info!(
-            "🔧 [tool-result] edit: replaced {} occurrence(s) in \"{}\"",
-            replacements,
-            path.display()
-        );
+        // Re-grounding data: each region's line in the final content,
+        // mapped through later edits' shifts (re-located when a later edit
+        // rewrote the region; dropped when it cannot be found at all).
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let summary_lines: Vec<Option<usize>> = staged
+            .iter()
+            .enumerate()
+            .map(|(index, edit)| {
+                let line = final_line(&staged, index, &content).or_else(|| {
+                    content
+                        .find(&items[index].new_string)
+                        .map(|offset| content[..offset].split('\n').count())
+                });
+                if let Some(line) = line {
+                    regions.push((line, edit.new_lines));
+                }
+                line
+            })
+            .collect();
 
         let warnings = anchor_warnings(
             path_note.as_deref(),
@@ -531,18 +714,84 @@ impl Tool for EditTool {
             args.tag.as_deref(),
             &current_tag,
         );
-        let mut message = format!(
-            "Successfully replaced {} occurrence(s) in {}{}",
-            replacements, args.path, warnings
+
+        if items.len() == 1 {
+            let edit = &staged[0];
+            let line = summary_lines[0].unwrap_or(1);
+            if let Some(confidence) = edit.fuzzy_confidence {
+                tracing::info!(
+                    "🔧 [tool-result] edit: fuzzy-replaced 1 occurrence in \"{}\" ({:.0}% similar, line {})",
+                    path.display(),
+                    confidence * 100.0,
+                    line
+                );
+                let mut message = format!(
+                    "Replaced 1 fuzzy-matched occurrence in {} (line {}, {:.0}% similar to old_string; \
+                     whitespace/indentation differences were tolerated){}",
+                    args.path,
+                    line,
+                    confidence * 100.0,
+                    warnings
+                );
+                message.push('\n');
+                message.push_str(&reground_section(&args.path, &content, new_tag, &regions));
+                return Ok(message);
+            }
+
+            tracing::info!(
+                "🔧 [tool-result] edit: replaced {} occurrence(s) in \"{}\"",
+                edit.occurrences,
+                path.display()
+            );
+            let mut message = format!(
+                "Successfully replaced {} occurrence(s) in {}{}",
+                edit.occurrences, args.path, warnings
+            );
+            message.push('\n');
+            message.push_str(&reground_section(&args.path, &content, new_tag, &regions));
+            return Ok(message);
+        }
+
+        tracing::info!(
+            "🔧 [tool-result] edit: applied {} edits in \"{}\"",
+            staged.len(),
+            path.display()
         );
+        let mut message = format!(
+            "Applied {} edits to {}{}",
+            staged.len(),
+            args.path,
+            warnings
+        );
+        for (index, edit) in staged.iter().enumerate() {
+            let line = summary_lines[index];
+            if let Some(confidence) = edit.fuzzy_confidence {
+                let _ = writeln!(
+                    message,
+                    "- edit {}: fuzzy-matched at line {} ({:.0}% similar to old_string)",
+                    index + 1,
+                    line.unwrap_or(1),
+                    confidence * 100.0
+                );
+            } else if edit.occurrences > 1 {
+                let _ = writeln!(
+                    message,
+                    "- edit {}: replaced all {} occurrences (first at line {})",
+                    index + 1,
+                    edit.occurrences,
+                    line.unwrap_or(1)
+                );
+            } else {
+                let _ = writeln!(
+                    message,
+                    "- edit {}: replaced 1 occurrence at line {}",
+                    index + 1,
+                    line.unwrap_or(1)
+                );
+            }
+        }
         message.push('\n');
-        message.push_str(&reground_section(
-            &args.path,
-            &new_content,
-            new_tag,
-            first_line,
-            args.new_string.lines().count().max(1),
-        ));
+        message.push_str(&reground_section(&args.path, &content, new_tag, &regions));
         Ok(message)
     }
 }
@@ -594,10 +843,38 @@ mod tests {
         use rig::agent::tool::Tool as _;
         let args = EditArgs {
             path: path.to_string(),
-            old_string: old.to_string(),
-            new_string: new.to_string(),
+            old_string: Some(old.to_string()),
+            new_string: Some(new.to_string()),
             replace_all,
+            edits: None,
             tag,
+        };
+        let mut ctx = rig::agent::tool::ToolContext::default();
+        tool.call(&mut ctx, args).await
+    }
+
+    async fn run_edit_batch(
+        tool: &EditTool,
+        path: &str,
+        edits: Vec<(&str, &str)>,
+    ) -> Result<String, EditError> {
+        use rig::agent::tool::Tool as _;
+        let args = EditArgs {
+            path: path.to_string(),
+            old_string: None,
+            new_string: None,
+            replace_all: None,
+            edits: Some(
+                edits
+                    .into_iter()
+                    .map(|(old_string, new_string)| EditItem {
+                        old_string: old_string.to_string(),
+                        new_string: new_string.to_string(),
+                        replace_all: None,
+                    })
+                    .collect(),
+            ),
+            tag: None,
         };
         let mut ctx = rig::agent::tool::ToolContext::default();
         tool.call(&mut ctx, args).await
@@ -648,8 +925,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.path, "/tmp/test.rs");
-        assert_eq!(args.old_string, "foo");
-        assert_eq!(args.new_string, "bar");
+        assert_eq!(args.old_string.as_deref(), Some("foo"));
+        assert_eq!(args.new_string.as_deref(), Some("bar"));
         assert_eq!(args.replace_all, None);
         assert_eq!(args.tag, None);
     }
@@ -661,6 +938,203 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.tag.as_deref(), Some("1a2b"));
+    }
+
+    #[test]
+    fn test_edit_args_edits_array() {
+        let args: EditArgs = serde_json::from_str(
+            r#"{"path": "/tmp/t.rs", "edits": [
+                {"old_string": "a", "new_string": "b"},
+                {"old_string": "c", "new_string": "d", "replace_all": true}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(args.old_string, None);
+        assert_eq!(args.new_string, None);
+        let edits = args.edits.expect("edits parsed");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].old_string, "a");
+        assert_eq!(edits[1].replace_all, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_batch_edits_applied_sequentially() {
+        let path = temp_fixture("batch", "fn a() {}\nfn b() {}\nfn c() {}\n");
+        let out = run_edit_batch(
+            &EditTool::new(),
+            path.to_str().unwrap(),
+            vec![("fn a() {}", "fn ax() {}"), ("fn ax() {}", "fn ay() {}")],
+        )
+        .await
+        .unwrap();
+        // Item 2 matched text produced by item 1: sequential application.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn ay() {}\nfn b() {}\nfn c() {}\n"
+        );
+        assert!(out.contains("Applied 2 edits"), "{out}");
+        assert!(
+            out.contains("- edit 1: replaced 1 occurrence at line 1"),
+            "{out}"
+        );
+        // One fresh anchor header for the whole batch.
+        let header_count = out
+            .lines()
+            .filter(|line| line.starts_with('[') && line.contains('#'))
+            .count();
+        assert_eq!(header_count, 1, "{out}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_batch_line_numbers_account_for_earlier_growth() {
+        let path = temp_fixture("batchln", "one\ntwo\nthree\n");
+        let out = run_edit_batch(
+            &EditTool::new(),
+            path.to_str().unwrap(),
+            vec![("one", "one\none-half"), ("three", "THREE")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\none-half\ntwo\nTHREE\n"
+        );
+        assert!(
+            out.contains("- edit 1: replaced 1 occurrence at line 1"),
+            "{out}"
+        );
+        // Edit 2 lands on line 4 after edit 1 inserted a line.
+        assert!(
+            out.contains("- edit 2: replaced 1 occurrence at line 4"),
+            "{out}"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_batch_failure_is_atomic() {
+        let path = temp_fixture("batchfail", "alpha\nbeta\n");
+        let err = run_edit_batch(
+            &EditTool::new(),
+            path.to_str().unwrap(),
+            vec![("alpha", "ALPHA"), ("missing string", "x")],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.0.contains("edits[1]"),
+            "names the failing item: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("No exact match found") || err.0.contains("No match found"),
+            "{}",
+            err.0
+        );
+        // Nothing was written, including the valid first item.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_batch_rejects_both_forms() {
+        let path = temp_fixture("batchboth", "alpha\n");
+        use rig::agent::tool::Tool as _;
+        let args = EditArgs {
+            path: path.to_string_lossy().to_string(),
+            old_string: Some("alpha".into()),
+            new_string: Some("beta".into()),
+            replace_all: None,
+            edits: Some(vec![EditItem {
+                old_string: "alpha".into(),
+                new_string: "beta".into(),
+                replace_all: None,
+            }]),
+            tag: None,
+        };
+        let mut ctx = rig::agent::tool::ToolContext::default();
+        let err = EditTool::new().call(&mut ctx, args).await.unwrap_err();
+        assert!(err.0.contains("not both"), "{}", err.0);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_drifted_file_refuses_fuzzy_edit() {
+        let path = temp_fixture("driftfuzzy", "fn a() {\n    let x = 1;\n}\n");
+        let read_tool = ReadTool::new();
+        let _ = run_read(&read_tool, path.to_str().unwrap()).await;
+
+        // External change: the model's remembered indentation now only
+        // fuzzy-matches the current content.
+        std::fs::write(&path, "fn a() {\n    let x = 2;\n    let y = 3;\n}\n").unwrap();
+
+        let err = run_edit(
+            &EditTool::new(),
+            path.to_str().unwrap(),
+            "  let x = 1;",
+            "  let x = 10;",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.0
+                .contains("fuzzy matching is not applied to changed content"),
+            "{}",
+            err.0
+        );
+        assert!(err.0.contains("Re-read"), "{}", err.0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn a() {\n    let x = 2;\n    let y = 3;\n}\n"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_grep_mints_anchor_and_edit_detects_drift() {
+        use crate::tools::grep::GrepTool;
+        let root = temp_root("grepmint");
+        let file = root.join("src/sample.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "let alpha = 1;\nlet beta = 2;\n").unwrap();
+
+        let grep_tool = GrepTool::new().with_project_root(root.clone());
+        let grep_args = crate::tools::grep::GrepArgs {
+            pattern: "alpha".to_string(),
+            path: Some(root.to_string_lossy().to_string()),
+            glob: None,
+            file_type: None,
+            case_insensitive: None,
+            multiline: None,
+            context_lines: None,
+            before_context: None,
+            after_context: None,
+            skip: None,
+            head_limit: None,
+            output_mode: Some("content".to_string()),
+            line_numbers: None,
+        };
+        let mut ctx = rig::agent::tool::ToolContext::default();
+        let grep_output = grep_tool.call(&mut ctx, grep_args).await.unwrap();
+        assert!(grep_output.contains("let alpha = 1;"), "{grep_output}");
+
+        // External change after the grep: the edit must see a drifted file.
+        std::fs::write(&file, "let alpha = 11;\nlet beta = 2;\n").unwrap();
+
+        let out = run_edit(
+            &EditTool::new(),
+            file.to_str().unwrap(),
+            "let alpha = 11;",
+            "let alpha = 111;",
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("changed since it was last read/written"),
+            "grep minted an anchor, so drift is detected: {out}"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

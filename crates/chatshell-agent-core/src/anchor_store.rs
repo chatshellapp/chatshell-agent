@@ -1,5 +1,6 @@
-//! Process-wide anchor state shared by the read/write/edit tools: content
-//! tags minted on read/write and validated on edit (upstream
+//! Process-wide anchor state shared by the read/write/grep/edit tools:
+//! content tags minted on read/write and on grep-displayed content, then
+//! validated on edit (upstream
 //! `file-snapshot-store` semantics), the no-op loop guard, and the
 //! exclusive edit lock. Tools are constructed per agent build, so this state
 //! must live outside them.
