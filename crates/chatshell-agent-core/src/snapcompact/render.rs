@@ -12,13 +12,18 @@ use base64::Engine as _;
 use png::Encoder;
 
 use super::fonts::{BitmapFont, Glyph};
-use super::normalize::{DIM_OFF, DIM_ON, NEWLINE_GLYPH};
+use super::normalize::{DIM_OFF, DIM_ON, NEWLINE_GLYPH, cell_units};
 
 /// Palette slots shared with the reference implementation's renderer: 0 background, 1-6 reserved
 /// sentence hues, 7 black ink, 8 repeat band, 9 dim gray ink.
 pub const BG: u8 = 0;
 pub const INK_BLACK: u8 = 7;
 pub const INK_DIM: u8 = 9;
+
+/// Minimum rendered frame height: some vision backends reject images of
+/// 32px or smaller (short final archive frames), so hug-the-rows never
+/// goes below this floor (clamped to `max_height`).
+pub const MIN_FRAME_HEIGHT: usize = 64;
 
 fn palette() -> Vec<[u8; 3]> {
     vec![
@@ -86,16 +91,23 @@ impl GridSpec {
 
     fn used_height(&self, lines: usize) -> usize {
         let used_rows = lines.min(self.max_height / self.cell_height.max(1));
-        (used_rows * self.cell_height).max(self.cell_height)
+        (used_rows * self.cell_height).max(MIN_FRAME_HEIGHT.min(self.max_height))
     }
 }
 
 /// Rasterize pre-wrapped lines onto a cell grid as palette indices, row
 /// major with no wrapping (the caller paginates). Dim toggles switch ink to
 /// [`INK_DIM`] without consuming a cell; [`NEWLINE_GLYPH`] fills its whole
-/// cell with black. Missing glyphs fall back to '?'. Frame height hugs the
-/// rows actually used, capped at the spec.
-pub fn render_bdf_frame(lines: &[String], font: &BitmapFont, spec: GridSpec) -> (Vec<u8>, usize) {
+/// cell with black. Code points missing from the bitmap font draw through
+/// the embedded Silver TrueType fallback when it has a glyph (wide CJK
+/// spans two cells); only glyphs in neither font fall back to '?'. Frame
+/// height hugs the rows actually used, capped at the spec.
+pub fn render_bdf_frame(
+    lines: &[String],
+    font: &BitmapFont,
+    silver: &FontArc,
+    spec: GridSpec,
+) -> (Vec<u8>, usize) {
     let cell_width = spec.cell_width;
     let cell_height = spec.cell_height;
     let width = spec.width;
@@ -105,6 +117,7 @@ pub fn render_bdf_frame(lines: &[String], font: &BitmapFont, spec: GridSpec) -> 
     let mut pixels = vec![BG; width * height];
 
     let question_mark = font.glyphs.get(&'?');
+    let mut silver_cache: HashMap<(char, usize), Option<Rasterized>> = HashMap::new();
     for (row, line) in lines.iter().take(used_rows).enumerate() {
         let mut ink = INK_BLACK;
         let mut col = 0usize;
@@ -125,11 +138,48 @@ pub fn render_bdf_frame(lines: &[String], font: &BitmapFont, spec: GridSpec) -> 
                     col += 1;
                 }
                 ch => {
-                    if col >= cols {
-                        break;
+                    let units = cell_units(ch);
+                    if col + units > cols {
+                        break; // a CJK wide glyph never straddles the right edge
                     }
-                    let glyph = font.glyphs.get(&ch).or(question_mark);
-                    if let Some(glyph) = glyph {
+                    if let Some(glyph) = font.glyphs.get(&ch) {
+                        blit_glyph(
+                            &mut pixels,
+                            &spec,
+                            glyph,
+                            font.ascent,
+                            col * cell_width,
+                            row,
+                            ink,
+                        );
+                    } else if let Some(glyph) = silver_fallback(
+                        &mut silver_cache,
+                        silver,
+                        ch,
+                        units,
+                        cell_width,
+                        cell_height,
+                    ) {
+                        let box_left = col * cell_width;
+                        let box_top = row * cell_height;
+                        let box_w = units * cell_width;
+                        let center_x =
+                            box_left + box_w.saturating_sub(glyph.width.max(0) as usize) / 2;
+                        let center_y =
+                            box_top + cell_height.saturating_sub(glyph.height.max(0) as usize) / 2;
+                        let offset_x = center_x as i32 - glyph.min_x;
+                        let offset_y = center_y as i32 - glyph.min_y;
+                        for (x, y, coverage) in &glyph.samples {
+                            if *coverage < 0.5 {
+                                continue; // quantize anti-aliasing to bitmap ink
+                            }
+                            let px = (*x + offset_x).max(0) as usize;
+                            let py = (*y + offset_y).max(0) as usize;
+                            if px < width && py < height {
+                                pixels[py * width + px] = ink;
+                            }
+                        }
+                    } else if let Some(glyph) = question_mark {
                         blit_glyph(
                             &mut pixels,
                             &spec,
@@ -140,12 +190,38 @@ pub fn render_bdf_frame(lines: &[String], font: &BitmapFont, spec: GridSpec) -> 
                             ink,
                         );
                     }
-                    col += 1;
+                    col += units;
                 }
             }
         }
     }
     (pixels, height)
+}
+
+/// Rasterize `ch` with Silver sized to a `units`-cell box (the bitmap
+/// renderer's per-character fallback for glyphs its font lacks).
+#[allow(clippy::too_many_arguments)]
+fn silver_fallback(
+    cache: &mut HashMap<(char, usize), Option<Rasterized>>,
+    silver: &FontArc,
+    ch: char,
+    units: usize,
+    cell_width: usize,
+    cell_height: usize,
+) -> Option<Rasterized> {
+    let key = (ch, units);
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            let glyph_id = silver.glyph_id(ch);
+            if glyph_id == GlyphId(0) {
+                None
+            } else {
+                let box_px = (units.max(1) * cell_width).min(cell_height.max(cell_width));
+                rasterize_ttf_glyph(silver, glyph_id, box_px as f32)
+            }
+        })
+        .clone()
 }
 
 /// One rasterized TrueType glyph: coverage samples at glyph-space offsets.
@@ -200,7 +276,9 @@ pub fn render_silver_frame(lines: &[String], font: &FontArc, spec: GridSpec) -> 
     let height = spec.used_height(lines.len());
     // White background, interleaved RGB.
     let mut pixels = vec![0xFFu8; width * height * 3];
-    let scale = cell_height as f32 * 0.82;
+    // Upstream sizes Silver at its design size (the cell height): the
+    // glyph fills the cell instead of floating at 82% of it.
+    let scale = cell_height as f32;
 
     let mut cache: HashMap<char, Option<Rasterized>> = HashMap::new();
     let put_pixel = |pixels: &mut [u8], x: usize, y: usize, coverage: f32, dim: bool| {
@@ -332,11 +410,13 @@ mod tests {
         LazyLock::new(|| FontArc::try_from_slice(SILVER_TTF).expect("silver loads"));
 
     #[test]
-    fn bdf_frame_has_ink_and_hugs_height() {
-        let lines = vec!["Hello".to_string()];
-        let (pixels, height) = render_bdf_frame(
-            &lines,
+    fn bdf_frame_hugs_height_with_min_floor() {
+        // A single short line never goes below MIN_FRAME_HEIGHT: vision
+        // backends reject tiny images.
+        let (_, height) = render_bdf_frame(
+            &["Hello".to_string()],
             &BDF,
+            &SILVER,
             GridSpec {
                 cell_width: 8,
                 cell_height: 13,
@@ -344,7 +424,22 @@ mod tests {
                 max_height: 1568,
             },
         );
-        assert_eq!(height, 13);
+        assert_eq!(height, MIN_FRAME_HEIGHT);
+
+        // Several lines still hug the rows actually printed.
+        let lines: Vec<String> = (0..10).map(|n| format!("line {n}")).collect();
+        let (pixels, height) = render_bdf_frame(
+            &lines,
+            &BDF,
+            &SILVER,
+            GridSpec {
+                cell_width: 8,
+                cell_height: 13,
+                width: 80,
+                max_height: 1568,
+            },
+        );
+        assert_eq!(height, 10 * 13);
         assert!(pixels.iter().any(|p| *p != BG), "no ink drawn");
         // Blank leading rows stay background above the glyph tops only
         // within the cell; count distinct ink columns to sanity-check width.
@@ -357,7 +452,44 @@ mod tests {
             .count();
         assert!(
             ink_columns >= 4,
-            "expected ink in ~5 cells, got {ink_columns}"
+            "expected ink in ~10 cells, got {ink_columns}"
+        );
+    }
+
+    #[test]
+    fn bdf_frame_draws_cjk_through_silver_fallback() {
+        let spec = GridSpec {
+            cell_width: 11,
+            cell_height: 16,
+            width: 88,
+            max_height: 1568,
+        };
+        let (cjk_pixels, _) =
+            render_bdf_frame(&["\u{4f60}\u{597d} ok".to_string()], &BDF, &SILVER, spec);
+        let (qm_pixels, _) = render_bdf_frame(&["?? ok".to_string()], &BDF, &SILVER, spec);
+        assert!(cjk_pixels.iter().any(|p| *p != BG), "CJK ink drawn");
+        assert_ne!(
+            cjk_pixels, qm_pixels,
+            "CJK must render as Silver glyphs, not question marks"
+        );
+
+        // CJK wide glyphs occupy two cells: the first glyph's ink spans
+        // columns 0-1 and the ASCII tail sits at columns 4-5.
+        let ink_columns = |pixels: &[u8]| {
+            (0..88 / 11)
+                .filter(|col| {
+                    (0..16).any(|y| pixels[y * 88 + col * 11..y * 88 + (col + 1) * 11] != [BG])
+                })
+                .collect::<Vec<_>>()
+        };
+        let cjk_cols = ink_columns(&cjk_pixels);
+        assert!(
+            cjk_cols.contains(&0) && cjk_cols.contains(&1),
+            "CJK wide glyph spans two cells"
+        );
+        assert!(
+            cjk_cols.contains(&4) && cjk_cols.contains(&5),
+            "ok at cols 4-5"
         );
     }
 
@@ -367,6 +499,7 @@ mod tests {
         let (pixels, _height) = render_bdf_frame(
             &lines,
             &BDF,
+            &SILVER,
             GridSpec {
                 cell_width: 8,
                 cell_height: 13,
@@ -384,6 +517,7 @@ mod tests {
         let (_pixels, height) = render_bdf_frame(
             &lines,
             &BDF,
+            &SILVER,
             GridSpec {
                 cell_width: 8,
                 cell_height: 13,
@@ -407,7 +541,7 @@ mod tests {
                 max_height: 1568,
             },
         );
-        assert_eq!(height, 16);
+        assert_eq!(height, MIN_FRAME_HEIGHT);
         let dark = pixels.chunks_exact(3).filter(|px| px[0] < 128).count();
         assert!(dark > 4, "expected CJK ink, got {dark} dark pixels");
     }
@@ -418,6 +552,7 @@ mod tests {
         let (pixels, height) = render_bdf_frame(
             &lines,
             &BDF,
+            &SILVER,
             GridSpec {
                 cell_width: 8,
                 cell_height: 13,

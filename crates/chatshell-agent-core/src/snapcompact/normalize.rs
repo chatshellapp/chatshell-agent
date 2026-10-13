@@ -162,10 +162,11 @@ where
                     }
                 }
                 if !kept {
-                    // Not renderable by this font and no ASCII fold: keep
-                    // wide-range characters (CJK draws through the TrueType
-                    // fallback), drop the rest (emoji, combining marks).
-                    if is_probably_wide(c) || c.is_alphabetic() {
+                    // Not renderable by either font and no ASCII fold:
+                    // keep wide-range and alphabetic characters (they may
+                    // still draw through the Silver fallback); drop the
+                    // rest (decorative emoji, combining marks).
+                    if is_wide(c) || c.is_alphabetic() {
                         out.push(c);
                         last_was_space = false;
                         last_was_newline_glyph = false;
@@ -180,33 +181,55 @@ where
         .to_string()
 }
 
-/// Rough East-Asian Wide/Fullwidth check used to decide which uncovered
-/// characters survive normalization for the TrueType fallback (subset of
-/// the reference implementation's `is_wide`).
-fn is_probably_wide(ch: char) -> bool {
+/// East Asian Wide / Fullwidth code points (port of the reference
+/// implementation's `is_wide`): these occupy two grid cells in narrow
+/// bitmap shapes and one full-width Silver cell.
+pub fn is_wide(ch: char) -> bool {
     let cp = ch as u32;
     (0x1100..=0x115F).contains(&cp)
-        || (0x2E80..=0x303E).contains(&cp)
+        || (0x2E80..=0x2EFF).contains(&cp)
+        || (0x2F00..=0x2FDF).contains(&cp)
+        || (0x3000..=0x303E).contains(&cp)
         || (0x3041..=0x33FF).contains(&cp)
         || (0x3400..=0x4DBF).contains(&cp)
         || (0x4E00..=0x9FFF).contains(&cp)
-        || (0xA960..=0xA97F).contains(&cp)
+        || (0xA000..=0xA4CF).contains(&cp)
         || (0xAC00..=0xD7A3).contains(&cp)
         || (0xF900..=0xFAFF).contains(&cp)
         || (0xFE30..=0xFE4F).contains(&cp)
         || (0xFF00..=0xFF60).contains(&cp)
         || (0xFFE0..=0xFFE6).contains(&cp)
-        || (0x1F300..=0x1F64F).contains(&cp)
         || (0x20000..=0x2FFFD).contains(&cp)
         || (0x30000..=0x3FFFD).contains(&cp)
 }
 
-/// Greedy word wrap at `width` cells (one cell per character in the v1
-/// shapes; wide characters occupy one Silver cell by design). No mid-word
-/// breaks except for words longer than the width. Explicit
-/// [`NEWLINE_GLYPH`] separators force line starts; zero-width dim toggles
-/// ride along without consuming cells.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
+/// Grid cells one character occupies in a narrow bitmap shape: 0 for the
+/// zero-width dim toggles, 2 for wide code points, 1 otherwise. The Silver
+/// shape sizes every cell full-width, so it always counts 1.
+pub fn cell_units(ch: char) -> usize {
+    if is_zero_width(ch) {
+        0
+    } else if is_wide(ch) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Greedy word wrap at `width` cells. With `wide_cells` (narrow bitmap
+/// shapes) wide characters count two cells; with the full-width Silver
+/// shape every character counts one. No mid-word breaks except for words
+/// longer than the width — and a wide character never straddles the right
+/// edge. Explicit [`NEWLINE_GLYPH`] separators force line starts;
+/// zero-width dim toggles ride along without consuming cells.
+pub fn wrap(text: &str, width: usize, wide_cells: bool) -> Vec<String> {
+    let units = |ch: char| -> usize {
+        if !wide_cells {
+            usize::from(!is_zero_width(ch))
+        } else {
+            cell_units(ch)
+        }
+    };
     if width == 0 {
         return vec![String::new()];
     }
@@ -215,7 +238,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         let mut current = String::new();
         let mut cells = 0usize;
         for word in raw_line.split(' ') {
-            let word_cells: usize = word.chars().filter(|c| !is_zero_width(*c)).count();
+            let word_cells: usize = word.chars().map(units).sum();
             let gap = if current.is_empty() { 0 } else { 1 };
             if cells + gap + word_cells <= width {
                 if gap == 1 {
@@ -233,18 +256,16 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                 if !current.is_empty() {
                     lines.push(std::mem::take(&mut current));
                 }
-                let mut chunk_cells = 0usize;
+                cells = 0;
                 for ch in word.chars() {
-                    if !is_zero_width(ch) {
-                        if chunk_cells == width {
-                            lines.push(std::mem::take(&mut current));
-                            chunk_cells = 0;
-                        }
-                        chunk_cells += 1;
+                    let ch_units = units(ch);
+                    if cells + ch_units > width {
+                        lines.push(std::mem::take(&mut current));
+                        cells = 0;
                     }
+                    cells += ch_units;
                     current.push(ch);
                 }
-                cells = chunk_cells;
             }
         }
         lines.push(current);
@@ -289,7 +310,7 @@ mod tests {
     fn dim_toggles_survive_at_zero_width() {
         let out = normalize("\u{000e}tool noise\u{000f} plain", ascii_only);
         assert_eq!(out, "\u{000e}tool noise\u{000f} plain");
-        assert_eq!(wrap(&out, 80).len(), 1);
+        assert_eq!(wrap(&out, 80, true).len(), 1);
     }
 
     #[test]
@@ -300,19 +321,47 @@ mod tests {
     }
 
     #[test]
-    fn controls_drop_but_emoji_are_dropped_without_placeholder() {
+    fn decorative_emoji_drop_rather_than_placeholder() {
         assert_eq!(normalize("a\u{7}b", ascii_only), "ab");
+        // Decorative emoji: not foldable, not wide-range, not alphabetic.
+        assert_eq!(normalize("ok \u{1f600} done", ascii_only), "ok done");
+    }
+
+    #[test]
+    fn cell_units_classify_widths() {
+        assert_eq!(cell_units('a'), 1);
+        assert_eq!(cell_units('\u{4f60}'), 2); // CJK
+        assert_eq!(cell_units('\u{ac00}'), 2); // Hangul
+        assert_eq!(cell_units('\u{ff21}'), 2); // fullwidth A
+        assert_eq!(cell_units(DIM_ON), 0);
+        assert_eq!(cell_units(DIM_OFF), 0);
+    }
+
+    #[test]
+    fn wrap_counts_wide_chars_as_two_cells() {
+        // 4 ASCII + 1 CJK (2 cells) = 6 cells: fits exactly, no straddle.
+        assert_eq!(wrap("AAAA\u{4f60}", 6, true), vec!["AAAA\u{4f60}"]);
+        // The second CJK glyph would straddle the width: new line first.
+        assert_eq!(
+            wrap("AAAA\u{4f60}\u{597d}", 6, true),
+            vec!["AAAA\u{4f60}", "\u{597d}"]
+        );
+        // The Silver shape counts every glyph one cell.
+        assert_eq!(
+            wrap("AAAA\u{4f60}\u{597d}", 6, false),
+            vec!["AAAA\u{4f60}\u{597d}"]
+        );
     }
 
     #[test]
     fn wrap_greedy_no_mid_word() {
-        let lines = wrap("alpha beta gamma delta", 11);
+        let lines = wrap("alpha beta gamma delta", 11, true);
         assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
         // Hard split for overlong words.
-        let lines = wrap("abcdefgh", 3);
+        let lines = wrap("abcdefgh", 3, true);
         assert_eq!(lines, vec!["abc", "def", "gh"]);
         // Explicit separators force new lines.
-        let lines = wrap("one\u{2588}\u{2588}two", 10);
+        let lines = wrap("one\u{2588}\u{2588}two", 10, true);
         assert_eq!(lines, vec!["one", "two"]);
     }
 }

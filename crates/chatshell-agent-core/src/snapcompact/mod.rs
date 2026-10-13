@@ -1,8 +1,10 @@
 //! Snapcompact compaction: archive conversation history as dense pixel-font
 //! bitmap images the model reads back near-verbatim at a fraction of the
 //! input-token price (see the snapcompact technique writeup). This port
-//! keeps the eval-winning black-ink shapes and drops hue cycling, line
-//! repetition, foveation, and Lanczos stretching.
+//! keeps the eval-winning black-ink shapes, the per-character Silver
+//! TrueType fallback for glyphs the bitmap font lacks (wide CJK spans two
+//! cells), and drops hue cycling, line repetition, foveation, and Lanczos
+//! stretching.
 //!
 //! Font assets are bundled under their own upstream licenses: the X.org
 //! misc 8x13 BDF bitmap font (Markus Kuhn's ucs-fonts) and a Silver
@@ -172,8 +174,10 @@ static SILVER: LazyLock<FontArc> =
     LazyLock::new(|| FontArc::try_from_slice(SILVER_TTF).expect("embedded font"));
 
 /// Pick the frame shape for a transcript: Silver for CJK-heavy text or when
-/// the 8x13 font cannot render enough of it; otherwise the billing family's
-/// eval-winning grid shape.
+/// neither bundled font can render enough of it; otherwise the billing
+/// family's eval-winning grid shape. Chars the bitmap font lacks but Silver
+/// covers count as covered — they draw through the per-character Silver
+/// fallback inside bitmap frames.
 pub fn resolve_shape(provider: &str, text: &str) -> ShapeGeometry {
     if cjk_heavy(text) {
         return GEOM_SILVER16;
@@ -189,7 +193,11 @@ pub fn resolve_shape(provider: &str, text: &str) -> ShapeGeometry {
     }
     let covered = sample
         .chars()
-        .filter(|ch| ch.is_whitespace() || BDF_FONT.glyphs.contains_key(ch))
+        .filter(|ch| {
+            ch.is_whitespace()
+                || BDF_FONT.glyphs.contains_key(ch)
+                || SILVER.glyph_id(*ch) != ab_glyph::GlyphId(0)
+        })
         .count();
     let coverage_ratio = (covered as f64) / (sample.chars().count() as f64);
     if coverage_ratio < MIN_RENDERABLE_RATIO {
@@ -268,7 +276,11 @@ pub fn build_archive(
     let normalized = normalize::normalize(transcript, renderable);
     let cols = geometry.frame_size / geometry.cell_width.max(1);
     let rows = geometry.frame_size / geometry.cell_height.max(1);
-    let lines = wrap(&normalized, cols);
+    let lines = wrap(
+        &normalized,
+        cols,
+        geometry.font != FontKind::Silver, // wide chars occupy two cells in narrow grids
+    );
 
     if lines.len() <= rows * 2 {
         return Err(SnapcompactError::NotNeeded);
@@ -288,7 +300,7 @@ pub fn build_archive(
         };
         let (pixels, width, height, indexed) = match geometry.font {
             FontKind::Bdf8x13 => {
-                let (pixels, height) = render::render_bdf_frame(chunk, &BDF_FONT, spec);
+                let (pixels, height) = render::render_bdf_frame(chunk, &BDF_FONT, &SILVER, spec);
                 (pixels, geometry.frame_size, height, true)
             }
             FontKind::Silver => {
@@ -424,5 +436,159 @@ mod tests {
         let archive = build_archive(&cjk, "anthropic").expect("archive builds");
         assert_eq!(archive.shape, "silver16-bw");
         assert!(!archive.frames.is_empty());
+    }
+
+    /// Decode an indexed frame back to palette indices (verification paths).
+    fn decode_indices(frame: &PngFrame) -> (u32, u32, Vec<u8>) {
+        let bytes = render::png_base64_decode(&frame.png_base64);
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let mut reader = decoder.read_info().expect("frame decodes");
+        let width = reader.info().width;
+        let height = reader.info().height;
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut buffer).expect("frame data");
+        (width, height, buffer)
+    }
+
+    #[test]
+    fn dim_spans_render_as_dim_ink_end_to_end() {
+        // Transcript sections carry zero-width dim toggles (tool noise);
+        // they must survive normalize + wrap and reach the frame as dim
+        // palette ink while conversation lines print black.
+        let mut transcript = String::new();
+        for i in 0..200 {
+            if i % 2 == 0 {
+                transcript.push('\u{000e}');
+                transcript.push_str(&format!("tool noise line {i}"));
+                transcript.push('\u{000f}');
+            } else {
+                transcript.push_str(&format!("conversation line {i}"));
+            }
+            transcript.push('\n');
+        }
+        let archive = build_archive(&transcript, "custom_openai").expect("archive builds");
+        assert!(!archive.frames.is_empty());
+        let (_, _, indices) = decode_indices(&archive.frames[0]);
+        assert!(indices.contains(&render::INK_DIM), "dim ink missing");
+        assert!(indices.contains(&render::INK_BLACK), "black ink missing");
+    }
+
+    #[test]
+    fn not_needed_boundary_is_exactly_two_frames_of_lines() {
+        // GEOM_8ON22 (unknown/openai family): rows = 1568/22 = 71.
+        let lines = |count: usize| {
+            (0..count)
+                .map(|i| format!("boundary probe line {i:04}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let exactly_two_frames = lines(142);
+        assert!(matches!(
+            build_archive(&exactly_two_frames, "custom_openai"),
+            Err(SnapcompactError::NotNeeded)
+        ));
+        let one_over = build_archive(&lines(143), "custom_openai").expect("builds");
+        assert_eq!(one_over.frames.len(), 1);
+        assert_eq!(one_over.chars_dropped, 0);
+    }
+
+    #[test]
+    fn mixed_language_transcript_keeps_bitmap_shape_with_fallback() {
+        // ~11% wide chars in the sample: below the cjk_heavy ratio (25%),
+        // above the old BDF-only coverage floor (95%). Silver-covered
+        // chars now count as covered, so the dense bitmap shape stays and
+        // CJK renders through the per-character Silver fallback.
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("line {i:03} of the migration plan\n"));
+            if i % 3 == 0 {
+                text.push_str(
+                    "\u{8fc1}\u{79fb}\u{8ba1}\u{5212}\u{7b2c}\u{4e00}\u{6b65}\u{5b8c}\u{6210}\n",
+                );
+            }
+        }
+        assert!(!cjk_heavy(&text));
+        assert_eq!(resolve_shape("anthropic", &text), GEOM_11ON16);
+
+        // End to end: the archive builds on the bitmap shape and its
+        // frames carry ink (CJK drawn as Silver glyphs, not skipped).
+        let archive = build_archive(&text, "anthropic").expect("archive builds");
+        assert_eq!(archive.shape, "11on16-bw");
+        assert!(!archive.frames.is_empty());
+        let (_, _, indices) = decode_indices(&archive.frames[0]);
+        assert!(indices.contains(&render::INK_BLACK));
+    }
+
+    #[test]
+    fn overflow_drops_newest_middle_lines() {
+        // Fixture: the overflow slice past the frame budget is made of
+        // long lines while everything inside the budget is short, so the
+        // reported chars_dropped identifies which slice was dropped.
+        let rows = 1568 / GEOM_8ON22.cell_height; // 71
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..rows {
+            lines.push(format!("head edge line {i:04}"));
+        }
+        for i in 0..rows * MAX_FRAMES {
+            lines.push(format!("mid {i:05}")); // short lines
+        }
+        let mut overflow: Vec<String> = Vec::new();
+        for i in 0..50 {
+            overflow.push(format!(
+                "overflow newest middle {i:03} 0123456789012345678901234567890123456789"
+            ));
+        }
+        lines.extend(overflow.iter().cloned());
+        for i in 0..rows {
+            lines.push(format!("tail edge line {i:04}"));
+        }
+        let transcript = lines.join("\n");
+        let archive = build_archive(&transcript, "custom_openai").expect("archive builds");
+
+        assert_eq!(archive.frames.len(), MAX_FRAMES);
+        let expected_dropped: usize = overflow.iter().map(|l| l.chars().count()).sum();
+        assert_eq!(archive.chars_dropped, expected_dropped);
+        assert!(archive.head_text.contains("head edge line 0000"));
+        assert!(archive.tail_text.contains("tail edge line 0070"));
+    }
+
+    #[test]
+    fn archive_token_estimate_sums_per_frame_estimates() {
+        let archive =
+            build_archive(&latin_transcript(6), "custom_anthropic").expect("archive builds");
+        let expected: usize = archive
+            .frames
+            .iter()
+            .map(|frame| {
+                frame_token_estimate(billing_family("anthropic"), frame.width.max(frame.height))
+            })
+            .sum();
+        assert_eq!(
+            archive_token_estimate(&archive, BillingFamily::Anthropic),
+            expected
+        );
+        // Unknown families share Anthropic's pixel-area pricing as ceiling.
+        assert_eq!(
+            archive_token_estimate(&archive, BillingFamily::Unknown),
+            expected
+        );
+    }
+
+    #[test]
+    fn frames_decode_with_declared_dimensions_and_min_height() {
+        // 143 lines -> two text edges of 71 + a 1-line middle: the single
+        // frame is exactly the MIN_FRAME_HEIGHT floor case.
+        let transcript = (0..143)
+            .map(|i| format!("min height probe {i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let archive = build_archive(&transcript, "custom_openai").expect("archive builds");
+        assert_eq!(archive.frames.len(), 1);
+        for frame in &archive.frames {
+            let (width, height, _) = decode_indices(frame);
+            assert_eq!(width as usize, frame.width);
+            assert_eq!(height as usize, frame.height);
+        }
+        assert!(archive.frames[0].height >= render::MIN_FRAME_HEIGHT);
     }
 }
