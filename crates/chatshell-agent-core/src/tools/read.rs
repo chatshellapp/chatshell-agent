@@ -143,11 +143,17 @@ impl ReadTool {
                     image.header, question, answer
                 ))
             }
-            Err(error) => Err(ReadError(format!(
-                "Image question failed: {}. Read the file again without \
-                 \"question\" for its normal content.",
-                error
-            ))),
+            // Return the failure as tool output, not an Err: host runtimes
+            // (e.g. rig) replace tool errors with generic feedback like
+            // "the tool failed", hiding the cause and the remedy from the
+            // model — the exact strings it needs to stop retrying blindly.
+            Err(error) => Ok(format!(
+                "{}\nImage question failed: {}. The vision model may be \
+                 misconfigured or unreachable; check Settings → Auxiliary \
+                 Models. Read the file again without \"question\" for its \
+                 normal content.",
+                image.header, error
+            )),
         }
     }
 }
@@ -791,16 +797,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responder_failure_is_an_error_with_recovery_hint() {
+    async fn responder_failure_returns_output_with_recovery_hint() {
         let (_dir, path) = write_temp_image();
         let tool = ReadTool::new()
             .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: true }));
 
-        let err = call_read(&tool, image_args(&path, Some("what is shown?")))
+        // Failure is tool output, not an Err: host runtimes replace tool
+        // errors with generic feedback, hiding the cause from the model.
+        let out = call_read(&tool, image_args(&path, Some("what is shown?")))
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("vision call failed"), "err: {err}");
-        assert!(err.to_string().contains("without \"question\""));
+            .unwrap();
+        assert!(out.contains("vision call failed"), "out: {out}");
+        assert!(out.contains("without \"question\""), "out: {out}");
     }
 
     #[tokio::test]
