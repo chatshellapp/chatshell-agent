@@ -233,6 +233,29 @@ pub struct SnapcompactArchive {
     pub frames: Vec<PngFrame>,
     /// Characters of the middle dropped by the frame cap.
     pub chars_dropped: usize,
+    /// Provider string the archive was shaped for; re-rendering uses it so
+    /// the frame geometry stays stable across model switches. Empty on
+    /// archives persisted before the field existed.
+    #[serde(default)]
+    pub provider: String,
+    /// The transcript this archive was built from (pre-normalization). A
+    /// later compaction merges it ahead of its own discarded region so the
+    /// imaged history survives re-compaction instead of being shadowed;
+    /// frames re-render from it on demand. Empty on archives persisted
+    /// before the field existed.
+    #[serde(default)]
+    pub source_text: String,
+}
+
+impl SnapcompactArchive {
+    /// What gets persisted: everything but the base64 frames. The shell
+    /// re-renders deterministically from `source_text` + `provider`, so
+    /// frames are a cache, not data.
+    pub fn persisted_shell(&self) -> SnapcompactArchive {
+        let mut shell = self.clone();
+        shell.frames.clear();
+        shell
+    }
 }
 
 /// Failures of archive construction.
@@ -331,6 +354,8 @@ pub fn build_archive(
         tail_text: tail_lines.join("\n"),
         frames,
         chars_dropped,
+        provider: provider.to_string(),
+        source_text: transcript.to_string(),
     })
 }
 
@@ -590,5 +615,50 @@ mod tests {
             assert_eq!(height as usize, frame.height);
         }
         assert!(archive.frames[0].height >= render::MIN_FRAME_HEIGHT);
+    }
+
+    #[test]
+    fn archive_stores_source_text_for_recompaction() {
+        let transcript = latin_transcript(6);
+        let archive = build_archive(&transcript, "custom_openai").expect("archive builds");
+        assert_eq!(archive.source_text, transcript);
+        // Round trip preserves it.
+        let json = serde_json::to_string(&archive).unwrap();
+        let parsed: SnapcompactArchive = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_text, transcript);
+    }
+
+    #[test]
+    fn persisted_shell_renders_back_identically() {
+        let transcript = latin_transcript(6);
+        let archive = build_archive(&transcript, "custom_anthropic").expect("archive builds");
+        let shell = archive.persisted_shell();
+        assert!(shell.frames.is_empty());
+        assert_eq!(shell.source_text, transcript);
+        assert_eq!(shell.provider, "custom_anthropic");
+
+        // The shell re-renders to the identical archive (deterministic).
+        let re_rendered =
+            build_archive(&shell.source_text, &shell.provider).expect("re-render builds");
+        assert_eq!(re_rendered.frames.len(), archive.frames.len());
+        assert_eq!(re_rendered.shape, archive.shape);
+        assert_eq!(re_rendered.head_text, archive.head_text);
+        assert_eq!(re_rendered.tail_text, archive.tail_text);
+        assert_eq!(re_rendered.chars_dropped, archive.chars_dropped);
+        for (a, b) in re_rendered.frames.iter().zip(archive.frames.iter()) {
+            assert_eq!(a.png_base64, b.png_base64);
+        }
+    }
+
+    #[test]
+    fn archive_json_without_optional_fields_still_parses() {
+        // Archives persisted before source_text/provider existed.
+        let legacy = r#"{
+            "shape": "11on16-bw", "head_text": "h", "tail_text": "t",
+            "frames": [], "chars_dropped": 0
+        }"#;
+        let parsed: SnapcompactArchive = serde_json::from_str(legacy).expect("legacy parses");
+        assert_eq!(parsed.source_text, "");
+        assert_eq!(parsed.provider, "");
     }
 }
