@@ -17,6 +17,11 @@ pdf-extract = "0.7"
 # Repair fallback for PDFs whose xref/trailer is malformed enough that
 # pdf-extract's pinned lopdf rejects them (newer lopdf recovers by scanning).
 lopdf = { version = "0.45", default-features = false }
+# Office formats: OOXML is ZIP + XML. calamine reads spreadsheets;
+# quick-xml parses docx/pptx text without a full OOXML model.
+calamine = "0.36"
+quick-xml = { version = "0.42", default-features = false }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 async-stream.workspace = true

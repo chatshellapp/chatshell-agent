@@ -47,6 +47,17 @@ pub struct ReadArgs {
     /// image files; `offset`/`limit` are ignored.
     #[serde(default)]
     pub question: Option<String>,
+    /// Worksheet name for `.xlsx`/`.xlsm`. Omit to preview the first sheet.
+    #[serde(default)]
+    pub sheet: Option<String>,
+    /// A1-style window for `.xlsx`/`.xlsm` (e.g. `"A1:F40"`). Capped at
+    /// 200 rows × 100 columns per read.
+    #[serde(default)]
+    pub range: Option<String>,
+    /// For `.xlsx`/`.xlsm`: show formula text instead of cached values
+    /// where a formula exists.
+    #[serde(default)]
+    pub formulas: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -488,6 +499,10 @@ impl Tool for ReadTool {
                 for image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data; \
                 for PDF files, extracts and returns the text content; use \"pages\" for a \
                 1-based page selection (e.g. \"3\", \"1-5\", \"1,4,7\"); \
+                for Office files, .docx/.pptx return Markdown (headings, lists, tables, slide text) \
+                and .xlsx/.xlsm return a bounded TSV view with a sheet list; use \"sheet\" and \
+                \"range\" (A1 style) to page spreadsheets, and \"formulas\" to show formulas; \
+                legacy .doc/.xls/.ppt are not supported. \
                 supports line ranges and negative offset for text files (e.g. -20 reads the last 20 lines). \
                 URLs (http/https): image URLs return metadata and base64-encoded data (or a \
                 vision-model answer when the \"question\" argument is set); text/JSON/XML URLs \
@@ -520,6 +535,18 @@ impl Tool for ReadTool {
                 "question": {
                     "type": "string",
                     "description": "Optional natural-language question about an image file or image URL. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for images; offset/limit are ignored."
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": "Worksheet name for .xlsx/.xlsm files. Omit to preview the first sheet and list the available sheets."
+                },
+                "range": {
+                    "type": "string",
+                    "description": "A1-style cell window for .xlsx/.xlsm files, e.g. \"A1:F40\" or \"B2\". Capped at 200 rows by 100 columns per read."
+                },
+                "formulas": {
+                    "type": "boolean",
+                    "description": "For .xlsx/.xlsm files: show formula text where a formula exists instead of the cached value."
                 }
             },
             "required": ["path"]
@@ -620,6 +647,12 @@ impl Tool for ReadTool {
         }
         if is_pdf_extension(&ext) {
             return read_pdf(self.fs.as_ref(), path, &args);
+        }
+        if crate::office::is_legacy_office_extension(&ext) {
+            return Err(ReadError(crate::office::legacy_message(&ext)));
+        }
+        if crate::office::is_office_extension(&ext) {
+            return read_office(self.fs.as_ref(), path, &ext, &args);
         }
 
         read_text(self.fs.as_ref(), path, &args)
@@ -1083,6 +1116,92 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Stri
     ))
 }
 
+/// Read an OOXML office document. Format-specific extraction lives in
+/// `crate::office`; this function owns the tool-level contract (which
+/// arguments apply, and how text is windowed).
+fn read_office(
+    fs: &dyn Fs,
+    path: &std::path::Path,
+    ext: &str,
+    args: &ReadArgs,
+) -> Result<String, ReadError> {
+    let bytes = fs
+        .read(path)
+        .map_err(|e| ReadError(format!("Failed to read file: {}", e)))?;
+
+    match ext {
+        "xlsx" | "xlsm" => {
+            if args.offset.is_some() || args.limit.is_some() {
+                return Err(ReadError(
+                    "offset/limit do not apply to spreadsheets; use \"range\" \
+                     (e.g. A1:F40) to page a sheet."
+                        .to_string(),
+                ));
+            }
+            crate::office::read_xlsx(
+                &bytes,
+                args.sheet.as_deref(),
+                args.range.as_deref(),
+                args.formulas,
+            )
+            .map_err(|e| ReadError(e.to_string()))
+        }
+        "docx" | "docm" => {
+            reject_spreadsheet_args(ext, args)?;
+            let markdown =
+                crate::office::read_docx(&bytes).map_err(|e| ReadError(e.to_string()))?;
+            Ok(window_markdown("DOCX", &markdown, args))
+        }
+        "pptx" | "pptm" => {
+            reject_spreadsheet_args(ext, args)?;
+            let text = crate::office::read_pptx(&bytes).map_err(|e| ReadError(e.to_string()))?;
+            Ok(window_markdown("PPTX", &text, args))
+        }
+        _ => Err(ReadError(format!(
+            "Unsupported office extension \".{ext}\"."
+        ))),
+    }
+}
+
+fn reject_spreadsheet_args(ext: &str, args: &ReadArgs) -> Result<(), ReadError> {
+    if args.sheet.is_some() || args.range.is_some() || args.formulas {
+        return Err(ReadError(format!(
+            "\"sheet\", \"range\", and \"formulas\" only apply to .xlsx/.xlsm \
+             files, not \".{ext}\"."
+        )));
+    }
+    Ok(())
+}
+
+/// Apply `offset`/`limit` to extracted Markdown/PPTX text. Line numbers are
+/// omitted so the text stays copy-pasteable as Markdown.
+fn window_markdown(kind: &str, text: &str, args: &ReadArgs) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let limit = args.limit.unwrap_or(DEFAULT_LINE_LIMIT).max(1);
+    let start = match args.offset {
+        Some(offset) if offset < 0 => total.saturating_sub((-offset) as usize),
+        Some(offset) => (offset.max(1) as usize - 1).min(total),
+        None => 0,
+    };
+    let end = (start + limit).min(total);
+
+    let mut output = format!("[{kind}: {total} lines]\n\n");
+    for line in &lines[start..end] {
+        output.push_str(line);
+        output.push('\n');
+    }
+    if start > 0 || end < total {
+        output.push_str(&format!(
+            "\n(showing lines {}-{} of {}; use offset/limit to page)\n",
+            start + 1,
+            end,
+            total
+        ));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,6 +1272,9 @@ mod tests {
             limit: None,
             pages: None,
             question: None,
+            sheet: None,
+            range: None,
+            formulas: false,
         };
         let out = call_read(&ReadTool::new(), args).await.unwrap();
 
@@ -1221,7 +1343,67 @@ mod tests {
             limit: None,
             pages: pages.map(str::to_string),
             question: None,
+            sheet: None,
+            range: None,
+            formulas: false,
         }
+    }
+
+    #[tokio::test]
+    async fn docx_read_dispatches_and_reports_line_count() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.docx");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("word/document.xml", options).unwrap();
+            zip.write_all(
+                br#"<w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p></w:body></w:document>"#,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let args = ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            pages: None,
+            question: None,
+            sheet: None,
+            range: None,
+            formulas: false,
+        };
+        let out = call_read(&ReadTool::new(), args).await.unwrap();
+        assert!(out.contains("[DOCX:"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn legacy_office_extension_reports_conversion_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.doc");
+        std::fs::write(&path, b"\xD0\xCF\x11\xE0").unwrap();
+
+        let args = ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            pages: None,
+            question: None,
+            sheet: None,
+            range: None,
+            formulas: false,
+        };
+        let error = call_read(&ReadTool::new(), args).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Legacy binary Office format"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1389,6 +1571,9 @@ mod tests {
             limit: None,
             pages: None,
             question: question.map(str::to_string),
+            sheet: None,
+            range: None,
+            formulas: false,
         }
     }
 
@@ -1545,6 +1730,9 @@ mod tests {
             limit: None,
             pages: None,
             question: question.map(str::to_string),
+            sheet: None,
+            range: None,
+            formulas: false,
         }
     }
 

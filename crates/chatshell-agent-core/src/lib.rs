@@ -9,6 +9,7 @@ pub mod edit_anchor;
 pub mod fuzzy_match;
 pub mod history;
 pub mod mcp;
+pub mod office;
 pub mod openai_compat;
 pub mod path_policy;
 pub mod pdf_text;
