@@ -2,7 +2,7 @@
 //!
 //! A general-purpose file reading tool. Supports text files with line numbers,
 //! image files (PNG, JPEG, GIF, WebP) with metadata and base64 encoding,
-//! and PDF files with text extraction.
+//! and PDF files with page-aware text extraction.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +36,11 @@ pub struct ReadArgs {
     /// Number of lines to read. Defaults to 2000.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// PDF page selection: a single page (`"3"`), a range (`"1-5"`), or a
+    /// comma-separated list (`"1,4,7"`). Pages are 1-based physical pages.
+    /// Only applies to PDF files; `offset`/`limit` are ignored when set.
+    #[serde(default)]
+    pub pages: Option<String>,
     /// Optional natural-language question about an image file. When set,
     /// the image is analyzed by a vision-capable model and the answer is
     /// returned as text instead of the image data. Only supported for
@@ -481,8 +486,9 @@ impl Tool for ReadTool {
         "Read the contents of a file from the filesystem or a remote URL. \
                 Local paths: for text files, returns content with line numbers; \
                 for image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data; \
-                for PDF files, extracts and returns the text content; \
-                supports line ranges and negative offset (e.g. -20 reads the last 20 lines). \
+                for PDF files, extracts and returns the text content; use \"pages\" for a \
+                1-based page selection (e.g. \"3\", \"1-5\", \"1,4,7\"); \
+                supports line ranges and negative offset for text files (e.g. -20 reads the last 20 lines). \
                 URLs (http/https): image URLs return metadata and base64-encoded data (or a \
                 vision-model answer when the \"question\" argument is set); text/JSON/XML URLs \
                 return the raw text (capped); use web_fetch for article extraction or binary \
@@ -507,6 +513,10 @@ impl Tool for ReadTool {
                     "type": "number",
                     "description": "Maximum number of lines to read. Defaults to 2000. Only applies to text files."
                 },
+                "pages": {
+                    "type": "string",
+                    "description": "PDF page selection, 1-based. Use a single page (\"3\"), a range (\"1-5\"), or a comma-separated list (\"1,4,7\"). Only applies to PDF files; offset/limit are ignored when set. Omit to read the whole document."
+                },
                 "question": {
                     "type": "string",
                     "description": "Optional natural-language question about an image file or image URL. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for images; offset/limit are ignored."
@@ -522,16 +532,23 @@ impl Tool for ReadTool {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         tracing::info!(
-            "🔧 [tool-call] read: path=\"{}\" offset={:?} limit={:?} question={:?}",
+            "🔧 [tool-call] read: path=\"{}\" offset={:?} limit={:?} pages={:?} question={:?}",
             args.path,
             args.offset,
             args.limit,
+            args.pages,
             args.question
         );
 
         // Remote URLs bypass local path policy: fetch raw bytes through
         // the injected seam, then dispatch by content type.
         if args.path.starts_with("http://") || args.path.starts_with("https://") {
+            if args.pages.is_some() {
+                return Ok("The \"pages\" argument only applies to local PDF files. \
+                     Read the URL without \"pages\" instead; remote PDFs are \
+                     not supported by the read tool."
+                    .to_string());
+            }
             return self.read_url(&args).await;
         }
 
@@ -558,6 +575,14 @@ impl Tool for ReadTool {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+
+        if args.pages.is_some() && !is_pdf_extension(&ext) {
+            return Err(ReadError(format!(
+                "The \"pages\" argument only supports PDF files, not \"{}\" \
+                 files. Use \"offset\"/\"limit\" for text files.",
+                ext
+            )));
+        }
 
         // Image questions: answer via the vision seam instead of returning
         // pixels. Only images qualify; anything else is an explicit error.
@@ -594,7 +619,7 @@ impl Tool for ReadTool {
             return read_image(self.fs.as_ref(), path, &ext);
         }
         if is_pdf_extension(&ext) {
-            return read_pdf(self.fs.as_ref(), path);
+            return read_pdf(self.fs.as_ref(), path, &args);
         }
 
         read_text(self.fs.as_ref(), path, &args)
@@ -863,16 +888,128 @@ fn read_url_text(final_url: &str, bytes: &[u8]) -> String {
     )
 }
 
-/// Read a PDF file by extracting its text content.
-fn read_pdf(fs: &dyn Fs, path: &std::path::Path) -> Result<String, ReadError> {
+/// Maximum pages a single `pages` request may select. Guards against a
+/// pathological range (e.g. `1-99999999`) exhausting memory before the
+/// out-of-range check runs.
+const MAX_PDF_PAGES_PER_READ: usize = 200;
+
+/// Parse a PDF page selection: `"3"`, `"1-5"`, or `"1,4,7"` (combinations
+/// such as `"1-3,7"` are accepted). Pages are 1-based; duplicates are
+/// dropped while preserving first-seen order.
+fn parse_page_selection(raw: &str) -> Result<Vec<usize>, ReadError> {
+    let mut pages = Vec::new();
+
+    for segment in raw.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            return Err(ReadError(format!(
+                "Invalid \"pages\" value \"{}\": empty page or range.",
+                raw
+            )));
+        }
+
+        let (start, end) = match segment.split_once('-') {
+            Some((start, end)) => (parse_page_number(start, raw)?, parse_page_number(end, raw)?),
+            None => {
+                let page = parse_page_number(segment, raw)?;
+                (page, page)
+            }
+        };
+
+        if start > end {
+            return Err(ReadError(format!(
+                "Invalid \"pages\" range \"{}\": start page {} is greater than \
+                 end page {}.",
+                segment, start, end
+            )));
+        }
+        if end - start + 1 > MAX_PDF_PAGES_PER_READ {
+            return Err(ReadError(format!(
+                "The \"pages\" range \"{}\" selects more than {} pages in one \
+                 read. Split it into smaller ranges.",
+                segment, MAX_PDF_PAGES_PER_READ
+            )));
+        }
+
+        for page in start..=end {
+            if !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+        if pages.len() > MAX_PDF_PAGES_PER_READ {
+            return Err(ReadError(format!(
+                "The \"pages\" value \"{}\" selects more than {} pages in one \
+                 read. Split it into smaller ranges.",
+                raw, MAX_PDF_PAGES_PER_READ
+            )));
+        }
+    }
+
+    if pages.is_empty() {
+        return Err(ReadError(format!(
+            "Invalid \"pages\" value \"{}\": no pages selected.",
+            raw
+        )));
+    }
+    Ok(pages)
+}
+
+fn parse_page_number(raw: &str, selection: &str) -> Result<usize, ReadError> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|page| *page > 0)
+        .ok_or_else(|| {
+            ReadError(format!(
+                "Invalid \"pages\" value \"{}\": \"{}\" is not a positive page \
+                 number.",
+                selection,
+                raw.trim()
+            ))
+        })
+}
+
+/// Render a page list back into compact ranges for the tool header.
+fn format_page_selection(pages: &[usize]) -> String {
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < pages.len() {
+        let start = pages[index];
+        let mut end = start;
+        while index + 1 < pages.len() && pages[index + 1] == end + 1 {
+            index += 1;
+            end = pages[index];
+        }
+        if start == end {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{start}-{end}"));
+        }
+        index += 1;
+    }
+    parts.join(", ")
+}
+
+/// Read a PDF file by extracting its text content. When `args.pages` is set,
+/// only those pages are extracted and returned with page markers.
+fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<String, ReadError> {
     let bytes = fs
         .read(path)
         .map_err(|e| ReadError(format!("Failed to read PDF: {}", e)))?;
 
     // Legacy attachment storage wrote extracted PDF text under a `.pdf`
-    // name. Treat a non-PDF payload as text so those paths stay readable.
+    // name. Treat a non-PDF payload as text so those paths stay readable,
+    // but page selection needs the original PDF bytes.
     let header = &bytes[..bytes.len().min(1024)];
     if !header.windows(5).any(|window| window == b"%PDF-") {
+        if args.pages.is_some() {
+            return Err(ReadError(format!(
+                "File has a .pdf extension but contains extracted text, not PDF \
+                 bytes: {}. The \"pages\" argument needs the original PDF; use \
+                 \"offset\"/\"limit\" for this file.",
+                path.display()
+            )));
+        }
         let text = String::from_utf8(bytes).map_err(|_| {
             ReadError(format!(
                 "File has a .pdf extension but is neither a PDF nor UTF-8 text: {}",
@@ -883,22 +1020,67 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path) -> Result<String, ReadError> {
         return Ok(format!("[PDF: {} lines extracted]\n\n{}", line_count, text));
     }
 
-    let text = crate::pdf_text::extract_pdf_text(&bytes)
+    if let Some(selection) = args.pages.as_deref() {
+        let requested = parse_page_selection(selection)?;
+        let extracted = crate::pdf_text::extract_pdf_pages(&bytes, &requested)
+            .map_err(|e| ReadError(format!("Failed to extract PDF text: {}", e)))?;
+
+        let shown = format_page_selection(
+            &extracted
+                .pages
+                .iter()
+                .map(|page| page.page)
+                .collect::<Vec<_>>(),
+        );
+        let mut output = format!(
+            "[PDF: {} pages; showing page{} {}]\n",
+            extracted.page_count,
+            if extracted.pages.len() == 1 { "" } else { "s" },
+            shown
+        );
+        for page in &extracted.pages {
+            output.push_str(&format!("\n--- page {} ---\n", page.page));
+            if page.text.trim().is_empty() {
+                output.push_str("[No extractable text on this page]\n");
+            } else {
+                output.push_str(page.text.trim_end());
+                output.push('\n');
+            }
+        }
+
+        tracing::info!(
+            "🔧 [tool-result] read: PDF \"{}\" ({} pages extracted, {} requested)",
+            path.display(),
+            extracted.pages.len(),
+            requested.len()
+        );
+        return Ok(output);
+    }
+
+    let extracted = crate::pdf_text::extract_pdf_text_document(&bytes)
         .map_err(|e| ReadError(format!("Failed to extract PDF text: {}", e)))?;
+    let text = extracted.text;
 
     if text.trim().is_empty() {
-        return Ok("[PDF] No extractable text found (the PDF may contain only images).".into());
+        return Ok(format!(
+            "[PDF] No extractable text found ({} pages; the PDF may contain only images).",
+            extracted.page_count
+        ));
     }
 
     let line_count = text.lines().count();
 
     tracing::info!(
-        "🔧 [tool-result] read: PDF \"{}\" ({} lines extracted)",
+        "🔧 [tool-result] read: PDF \"{}\" ({} pages, {} lines extracted)",
         path.display(),
+        extracted.page_count,
         line_count
     );
 
-    Ok(format!("[PDF: {} lines extracted]\n\n{}", line_count, text))
+    Ok(format!(
+        "[PDF: {} pages, {} lines extracted]\n\n{}",
+        extracted.page_count, line_count, text
+    ))
 }
 
 #[cfg(test)]
@@ -969,12 +1151,196 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             offset: None,
             limit: None,
+            pages: None,
             question: None,
         };
         let out = call_read(&ReadTool::new(), args).await.unwrap();
 
         assert!(out.contains("first line"), "out: {out}");
         assert!(out.contains("second line"), "out: {out}");
+    }
+
+    fn write_pdf(pages: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+
+        let mut kids = Vec::new();
+        for text in pages {
+            let contents = if text.is_empty() {
+                Vec::new()
+            } else {
+                format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET").into_bytes()
+            };
+            let content_id = document.add_object(Stream::new(dictionary! {}, contents));
+            let page_id = document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            kids.push(Object::Reference(page_id));
+        }
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => Object::Array(kids),
+                "Count" => pages.len() as i64,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.pdf");
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    fn pdf_args(path: &std::path::Path, pages: Option<&str>) -> ReadArgs {
+        ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            pages: pages.map(str::to_string),
+            question: None,
+        }
+    }
+
+    #[test]
+    fn page_selection_parser_accepts_single_ranges_and_lists() {
+        assert_eq!(parse_page_selection("3").unwrap(), vec![3]);
+        assert_eq!(parse_page_selection("1-3").unwrap(), vec![1, 2, 3]);
+        assert_eq!(parse_page_selection("1,4,7").unwrap(), vec![1, 4, 7]);
+        assert_eq!(parse_page_selection("1-3,3,5").unwrap(), vec![1, 2, 3, 5]);
+        assert_eq!(format_page_selection(&[1, 2, 3, 5]), "1-3, 5");
+    }
+
+    #[test]
+    fn page_selection_parser_rejects_invalid_values() {
+        for invalid in ["", "0", "-1", "5-1", "1,,2", "a", "1-a", "1-"] {
+            assert!(
+                parse_page_selection(invalid).is_err(),
+                "accepted invalid selection: {invalid}"
+            );
+        }
+        assert!(parse_page_selection("1-201").is_err());
+    }
+
+    #[tokio::test]
+    async fn pdf_page_selection_returns_only_requested_pages() {
+        let (_dir, path) = write_pdf(&[
+            "BT /F1 24 Tf 72 720 Td (Alpha) Tj ET",
+            "BT /F1 24 Tf 72 720 Td (Beta) Tj ET",
+        ]);
+        let out = call_read(&ReadTool::new(), pdf_args(&path, Some("2")))
+            .await
+            .unwrap();
+
+        assert!(out.contains("[PDF: 2 pages; showing page 2]"), "{out}");
+        assert!(out.contains("--- page 2 ---"), "{out}");
+        assert!(out.contains("Beta"), "{out}");
+        assert!(!out.contains("Alpha"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn pdf_page_range_returns_multiple_marked_pages() {
+        let (_dir, path) = write_pdf(&[
+            "BT /F1 24 Tf 72 720 Td (Alpha) Tj ET",
+            "BT /F1 24 Tf 72 720 Td (Beta) Tj ET",
+        ]);
+        let out = call_read(&ReadTool::new(), pdf_args(&path, Some("1-2")))
+            .await
+            .unwrap();
+
+        assert!(out.contains("[PDF: 2 pages; showing pages 1-2]"), "{out}");
+        assert!(out.contains("--- page 1 ---"), "{out}");
+        assert!(out.contains("Alpha"), "{out}");
+        assert!(out.contains("--- page 2 ---"), "{out}");
+        assert!(out.contains("Beta"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn pdf_without_pages_reads_the_whole_document() {
+        let (_dir, path) = write_pdf(&[
+            "BT /F1 24 Tf 72 720 Td (Alpha) Tj ET",
+            "BT /F1 24 Tf 72 720 Td (Beta) Tj ET",
+        ]);
+        let out = call_read(&ReadTool::new(), pdf_args(&path, None))
+            .await
+            .unwrap();
+
+        assert!(out.contains("[PDF: 2 pages,"), "{out}");
+        assert!(out.contains("Alpha"), "{out}");
+        assert!(out.contains("Beta"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn pdf_page_selection_marks_empty_pages() {
+        let (_dir, path) = write_pdf(&["BT /F1 24 Tf 72 720 Td (Alpha) Tj ET", ""]);
+        let out = call_read(&ReadTool::new(), pdf_args(&path, Some("2")))
+            .await
+            .unwrap();
+
+        assert!(out.contains("--- page 2 ---"), "{out}");
+        assert!(out.contains("[No extractable text on this page]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn pdf_page_selection_rejects_out_of_range_pages() {
+        let (_dir, path) = write_pdf(&["BT /F1 24 Tf 72 720 Td (Alpha) Tj ET"]);
+        let err = call_read(&ReadTool::new(), pdf_args(&path, Some("2")))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("out of range"), "error: {err}");
+        assert!(err.to_string().contains("1 pages"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn pages_argument_on_text_file_is_an_explicit_error() {
+        let (_dir, path) = write_temp("plain text\n");
+        let err = call_read(&ReadTool::new(), pdf_args(&path, Some("1")))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("only supports PDF files"),
+            "error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_argument_on_legacy_pdf_text_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.pdf");
+        std::fs::write(&path, "extracted text\n").unwrap();
+
+        let err = call_read(&ReadTool::new(), pdf_args(&path, Some("1")))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("needs the original PDF"),
+            "error: {err}"
+        );
     }
 
     #[test]
@@ -1021,6 +1387,7 @@ mod tests {
             path: path.to_string_lossy().to_string(),
             offset: None,
             limit: None,
+            pages: None,
             question: question.map(str::to_string),
         }
     }
@@ -1176,6 +1543,7 @@ mod tests {
             path: url.to_string(),
             offset: None,
             limit: None,
+            pages: None,
             question: question.map(str::to_string),
         }
     }

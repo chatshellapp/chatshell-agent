@@ -890,6 +890,7 @@ mod tests {
                     path: path.to_string(),
                     offset: None,
                     limit: None,
+                    pages: None,
                     question: None,
                 },
             )
