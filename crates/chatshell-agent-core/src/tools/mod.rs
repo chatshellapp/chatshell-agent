@@ -22,5 +22,5 @@ pub use glob::{GlobArgs, GlobError, GlobTool};
 pub use grep::{GrepArgs, GrepError, GrepTool};
 pub use image_question::{ImageInput, ImageQuestionResponder};
 pub use kill_shell::{KillShellArgs, KillShellError, KillShellTool};
-pub use read::{ReadArgs, ReadError, ReadTool};
+pub use read::{ReadArgs, ReadError, ReadTool, UrlByteFetcher, UrlBytes};
 pub use write::{WriteArgs, WriteError, WriteTool};

@@ -15,11 +15,14 @@ use serde_json::json;
 use super::image_question::{ImageInput, ImageQuestionResponder};
 use crate::path_policy;
 use crate::tool_fs::{Fs, StdFs};
+use futures::future::BoxFuture;
 
 const DEFAULT_LINE_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 const BINARY_CHECK_SIZE: usize = 8192;
 const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024; // 20 MB
+/// Raw-bytes cap for non-image URL reads (text, JSON, XML, …).
+const MAX_URL_TEXT_BYTES: usize = 100 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadArgs {
@@ -45,6 +48,23 @@ pub struct ReadArgs {
 #[error("Read error: {0}")]
 pub struct ReadError(String);
 
+/// Bytes fetched from a remote URL by a host-injected [`UrlByteFetcher`].
+#[derive(Debug, Clone)]
+pub struct UrlBytes {
+    pub bytes: Vec<u8>,
+    /// Response `Content-Type` (may carry parameters; callers normalize).
+    pub mime_type: String,
+    /// Final URL after redirects.
+    pub final_url: String,
+}
+
+/// Host-injected remote URL fetcher for the read tool. The core crate owns
+/// no network client, so the host supplies one; injected only when the
+/// web_fetch tool is enabled, which doubles as the settings gate.
+pub trait UrlByteFetcher: Send + Sync {
+    fn fetch(&self, url: &str) -> BoxFuture<'static, Result<UrlBytes, String>>;
+}
+
 fn default_fs() -> std::sync::Arc<dyn Fs> {
     std::sync::Arc::new(StdFs)
 }
@@ -63,6 +83,10 @@ pub struct ReadTool {
     /// guidance instead of pixels the main model cannot use.
     #[serde(skip, default)]
     main_model_vision: Option<bool>,
+    /// Host-injected remote URL fetcher; `None` disables URL reads (the
+    /// gate: injected only when web_fetch is enabled for the conversation).
+    #[serde(skip, default)]
+    url_fetcher: Option<Arc<dyn UrlByteFetcher>>,
 }
 
 impl Default for ReadTool {
@@ -78,6 +102,7 @@ impl ReadTool {
             fs: Arc::new(StdFs),
             image_question: None,
             main_model_vision: None,
+            url_fetcher: None,
         }
     }
 
@@ -108,6 +133,13 @@ impl ReadTool {
         self
     }
 
+    /// Enable remote URL reads through a host-injected fetcher. Without
+    /// it, URL paths fail with a gate message pointing at web_fetch.
+    pub fn with_url_fetcher(mut self, fetcher: Arc<dyn UrlByteFetcher>) -> Self {
+        self.url_fetcher = Some(fetcher);
+        self
+    }
+
     /// Answer a question about an image via the injected vision responder.
     async fn answer_image_question(
         &self,
@@ -116,7 +148,20 @@ impl ReadTool {
         question: &str,
     ) -> Result<String, ReadError> {
         let image = load_image(self.fs.as_ref(), path, ext)?;
+        let label = path.display().to_string();
+        self.answer_image_question_bytes(image, &label, question)
+            .await
+    }
 
+    /// In-memory core of the image-question path, shared by file and URL
+    /// reads. Failures are tool output, not `Err` (see the note in the
+    /// match arm below).
+    async fn answer_image_question_bytes(
+        &self,
+        image: LoadedImage,
+        label: &str,
+        question: &str,
+    ) -> Result<String, ReadError> {
         let Some(responder) = self.image_question.as_ref() else {
             return Ok(format!(
                 "{}\nNo vision model is configured to answer image questions. \
@@ -128,7 +173,7 @@ impl ReadTool {
 
         tracing::info!(
             "🔧 [tool-call] read: image question \"{}\" ({})",
-            path.display(),
+            label,
             question
         );
         let input = ImageInput {
@@ -156,6 +201,115 @@ impl ReadTool {
             )),
         }
     }
+
+    /// Read a remote URL: fetch bytes through the injected seam and
+    /// dispatch by content type — images take the same paths as local
+    /// image files, text-ish content returns capped raw text, anything
+    /// else steers to `web_fetch`.
+    ///
+    /// Every URL-path failure is returned as tool output, not `Err`:
+    /// host runtimes (e.g. rig) replace tool errors with generic feedback
+    /// like "the tool failed", hiding the cause and the remedy from the
+    /// model — the exact strings it needs to stop retrying blindly.
+    async fn read_url(&self, args: &ReadArgs) -> Result<String, ReadError> {
+        let Some(fetcher) = self.url_fetcher.as_ref() else {
+            return Ok(
+                "URL reads require the web fetch tool to be enabled for this \
+                 conversation. Enable web_fetch in the conversation's tools, \
+                 or read a local file path instead."
+                    .to_string(),
+            );
+        };
+        let fetched = match fetcher.fetch(&args.path).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                return Ok(format!(
+                    "URL fetch failed: {error}\n\nThe request itself failed; \
+                     HTTP 4xx usually means the URL is invalid or refuses \
+                     this client (e.g. a thumbnail size that was never \
+                     rendered). Double-check the URL, try the web_fetch \
+                     tool, or use bash for resources needing different \
+                     headers."
+                ));
+            }
+        };
+        let mime = fetched
+            .mime_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+
+        if mime.starts_with("image/") {
+            return self.read_url_image(&fetched, &mime, args).await;
+        }
+        if mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/xml"
+            || mime == "application/javascript"
+            || mime.is_empty()
+        {
+            return Ok(read_url_text(&fetched.final_url, &fetched.bytes));
+        }
+        Ok(format!(
+            "URL content type \"{mime}\" is not readable directly. Use the \
+             web_fetch tool for this resource."
+        ))
+    }
+
+    /// Image URL: the same dispatch as local image files, in memory.
+    async fn read_url_image(
+        &self,
+        fetched: &UrlBytes,
+        mime: &str,
+        args: &ReadArgs,
+    ) -> Result<String, ReadError> {
+        let ext = extension_from_mime(mime);
+        // The declared MIME is untrusted server data; a mismatch usually
+        // means an error page served with an image content type. Local
+        // files trust their extension; URL bytes must prove themselves.
+        if !signature_matches_ext(&fetched.bytes, ext) {
+            return Ok(format!(
+                "The URL did not return a valid {ext} image: the declared \
+                 content type \"{mime}\" does not match the body signature.\n\n\
+                 The server may have answered with an error page despite an \
+                 image content type, or the bytes are corrupt. Check the URL \
+                 or use the web_fetch tool to inspect what the server \
+                 actually returns."
+            ));
+        }
+        let image = build_loaded_image(fetched.bytes.clone(), ext)?;
+
+        // SVG is text-based; return the decoded content.
+        if ext == "svg" {
+            let svg_text = String::from_utf8_lossy(&image.bytes);
+            return Ok(format!(
+                "[Image: SVG, {}]\n\n{}",
+                format_file_size(image.bytes.len() as u64),
+                svg_text
+            ));
+        }
+
+        let label = &fetched.final_url;
+        if let Some(question) = args
+            .question
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
+            return self
+                .answer_image_question_bytes(image, label, question)
+                .await;
+        }
+        if self.main_model_vision == Some(false) {
+            return Ok(read_image_metadata_text(
+                &image,
+                self.image_question.is_some(),
+            ));
+        }
+        Ok(read_image_inline(&image, label))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +325,30 @@ fn is_image_extension(ext: &str) -> bool {
 
 fn is_pdf_extension(ext: &str) -> bool {
     ext == "pdf"
+}
+
+/// Whether raw bytes carry the magic signature of the claimed image
+/// format. Unknown extensions (`bin`) cannot be verified and pass.
+fn signature_matches_ext(bytes: &[u8], ext: &str) -> bool {
+    match ext {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "bmp" => bytes.starts_with(b"BM"),
+        "ico" => bytes.starts_with(b"\x00\x00\x01\x00"),
+        "svg" => {
+            let prefix = &bytes[..bytes.len().min(4096)];
+            let Ok(text) = std::str::from_utf8(prefix) else {
+                return false;
+            };
+            let normalized = text.trim_start_matches('\u{feff}').trim_start();
+            normalized.starts_with("<svg")
+                || (normalized.starts_with("<?xml")
+                    && normalized.to_ascii_lowercase().contains("<svg"))
+        }
+        _ => true,
+    }
 }
 
 fn mime_from_extension(ext: &str) -> &'static str {
@@ -300,16 +478,16 @@ impl Tool for ReadTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Read the contents of a file from the filesystem. \
-                For text files, returns content with line numbers. \
-                For image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data. \
-                For PDF files, extracts and returns the text content. \
-                Supports reading specific line ranges for large text files. \
-                Use negative offset to read from the end of a file (e.g. -20 reads the last 20 lines). \
-                For image files, an optional \"question\" argument returns a text answer from a \
-                vision-capable model instead of the image data — use it when the image's contents \
-                should be analyzed or summarized rather than shown, or when reading images for a \
-                model that cannot accept image input."
+        "Read the contents of a file from the filesystem or a remote URL. \
+                Local paths: for text files, returns content with line numbers; \
+                for image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data; \
+                for PDF files, extracts and returns the text content; \
+                supports line ranges and negative offset (e.g. -20 reads the last 20 lines). \
+                URLs (http/https): image URLs return metadata and base64-encoded data (or a \
+                vision-model answer when the \"question\" argument is set); text/JSON/XML URLs \
+                return the raw text (capped); use web_fetch for article extraction or binary \
+                content. For image files or image URLs, the optional \"question\" argument \
+                returns a text answer from a vision-capable model instead of the image data."
             .to_string()
     }
 
@@ -319,7 +497,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to read"
+                    "description": "Absolute path to a local file, or an HTTP/HTTPS URL"
                 },
                 "offset": {
                     "type": "number",
@@ -331,7 +509,7 @@ impl Tool for ReadTool {
                 },
                 "question": {
                     "type": "string",
-                    "description": "Optional natural-language question about an image file. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for image files; offset/limit are ignored."
+                    "description": "Optional natural-language question about an image file or image URL. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for images; offset/limit are ignored."
                 }
             },
             "required": ["path"]
@@ -350,6 +528,12 @@ impl Tool for ReadTool {
             args.limit,
             args.question
         );
+
+        // Remote URLs bypass local path policy: fetch raw bytes through
+        // the injected seam, then dispatch by content type.
+        if args.path.starts_with("http://") || args.path.starts_with("https://") {
+            return self.read_url(&args).await;
+        }
 
         let path = std::path::Path::new(&args.path);
 
@@ -521,13 +705,10 @@ struct LoadedImage {
     header: String,
 }
 
-/// Load an image (size-capped) and render its metadata header.
-fn load_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<LoadedImage, ReadError> {
-    let metadata = fs
-        .metadata(path)
-        .map_err(|e| ReadError(format!("Failed to read image metadata: {}", e)))?;
-
-    let file_size = metadata.len;
+/// Build a [`LoadedImage`] from in-memory bytes (size-capped): the shared
+/// core of the file and URL image paths.
+fn build_loaded_image(bytes: Vec<u8>, ext: &str) -> Result<LoadedImage, ReadError> {
+    let file_size = bytes.len() as u64;
     if file_size > MAX_IMAGE_SIZE {
         return Err(ReadError(format!(
             "Image too large ({}, max {})",
@@ -535,18 +716,11 @@ fn load_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<LoadedIm
             format_file_size(MAX_IMAGE_SIZE)
         )));
     }
-
-    let raw_bytes = fs
-        .read(path)
-        .map_err(|e| ReadError(format!("Failed to read image: {}", e)))?;
-
-    let dims = parse_image_dimensions(&raw_bytes, ext);
+    let dims = parse_image_dimensions(&bytes, ext);
     let dim_str = dims
         .map(|(w, h)| format!("{}x{}", w, h))
         .unwrap_or_else(|| "unknown".to_string());
-
     Ok(LoadedImage {
-        bytes: raw_bytes,
         mime: mime_from_extension(ext),
         header: format!(
             "[Image: {}, {}, {}]",
@@ -554,7 +728,26 @@ fn load_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<LoadedIm
             dim_str,
             format_file_size(file_size)
         ),
+        bytes,
     })
+}
+
+/// Load an image (size-capped) and render its metadata header.
+fn load_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<LoadedImage, ReadError> {
+    let metadata = fs
+        .metadata(path)
+        .map_err(|e| ReadError(format!("Failed to read image metadata: {}", e)))?;
+    if metadata.len > MAX_IMAGE_SIZE {
+        return Err(ReadError(format!(
+            "Image too large ({}, max {})",
+            format_file_size(metadata.len),
+            format_file_size(MAX_IMAGE_SIZE)
+        )));
+    }
+    let raw_bytes = fs
+        .read(path)
+        .map_err(|e| ReadError(format!("Failed to read image: {}", e)))?;
+    build_loaded_image(raw_bytes, ext)
 }
 
 /// Read an image file: return metadata and base64-encoded data.
@@ -573,18 +766,22 @@ fn read_image(fs: &dyn Fs, path: &std::path::Path, ext: &str) -> Result<String, 
         return Ok(format!("[Image: SVG, {}]\n\n{}", size, svg_text));
     }
 
-    let b64 = BASE64.encode(&image.bytes);
+    Ok(read_image_inline(&image, &path.display().to_string()))
+}
 
+/// Inline base64 rendering shared by the file and URL image paths.
+fn read_image_inline(image: &LoadedImage, label: &str) -> String {
     tracing::info!(
         "🔧 [tool-result] read: image \"{}\" ({})",
-        path.display(),
+        label,
         image.header
     );
-
-    Ok(format!(
+    format!(
         "{}\ndata:{};base64,{}",
-        image.header, image.mime, b64
-    ))
+        image.header,
+        image.mime,
+        BASE64.encode(&image.bytes)
+    )
 }
 
 /// Image read for a main model that cannot accept image input: metadata
@@ -596,28 +793,74 @@ fn read_image_metadata(
     question_available: bool,
 ) -> Result<String, ReadError> {
     let image = load_image(fs, path, ext)?;
-
     tracing::info!(
         "🔧 [tool-result] read: image metadata \"{}\" (main model has no image input)",
         path.display()
     );
+    Ok(read_image_metadata_text(&image, question_available))
+}
 
+/// Metadata + guidance rendering shared by the file and URL image paths.
+fn read_image_metadata_text(image: &LoadedImage, question_available: bool) -> String {
     let guidance = if question_available {
         "To ask about this image, read it again with the \"question\" argument \
-         (e.g. {\"path\": \"<this file>\", \"question\": \"what does this \
-         screenshot show?\"}) — a vision model answers and the answer is \
-         returned as text."
+         (e.g. {\"path\": \"<this file or URL>\", \"question\": \"what does \
+         this screenshot show?\"}) — a vision model answers and the answer \
+         is returned as text."
     } else {
         "No vision model is configured, so this image cannot be analyzed. \
          Configure one under Settings → Auxiliary Models to enable image \
          questions."
     };
 
-    Ok(format!(
+    format!(
         "{}\nThe current conversation model does not accept image input, so \
          the image content is omitted.\n{}",
         image.header, guidance
-    ))
+    )
+}
+
+/// Extension for a fetched image MIME type (inverse of
+/// [`mime_from_extension`], restricted to the image set).
+fn extension_from_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" | "image/x-png" => "png",
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" | "image/x-bmp" => "bmp",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
+/// Capped raw text rendering for text-ish URL content. A NUL byte in the
+/// leading window means the declared MIME lied; steer to `web_fetch`.
+fn read_url_text(final_url: &str, bytes: &[u8]) -> String {
+    let check_len = bytes.len().min(BINARY_CHECK_SIZE);
+    if bytes[..check_len].contains(&0) {
+        return format!(
+            "[URL: {}]\n\nThe response body is binary. Use the web_fetch tool \
+             for this resource.",
+            final_url
+        );
+    }
+    let full = String::from_utf8_lossy(bytes);
+    if full.len() <= MAX_URL_TEXT_BYTES {
+        return format!("[URL: {}]\n\n{}", final_url, full);
+    }
+    let mut end = MAX_URL_TEXT_BYTES;
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "[URL: {}]\n\n{}\n\n[URL content truncated at {} bytes — use \
+         web_fetch to extract the full page]",
+        final_url,
+        &full[..end],
+        MAX_URL_TEXT_BYTES
+    )
 }
 
 /// Read a PDF file by extracting its text content.
@@ -856,5 +1099,183 @@ mod tests {
             out.contains("data:image/png;base64,"),
             "legacy behavior kept: {out}"
         );
+    }
+
+    // ---- remote URL reads ----
+
+    struct MockFetcher {
+        mime: &'static str,
+        bytes: Vec<u8>,
+        error: Option<&'static str>,
+    }
+
+    impl super::UrlByteFetcher for MockFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+        ) -> futures::future::BoxFuture<'static, Result<super::UrlBytes, String>> {
+            let bytes = self.bytes.clone();
+            let mime = self.mime.to_string();
+            let error = self.error.map(str::to_string);
+            Box::pin(async move {
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                Ok(super::UrlBytes {
+                    bytes,
+                    mime_type: mime,
+                    final_url: "https://example.com/final".to_string(),
+                })
+            })
+        }
+    }
+
+    fn mock_fetcher(mime: &'static str, bytes: Vec<u8>) -> MockFetcher {
+        MockFetcher {
+            mime,
+            bytes,
+            error: None,
+        }
+    }
+
+    fn url_args(url: &str, question: Option<&str>) -> ReadArgs {
+        ReadArgs {
+            path: url.to_string(),
+            offset: None,
+            limit: None,
+            question: question.map(str::to_string),
+        }
+    }
+
+    const PNG_BYTES: &[u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0DIHDR\x00\x00\x00\x64\x00\x00\x00\x64";
+
+    #[tokio::test]
+    async fn url_read_without_fetcher_gates_on_web_fetch() {
+        let tool = ReadTool::new();
+        let out = call_read(&tool, url_args("https://example.com/a.png", None))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("web fetch tool to be enabled"),
+            "gate message: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn url_fetch_failure_is_reported_as_output() {
+        let tool = ReadTool::new().with_url_fetcher(std::sync::Arc::new(MockFetcher {
+            mime: "image/png",
+            bytes: Vec::new(),
+            error: Some("HTTP error: 400 Bad Request"),
+        }));
+        let out = call_read(&tool, url_args("https://example.com/a.png", None))
+            .await
+            .unwrap();
+        assert!(out.contains("URL fetch failed: HTTP error: 400"), "{out}");
+        assert!(out.contains("HTTP 4xx"), "remedy hint present: {out}");
+    }
+
+    #[tokio::test]
+    async fn url_image_with_invalid_bytes_is_reported_as_output() {
+        let tool = ReadTool::new().with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+            "image/png",
+            b"<!DOCTYPE html>not an image".to_vec(),
+        )));
+        let out = call_read(&tool, url_args("https://example.com/a.png", None))
+            .await
+            .unwrap();
+        assert!(out.contains("valid png image"), "{out}");
+        assert!(out.contains("error page despite"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn url_image_inline_for_vision_capable_main() {
+        let tool = ReadTool::new()
+            .with_main_model_vision(true)
+            .with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+                "image/png",
+                PNG_BYTES.to_vec(),
+            )));
+        let out = call_read(&tool, url_args("https://example.com/a.png", None))
+            .await
+            .unwrap();
+        assert!(out.contains("data:image/png;base64,"), "out: {out}");
+        assert!(out.contains("100x100"), "dims parsed: {out}");
+    }
+
+    #[tokio::test]
+    async fn url_image_question_routes_to_vision_seam() {
+        let tool = ReadTool::new()
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: false }))
+            .with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+                "image/png",
+                PNG_BYTES.to_vec(),
+            )));
+        let out = call_read(
+            &tool,
+            url_args("https://example.com/a.png", Some("what is this?")),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("a sleeping cat"), "out: {out}");
+        assert!(out.contains("Question: what is this?"), "out: {out}");
+    }
+
+    #[tokio::test]
+    async fn url_image_metadata_fallback_for_text_only_main() {
+        let tool = ReadTool::new()
+            .with_main_model_vision(false)
+            .with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+                "image/png",
+                PNG_BYTES.to_vec(),
+            )));
+        let out = call_read(&tool, url_args("https://example.com/a.png", None))
+            .await
+            .unwrap();
+        assert!(out.contains("does not accept image input"), "out: {out}");
+        assert!(!out.contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn url_svg_returns_decoded_text() {
+        let tool = ReadTool::new().with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+            "image/svg+xml",
+            b"<svg><circle/></svg>".to_vec(),
+        )));
+        let out = call_read(&tool, url_args("https://example.com/a.svg", None))
+            .await
+            .unwrap();
+        assert!(out.contains("[Image: SVG"), "out: {out}");
+        assert!(out.contains("<circle/>"), "out: {out}");
+    }
+
+    #[tokio::test]
+    async fn url_json_returns_capped_text() {
+        let big = "x".repeat(200 * 1024);
+        let tool = ReadTool::new().with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+            "application/json",
+            big.into_bytes(),
+        )));
+        let out = call_read(&tool, url_args("https://example.com/a.json", None))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[URL: https://example.com/final]"),
+            "out: {out}"
+        );
+        assert!(out.contains("truncated at 102400 bytes"), "out: {out}");
+    }
+
+    #[tokio::test]
+    async fn url_binary_mime_steers_to_web_fetch() {
+        let tool = ReadTool::new().with_url_fetcher(std::sync::Arc::new(mock_fetcher(
+            "application/pdf",
+            vec![1, 2, 3],
+        )));
+        let out = call_read(&tool, url_args("https://example.com/a.pdf", None))
+            .await
+            .unwrap();
+        assert!(out.contains("web_fetch"), "out: {out}");
     }
 }
