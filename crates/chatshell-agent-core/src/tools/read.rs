@@ -868,7 +868,22 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path) -> Result<String, ReadError> {
     let bytes = fs
         .read(path)
         .map_err(|e| ReadError(format!("Failed to read PDF: {}", e)))?;
-    let text = pdf_extract::extract_text_from_mem(&bytes)
+
+    // Legacy attachment storage wrote extracted PDF text under a `.pdf`
+    // name. Treat a non-PDF payload as text so those paths stay readable.
+    let header = &bytes[..bytes.len().min(1024)];
+    if !header.windows(5).any(|window| window == b"%PDF-") {
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ReadError(format!(
+                "File has a .pdf extension but is neither a PDF nor UTF-8 text: {}",
+                path.display()
+            ))
+        })?;
+        let line_count = text.lines().count();
+        return Ok(format!("[PDF: {} lines extracted]\n\n{}", line_count, text));
+    }
+
+    let text = crate::pdf_text::extract_pdf_text(&bytes)
         .map_err(|e| ReadError(format!("Failed to extract PDF text: {}", e)))?;
 
     if text.trim().is_empty() {
@@ -942,6 +957,24 @@ mod tests {
             );
             assert!(!out.contains('\u{FFFD}'), "no replacement chars");
         }
+    }
+
+    #[tokio::test]
+    async fn pdf_extension_with_extracted_text_reads_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.pdf");
+        std::fs::write(&path, "first line\nsecond line\n").unwrap();
+
+        let args = ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            question: None,
+        };
+        let out = call_read(&ReadTool::new(), args).await.unwrap();
+
+        assert!(out.contains("first line"), "out: {out}");
+        assert!(out.contains("second line"), "out: {out}");
     }
 
     #[test]

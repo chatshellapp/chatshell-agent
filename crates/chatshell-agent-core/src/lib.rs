@@ -11,6 +11,7 @@ pub mod history;
 pub mod mcp;
 pub mod openai_compat;
 pub mod path_policy;
+pub mod pdf_text;
 pub mod process_api;
 pub mod provider_catalog;
 pub mod provider_registry;

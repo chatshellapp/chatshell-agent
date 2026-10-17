@@ -14,6 +14,9 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 pdf-extract = "0.7"
+# Repair fallback for PDFs whose xref/trailer is malformed enough that
+# pdf-extract's pinned lopdf rejects them (newer lopdf recovers by scanning).
+lopdf = { version = "0.45", default-features = false }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 async-stream.workspace = true
