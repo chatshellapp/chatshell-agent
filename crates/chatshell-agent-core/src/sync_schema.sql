@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS search_results (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT,
+    items_json TEXT,
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
