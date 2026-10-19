@@ -74,3 +74,69 @@ impl Tool for KillShellTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::bash::{BashArgs, BashTool};
+    use rig::agent::tool::ToolContext;
+    use std::sync::Arc;
+
+    /// Spawn a real bash session through the public path: run one command via
+    /// BashTool so it lazily creates the session inside the shared handle.
+    async fn live_session() -> SharedBashSession {
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let tool: BashTool =
+            BashTool::with_session(Arc::new(tokio::sync::Mutex::new(None)), Some(cwd));
+        let handle = tool.session_handle();
+        let mut context = ToolContext::new();
+        tool.call(
+            &mut context,
+            BashArgs {
+                command: Some("true".to_string()),
+                timeout: None,
+                description: None,
+                workdir: None,
+            },
+        )
+        .await
+        .unwrap();
+        handle
+    }
+
+    #[test]
+    fn schema_advertises_no_arguments() {
+        let tool = KillShellTool::new(Arc::new(tokio::sync::Mutex::new(None)));
+        assert_eq!(<KillShellTool as Tool>::NAME, "kill_shell");
+        let params = tool.parameters();
+        assert!(
+            params["properties"].as_object().unwrap().is_empty(),
+            "kill_shell takes no arguments: {params}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminates_an_active_session_and_empties_the_slot() {
+        let session = live_session().await;
+        let tool = KillShellTool::new(session.clone());
+        let mut context = ToolContext::new();
+
+        let output = tool.call(&mut context, KillShellArgs {}).await.unwrap();
+
+        assert_eq!(output, "Bash session terminated.");
+        assert!(
+            session.lock().await.is_none(),
+            "the shared slot must be emptied so the next bash call spawns fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_active_session_it_reports_none() {
+        let tool = KillShellTool::new(Arc::new(tokio::sync::Mutex::new(None)));
+        let mut context = ToolContext::new();
+
+        let output = tool.call(&mut context, KillShellArgs {}).await.unwrap();
+
+        assert_eq!(output, "No active bash session.");
+    }
+}

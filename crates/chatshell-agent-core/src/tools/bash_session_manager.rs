@@ -133,3 +133,145 @@ impl BashSessionManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::bash::{BashArgs, BashTool};
+    use rig::agent::tool::{Tool as _, ToolContext};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Put a real live bash session into `handle` via the public path: one
+    /// BashTool command lazily spawns the session in place.
+    async fn put_live_session(handle: &SharedBashSession) {
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let tool: BashTool = BashTool::with_session(handle.clone(), Some(cwd));
+        let mut context = ToolContext::new();
+        tool.call(
+            &mut context,
+            BashArgs {
+                command: Some("true".to_string()),
+                timeout: None,
+                description: None,
+                workdir: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn same_conversation_shares_one_handle_pair() {
+        let manager = BashSessionManager::new();
+        let (session_a, abort_a) = manager.get_or_create("conv-1");
+        let (session_b, abort_b) = manager.get_or_create("conv-1");
+        assert!(Arc::ptr_eq(&session_a, &session_b));
+        assert!(Arc::ptr_eq(&abort_a, &abort_b));
+
+        let (session_c, _) = manager.get_or_create("conv-2");
+        assert!(
+            !Arc::ptr_eq(&session_a, &session_c),
+            "conversations must not share sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_running_wakes_a_registered_waiter() {
+        let manager = BashSessionManager::new();
+        let (_, abort) = manager.get_or_create("conv-1");
+
+        let notified = abort.notified();
+        tokio::pin!(notified);
+        // Enroll the future with the Notify before signalling: one poll inside
+        // select registers interest, yield_now completes immediately after.
+        tokio::select! {
+            _ = &mut notified => panic!("woken before abort_running"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        manager.abort_running("conv-1");
+
+        tokio::time::timeout(Duration::from_millis(100), &mut notified)
+            .await
+            .expect("abort_running must wake registered waiters");
+    }
+
+    #[tokio::test]
+    async fn remove_detaches_so_the_next_call_gets_a_fresh_session() {
+        let manager = BashSessionManager::new();
+        let (session, _) = manager.get_or_create("conv-1");
+
+        manager.remove("conv-1");
+
+        let (next, _) = manager.get_or_create("conv-1");
+        assert!(!Arc::ptr_eq(&session, &next));
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_kills_stale_sessions_and_spares_fresh_ones() {
+        let manager = BashSessionManager::new();
+        let (stale, _) = manager.get_or_create("stale");
+        put_live_session(&stale).await;
+        // Age the stale entry past the idle budget; spawning the live fresh
+        // session takes time too, so refresh its timestamp right before the
+        // sweep via another get_or_create.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (fresh, _) = manager.get_or_create("fresh");
+        put_live_session(&fresh).await;
+        let _ = manager.get_or_create("fresh");
+
+        manager.sweep_idle(Duration::from_millis(10)).await;
+
+        assert!(stale.lock().await.is_none(), "stale session must be killed");
+        assert!(fresh.lock().await.is_some(), "fresh session must survive");
+        let (after, _) = manager.get_or_create("stale");
+        assert!(
+            !Arc::ptr_eq(&stale, &after),
+            "evicted entry is gone for good"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_all_terminates_every_tracked_session() {
+        let manager = BashSessionManager::new();
+        let handles: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|c| manager.get_or_create(c).0)
+            .collect();
+        for handle in &handles {
+            put_live_session(handle).await;
+        }
+
+        manager.kill_all().await;
+
+        for handle in &handles {
+            assert!(handle.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_all_sync_drains_sessions_without_await() {
+        let manager = BashSessionManager::new();
+        let handles: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|c| manager.get_or_create(c).0)
+            .collect();
+        for handle in &handles {
+            put_live_session(handle).await;
+        }
+
+        manager.kill_all_sync();
+
+        // kill_sync terminates the process but leaves the shell struct in the
+        // handle (the process exit cleans it up); the manager's map itself
+        // must be drained, so every follow-up get_or_create spawns fresh.
+        for (index, conversation) in ["a", "b"].iter().enumerate() {
+            let (next, _) = manager.get_or_create(conversation);
+            assert!(
+                !Arc::ptr_eq(&handles[index], &next),
+                "entry for {conversation} must be gone from the map"
+            );
+        }
+    }
+}

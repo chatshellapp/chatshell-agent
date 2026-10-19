@@ -269,4 +269,101 @@ mod tests {
         // Exactly MAX_RESULTS paths listed, not more.
         assert_eq!(out.matches(".txt\n").count(), MAX_RESULTS);
     }
+
+    fn set_modified(path: &Path, when: SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    #[test]
+    fn recursive_pattern_lists_nested_matches_relative_to_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("nested")).unwrap();
+        std::fs::write(dir.path().join("top.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("src").join("nested").join("deep.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("src").join("other.txt"), "x").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let out = run_glob(default_fs(), "**/*.rs", &dir_str).unwrap();
+
+        assert!(out.contains("top.rs"), "output: {out}");
+        let deep = format!(
+            "src{}nested{}deep.rs",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
+        assert!(
+            out.contains(&deep),
+            "nested match as a relative path: {out}"
+        );
+        assert!(!out.contains("other.txt"), "non-matching extension: {out}");
+        assert!(out.contains("2 files found"), "footer: {out}");
+    }
+
+    #[test]
+    fn newest_matches_are_listed_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&new, "x").unwrap();
+        set_modified(
+            &old,
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let out = run_glob(default_fs(), "*.txt", &dir_str).unwrap();
+
+        let first_line = out.lines().next().unwrap();
+        assert!(first_line.ends_with("new.txt"), "newest first, got: {out}");
+    }
+
+    #[test]
+    fn missing_directory_is_reported_as_an_error() {
+        let error =
+            run_glob(default_fs(), "*.txt", "/nonexistent-chatshell-glob-root").unwrap_err();
+
+        assert!(
+            error.to_string().contains("Directory not found"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn no_matches_reported_plainly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let out = run_glob(default_fs(), "*.md", &dir_str).unwrap();
+
+        assert_eq!(out, "No files found matching the pattern.");
+    }
+
+    #[tokio::test]
+    async fn call_resolves_the_pattern_against_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "x").unwrap();
+        let tool = GlobTool::with_working_directory(dir.path().to_string_lossy().to_string());
+        let mut context = rig::agent::tool::ToolContext::new();
+
+        let out = tool
+            .call(
+                &mut context,
+                GlobArgs {
+                    pattern: "*.txt".to_string(),
+                    path: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(out.contains("note.txt"), "output: {out}");
+        assert!(
+            out.contains(&format!("relative to {}", dir.path().to_string_lossy())),
+            "footer names the default directory: {out}"
+        );
+    }
 }
