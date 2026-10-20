@@ -7,6 +7,7 @@
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
+    active_message_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     deleted_at TEXT
@@ -189,6 +190,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     conversation_id TEXT,
+    parent_id TEXT,
     sender_type TEXT NOT NULL,
     sender_id TEXT,
     content TEXT NOT NULL,
@@ -433,7 +435,7 @@ CREATE INDEX IF NOT EXISTS idx_fetch_results_source ON fetch_results(source_type
 CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_message_contexts_message ON message_contexts(message_id);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_parent ON messages(conversation_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_search_decisions_message ON search_decisions(message_id);
 CREATE INDEX IF NOT EXISTS idx_search_results_message ON search_results(message_id);
 CREATE INDEX IF NOT EXISTS idx_thinking_steps_message ON thinking_steps(message_id);

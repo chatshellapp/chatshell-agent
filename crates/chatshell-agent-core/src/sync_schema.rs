@@ -54,7 +54,7 @@ pub const SYNC_SCHEMA_SQL: &str = include_str!("sync_schema.sql");
 /// Monotonic version of [`SYNC_SCHEMA_SQL`]'s shape, recorded in the `meta`
 /// table under [`META_SCHEMA_VERSION`]. Bump on every shape change;
 /// [`ensure_sync_tables`] stamps it into fresh databases.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 3;
+pub const CANONICAL_SCHEMA_VERSION: i64 = 4;
 
 /// `meta` key holding [`CANONICAL_SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -183,12 +183,12 @@ mod tests {
             seed_row(
                 &src,
                 "conversations",
-                "('id','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+                "('id','t',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
                 "messages",
-                "('id','id','user',NULL,'c',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+                "('id','id',NULL,'user',NULL,'c',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
@@ -237,12 +237,12 @@ mod tests {
             seed_row(
                 &src,
                 "conversations",
-                "('id','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+                "('id','t',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
                 "messages",
-                "('id','id','user',NULL,'secret content',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+                "('id','id',NULL,'user',NULL,'secret content',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
             );
             seed_row(
                 &src,
