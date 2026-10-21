@@ -393,6 +393,7 @@ CREATE TABLE IF NOT EXISTS conversation_settings (
     enabled_mcp_server_ids TEXT,
     enabled_skill_ids TEXT,
     working_directory TEXT,
+    permission_mode TEXT,
     updated_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
