@@ -75,8 +75,12 @@ pub enum GrantScope {
     /// Every base command of the approved bash call (all future commands
     /// whose segments are covered by these base commands).
     BashCommands(Vec<String>),
-    /// The whole tool (write-tier tools only).
+    /// The whole tool (edit/write only).
     Tool(String),
+    /// One tool on one MCP server. MCP grants stay this narrow on
+    /// purpose: approving a benign tool must not unlock other tools or
+    /// other servers for the session.
+    ServerTool { server: String, tool: String },
 }
 
 /// In-memory session grants ("allow for this session" answers).
@@ -101,6 +105,11 @@ impl SessionGrants {
         self.keys.insert(format!("tool:{tool}"));
     }
 
+    /// Grant one tool on one MCP server for the rest of the session.
+    pub fn grant_server_tool(&mut self, server: &str, tool: &str) {
+        self.keys.insert(format!("mcp:{server}/{tool}"));
+    }
+
     /// True when every segment base command of `command` is granted. A
     /// partial grant never authorizes a compound command.
     pub fn bash_command_granted(&self, command: &str) -> bool {
@@ -114,6 +123,11 @@ impl SessionGrants {
     /// True when the tool was granted for the session.
     pub fn tool_granted(&self, tool: &str) -> bool {
         self.keys.contains(&format!("tool:{tool}"))
+    }
+
+    /// True when this exact server/tool pair was granted.
+    pub fn server_tool_granted(&self, server: &str, tool: &str) -> bool {
+        self.keys.contains(&format!("mcp:{server}/{tool}"))
     }
 
     /// True when no grants are held.
@@ -156,6 +170,9 @@ pub fn subject_for(tool_name: &str, args: &Value) -> String {
             (Some(server), Some(tool)) => Some(format!("{server}/{tool}")),
             _ => None,
         },
+        // Read tier never prompts in v1; this arm feeds the possible
+        // middle tier (risk-taxonomy prompts) where fetch URLs would be
+        // shown as subjects.
         "web_fetch" => arg("url").map(str::to_string),
         _ => None,
     };
@@ -164,14 +181,26 @@ pub fn subject_for(tool_name: &str, args: &Value) -> String {
 
 /// What an "allow for this session" answer memoizes for this call.
 ///
-/// `None` for tools without session-grant semantics (exec tier other
-/// than bash): the UI hides the session button for those.
+/// `None` when no session grant is offered (exec tier other than bash, or
+/// an MCP call missing its server/tool args): the UI hides the session
+/// button for those.
 pub fn grant_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
     if tool_name == "bash" {
         return args
             .get("command")
             .and_then(Value::as_str)
             .map(|command| GrantScope::BashCommands(base_commands(command)));
+    }
+    if tool_name == "mcp_tool_use" {
+        let server = args.get("server").and_then(Value::as_str);
+        let tool = args.get("tool").and_then(Value::as_str);
+        if let (Some(server), Some(tool)) = (server, tool) {
+            return Some(GrantScope::ServerTool {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            });
+        }
+        return None;
     }
     if matches!(PermissionTier::for_tool(tool_name), PermissionTier::Write) {
         return Some(GrantScope::Tool(tool_name.to_string()));
@@ -222,8 +251,21 @@ pub fn resolve(
     if !needs_prompt {
         return GateDecision::Allow;
     }
-    if matches!(tier, PermissionTier::Write) && grants.tool_granted(tool_name) {
-        return GateDecision::Allow;
+    if matches!(tier, PermissionTier::Write) {
+        if tool_name == "mcp_tool_use" {
+            // MCP grants are per server/tool pair; a call missing either
+            // arg matches no grant and falls through to a prompt
+            // (fail-safe).
+            if let (Some(server), Some(tool)) = (
+                args.get("server").and_then(Value::as_str),
+                args.get("tool").and_then(Value::as_str),
+            ) && grants.server_tool_granted(server, tool)
+            {
+                return GateDecision::Allow;
+            }
+        } else if grants.tool_granted(tool_name) {
+            return GateDecision::Allow;
+        }
     }
     GateDecision::Prompt {
         subject: subject_for(tool_name, args),
@@ -448,6 +490,49 @@ mod tests {
         assert_eq!(
             grant_scope("edit", &json!({"path": "/tmp/a"})),
             Some(GrantScope::Tool("edit".to_string()))
+        );
+    }
+
+    #[test]
+    fn mcp_grant_scopes_to_one_server_tool_pair() {
+        let mut grants = SessionGrants::default();
+        grants.grant_server_tool("server-a", "fetch");
+        let granted = json!({"server": "server-a", "tool": "fetch"});
+        assert_eq!(
+            resolve(PermissionMode::Ask, "mcp_tool_use", &granted, &grants),
+            GateDecision::Allow
+        );
+        // Same server, different tool: not covered.
+        let other_tool = json!({"server": "server-a", "tool": "delete_file"});
+        assert!(matches!(
+            resolve(PermissionMode::Ask, "mcp_tool_use", &other_tool, &grants),
+            GateDecision::Prompt { .. }
+        ));
+        // Same tool name on another server: not covered.
+        let other_server = json!({"server": "server-b", "tool": "fetch"});
+        assert!(matches!(
+            resolve(PermissionMode::Ask, "mcp_tool_use", &other_server, &grants),
+            GateDecision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_call_without_server_or_tool_args_has_no_session_grant() {
+        let mut grants = SessionGrants::default();
+        grants.grant_server_tool("server-a", "fetch");
+        // A blanket tool-level grant must never match an MCP call.
+        grants.grant_tool("mcp_tool_use");
+        assert!(matches!(
+            resolve(PermissionMode::Ask, "mcp_tool_use", &json!({}), &grants),
+            GateDecision::Prompt { .. }
+        ));
+        assert_eq!(grant_scope("mcp_tool_use", &json!({})), None);
+        assert_eq!(
+            grant_scope("mcp_tool_use", &json!({"server": "s", "tool": "t"})),
+            Some(GrantScope::ServerTool {
+                server: "s".to_string(),
+                tool: "t".to_string()
+            })
         );
     }
 }
