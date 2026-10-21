@@ -15,7 +15,6 @@ use rig::client::{BearerAuth, Client, Provider, ProviderBuilder};
 use rig::completion::{CompletionError, CompletionRequest};
 use rig::providers::openai::completion::{
     CompletionModelOptions, CompletionResponse, GenericCompletionModel, OpenAICompatibleProvider,
-    Usage,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -62,7 +61,13 @@ impl Provider for CompatExt {
 impl OpenAICompatibleProvider for CompatExt {
     const PROVIDER_NAME: &'static str = "openai-compat";
 
-    type StreamingUsage = Usage;
+    // Lenient on purpose: MiniMax (and other compat endpoints) emit
+    // abnormal terminal chunks whose `usage` object is missing fields —
+    // observed live as `missing field 'prompt_tokens'` killing a whole
+    // turn one second in. rig's stock `Usage` requires the field; parsing
+    // to zeros keeps the turn alive and the provider's error envelope (if
+    // any) is what should decide the outcome, not usage bookkeeping.
+    type StreamingUsage = CompatStreamingUsage;
     type Response = CompletionResponse;
 
     fn finalize_request_body_with_options(
@@ -168,5 +173,91 @@ impl rig::completion::CompletionModel for CompletionModel {
     ) -> Result<rig::streaming::StreamingCompletionResponse, CompletionError> {
         let generic = self.generic();
         generic.stream(request).await
+    }
+}
+
+/// Streaming `usage` payload for the compat fleet: every field defaults to
+/// zero so an abnormal terminal chunk (MiniMax omits `prompt_tokens` on
+/// some error/terminal chunks) cannot fail deserialization and kill the
+/// turn. [`From<CompatStreamingUsage> for rig::completion::Usage`] derives
+/// `total_tokens` when the provider omits it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompatStreamingUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// `prompt_tokens_details`, when the provider reports it.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<CompatPromptTokensDetails>,
+}
+
+/// `prompt_tokens_details` sub-object of the usage payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompatPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl From<CompatStreamingUsage> for rig::completion::Usage {
+    fn from(u: CompatStreamingUsage) -> Self {
+        rig::completion::Usage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: if u.total_tokens > 0 {
+                u.total_tokens
+            } else {
+                u.prompt_tokens + u.completion_tokens
+            },
+            cached_input_tokens: u
+                .prompt_tokens_details
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0),
+            ..rig::completion::Usage::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact live failure: MiniMax's abnormal terminal chunk carries a
+    /// `usage` object without `prompt_tokens`. Stock rig `Usage` hard-fails
+    /// ("missing field `prompt_tokens`"); the compat type must parse.
+    #[test]
+    fn streaming_usage_parses_without_prompt_tokens() {
+        let u: CompatStreamingUsage =
+            serde_json::from_str(r#"{"completion_tokens": 12, "total_tokens": 34}"#).unwrap();
+        assert_eq!(u.prompt_tokens, 0);
+        assert_eq!(u.completion_tokens, 12);
+
+        let normalized = rig::completion::Usage::from(u);
+        assert_eq!(normalized.input_tokens, 0);
+        assert_eq!(normalized.output_tokens, 12);
+        assert_eq!(normalized.total_tokens, 34);
+    }
+
+    #[test]
+    fn streaming_usage_maps_full_payload_and_derives_missing_total() {
+        let u: CompatStreamingUsage = serde_json::from_str(
+            r#"{"prompt_tokens": 40, "completion_tokens": 60,
+                "prompt_tokens_details": {"cached_tokens": 30}}"#,
+        )
+        .unwrap();
+        let normalized = rig::completion::Usage::from(u);
+        assert_eq!(normalized.input_tokens, 40);
+        assert_eq!(normalized.output_tokens, 60);
+        // total_tokens absent on the wire: derived, not zero.
+        assert_eq!(normalized.total_tokens, 100);
+        assert_eq!(normalized.cached_input_tokens, 30);
+    }
+
+    #[test]
+    fn streaming_usage_parses_empty_object() {
+        let u: CompatStreamingUsage = serde_json::from_str("{}").unwrap();
+        assert_eq!(u, CompatStreamingUsage::default());
     }
 }
