@@ -553,6 +553,10 @@ impl Tool for ReadTool {
         })
     }
 
+    fn map_error(&self, error: Self::Error) -> rig::agent::tool::ToolExecutionError {
+        super::classify_tool_error(error.0)
+    }
+
     async fn call(
         &self,
         _context: &mut rig::agent::tool::ToolContext,
@@ -1866,5 +1870,33 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("web_fetch"), "out: {out}");
+    }
+
+    /// A TCC/permission denial must surface as PermissionDenied with
+    /// actionable model feedback — rig's default redaction would shrink it
+    /// to "the tool failed" and the model would retry blind (observed on a
+    /// permission-denied PDF in ~/Downloads).
+    #[test]
+    fn map_error_classifies_permission_denial_with_actionable_feedback() {
+        use rig::agent::tool::Tool;
+
+        let tool = ReadTool::new();
+        let err = tool.map_error(ReadError(
+            "Failed to read PDF: Operation not permitted (os error 1)".into(),
+        ));
+        assert_eq!(err.kind().as_str(), "permission_denied");
+        assert!(err.message().contains("Operation not permitted"));
+        let feedback = err.model_feedback().expect("custom model feedback");
+        assert!(
+            feedback.contains("Privacy & Security"),
+            "feedback: {feedback}"
+        );
+        assert!(feedback.contains("Do not retry"), "feedback: {feedback}");
+
+        // Unrelated errors keep the generic Other kind with the message
+        // intact for the operator.
+        let other = tool.map_error(ReadError("no such anchor".into()));
+        assert_eq!(other.kind().as_str(), "other");
+        assert_eq!(other.message(), "no such anchor");
     }
 }
