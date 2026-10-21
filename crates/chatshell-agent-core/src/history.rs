@@ -66,15 +66,24 @@ pub struct HistoryRow {
     pub images: Vec<ChatMessageImage>,
 }
 
+/// Placeholder replayed for a tool call that never recorded output (the
+/// generation was stopped mid-call, or the process died before the result
+/// landed). Strict OpenAI-compatible endpoints (MiniMax, OpenAI itself)
+/// reject an assistant `tool_calls` message whose ids lack matching tool
+/// messages, so the projection must answer every call.
+pub const INTERRUPTED_TOOL_RESULT: &str =
+    "[Tool execution was interrupted before a result was produced]";
+
 /// Expand flattened history rows into the replayable message sequence.
 ///
 /// For an assistant row with tool calls, emits:
 ///
 /// 1. an assistant message carrying `tool_calls` (content =
 ///    [`HistoryRow::pre_tool_content`], which may be empty),
-/// 2. one tool-role message per tool call that has an output
-///    (`tool_call_id` = call id, `tool_result_call_id` = Responses API
-///    `call_id` when present),
+/// 2. one tool-role message per tool call (`tool_call_id` = call id,
+///    `tool_result_call_id` = Responses API `call_id` when present), with
+///    the recorded output or the [`INTERRUPTED_TOOL_RESULT`] placeholder
+///    when the call never finished,
 /// 3. a trailing assistant message with the final text, when non-empty.
 pub fn pair_history(rows: &[HistoryRow]) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(rows.len());
@@ -113,19 +122,22 @@ pub fn pair_history(rows: &[HistoryRow]) -> Vec<ChatMessage> {
                     tool_result_call_id: None,
                 });
 
-                // 2) Tool result messages for completed invocations.
+                // 2) Tool result messages: the recorded output, or the
+                // placeholder for calls interrupted before finishing.
                 for tc in &row.tool_calls {
-                    if let Some(output) = &tc.output {
-                        messages.push(ChatMessage {
-                            role: MessageRole::Tool,
-                            content: output.clone(),
-                            reasoning_content: None,
-                            images: Vec::new(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: Some(tc.id.clone()),
-                            tool_result_call_id: tc.call_id.clone(),
-                        });
-                    }
+                    let content = tc
+                        .output
+                        .clone()
+                        .unwrap_or_else(|| INTERRUPTED_TOOL_RESULT.to_string());
+                    messages.push(ChatMessage {
+                        role: MessageRole::Tool,
+                        content,
+                        reasoning_content: None,
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_result_call_id: tc.call_id.clone(),
+                    });
                 }
 
                 // 3) Final assistant text after the tool calls, if non-empty.
@@ -254,15 +266,18 @@ mod tests {
     }
 
     #[test]
-    fn output_less_tool_call_emits_no_tool_message() {
+    fn output_less_tool_call_replays_placeholder_result() {
         let messages = pair_history(&[HistoryRow {
             tool_calls: vec![tc("t1", None), tc("t2", Some("done"))],
             ..row(HistoryRole::Assistant, "")
         }]);
-        // assistant + one tool result; no final text (empty content)
-        assert_eq!(messages.len(), 2);
+        // assistant + one tool message per call; no final text (empty content)
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].tool_calls.len(), 2);
-        assert_eq!(messages[1].tool_call_id.as_deref(), Some("t2"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(messages[1].content, INTERRUPTED_TOOL_RESULT);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("t2"));
+        assert_eq!(messages[2].content, "done");
     }
 
     #[test]
