@@ -166,6 +166,97 @@ pub fn validate_registry(conn: &Connection, tables: &[TableSpec]) -> Result<()> 
     }
     Ok(())
 }
+/// One declared foreign key of a table: child columns -> parent columns.
+struct ForeignKey {
+    parent: String,
+    /// `(child_column, parent_column)` pairs; composite keys carry more
+    /// than one, `PRAGMA foreign_key_list` reports them sharing an id.
+    pairs: Vec<(String, String)>,
+}
+
+/// The table's declared foreign keys, grouped by constraint id in
+/// declaration order (`PRAGMA foreign_key_list` emits one row per child
+/// column, ordered by `seq` within each constraint).
+fn table_foreign_keys(local: &Connection, table: &str) -> Result<Vec<ForeignKey>> {
+    let mut stmt = local.prepare(&format!("PRAGMA main.foreign_key_list({table})"))?;
+    let mut rows: Vec<(i64, i64, Option<String>, String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.sort_by_key(|(id, seq, ..)| (*id, *seq));
+
+    let mut fks: Vec<ForeignKey> = Vec::new();
+    let mut current_id: Option<i64> = None;
+    for (id, _seq, parent, from, to) in rows {
+        // SQLite resolves the parent column even for implicit `REFERENCES
+        // parent` clauses, so both are always present for schema created
+        // by this project's DDL; a NULL would mean a malformed schema.
+        let (Some(parent), Some(to)) = (parent, to) else {
+            continue;
+        };
+        if current_id == Some(id) {
+            if let Some(fk) = fks.last_mut() {
+                fk.pairs.push((from, to));
+                continue;
+            }
+        }
+        current_id = Some(id);
+        fks.push(ForeignKey {
+            parent,
+            pairs: vec![(from, to)],
+        });
+    }
+    Ok(fks)
+}
+
+/// SQL predicates (evaluated over the remote row alias `r`) that keep only
+/// rows whose declared foreign-key parents exist in the local database.
+///
+/// The merge runs with `PRAGMA foreign_keys = ON` and the registry is
+/// parents-first, so after a table's parents merged, a satisfied guard
+/// means the row's INSERT/UPDATE cannot trip the constraint. A row whose
+/// parent is still missing — a legacy orphan the publishing device carries
+/// because its rows were hard-deleted out-of-band (real-device finding
+/// 2026-10-28: 14 such rows wedged a TestFlight client on error 787
+/// forever, every pass aborting on the same first orphan) — is skipped
+/// this pass instead of aborting the whole merge, and stays in the remote
+/// snapshot to merge once its parent ever appears.
+///
+/// NULL child columns follow SQLite's MATCH-simple rule: any NULL
+/// satisfies the constraint. Self-referential tables would probe the
+/// half-merged local state and may skip rows unnecessarily — none exist
+/// in the registry (`messages.parent_id` is not a declared FK).
+fn fk_guards(local: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(table_foreign_keys(local, table)?
+        .into_iter()
+        .filter(|fk| !fk.pairs.is_empty())
+        .map(|fk| {
+            let nulls = fk
+                .pairs
+                .iter()
+                .map(|(from, _)| format!("r.{from} IS NULL"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let eqs = fk
+                .pairs
+                .iter()
+                .map(|(from, to)| format!("p.{to} = r.{from}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "({nulls} OR EXISTS (SELECT 1 FROM main.{parent} p WHERE {eqs}))",
+                parent = fk.parent
+            )
+        })
+        .collect())
+}
 
 /// Merge a remote snapshot (a published database file) into `local` under the
 /// given table registry.
@@ -174,6 +265,9 @@ pub fn validate_registry(conn: &Connection, tables: &[TableSpec]) -> Result<()> 
 /// greater — same-timestamp writes never flap). Tombstones (`deleted_at`) are
 /// ordinary column values: an edit newer than a tombstone resurrects the row.
 /// Immutable tables merge with INSERT OR IGNORE (PK + natural UNIQUE dedup).
+/// Remote rows referencing a foreign-key parent that is missing locally
+/// after the parents-first pass are skipped (see [`fk_guards`]), so one
+/// orphaned row on the publishing device can no longer abort the pass.
 pub fn merge_remote(
     local: &Connection,
     remote_path: &Path,
@@ -255,7 +349,46 @@ pub fn merge_remote(
                 );
             }
             let col_list = cols.join(", ");
-            let src = format!("SELECT {col_list} FROM remote_db.{}", spec.name);
+            // FK orphan guard: rows whose declared parents are missing
+            // locally (after this registry's parents-first pass) are
+            // excluded from the INSERT instead of aborting it with
+            // SQLITE_CONSTRAINT_FOREIGNKEY — see [`fk_guards`].
+            let guards = fk_guards(local, spec.name)?;
+            let guard_conjunction = guards.join(" AND ");
+            if !guards.is_empty() {
+                let orphaned: i64 = local.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM remote_db.{name} r \
+                         WHERE NOT ({guard_conjunction})",
+                        name = spec.name
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if orphaned > 0 {
+                    tracing::warn!(
+                        table = spec.name,
+                        orphaned,
+                        "remote snapshot carries rows whose FK parents are \
+                         absent locally; skipping them this pass"
+                    );
+                }
+            }
+            let src = format!("SELECT {col_list} FROM remote_db.{} r", spec.name);
+            // The mutable upsert already opens with `WHERE true` (upsert
+            // parse disambiguation); the immutable INSERT OR IGNORE takes
+            // the guard as its own WHERE. With no declared FKs both forms
+            // stay byte-identical to the unguarded statements.
+            let guard_conj = if guards.is_empty() {
+                String::new()
+            } else {
+                format!(" AND ({guard_conjunction})")
+            };
+            let immutable_guard = if guards.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE ({guard_conjunction})")
+            };
             let sql = if spec.mutable {
                 let assignments = cols
                     .iter()
@@ -283,7 +416,7 @@ pub fn merge_remote(
                 // (e.g. the '' schema default) coalesce to 0.0 so any real
                 // timestamp beats them.
                 format!(
-                    "INSERT INTO main.{name} ({col_list}) {src} WHERE true \
+                    "INSERT INTO main.{name} ({col_list}) {src} WHERE true{guard_conj} \
                      ON CONFLICT({pk}) DO UPDATE SET {assignments} \
                      WHERE COALESCE(julianday(excluded.updated_at), 0.0) > \
                      COALESCE(julianday(main.{name}.updated_at), 0.0){natural_clause}",
@@ -292,7 +425,8 @@ pub fn merge_remote(
                 )
             } else {
                 format!(
-                    "INSERT OR IGNORE INTO main.{name} ({col_list}) {src}",
+                    "INSERT OR IGNORE INTO main.{name} ({col_list}) \
+                     {src}{immutable_guard}",
                     name = spec.name
                 )
             };
@@ -2187,48 +2321,61 @@ CREATE TABLE conversations (
         assert_eq!(header_after.slots.len(), 1, "adopter publishes the slot");
     }
 
+    /// Rollback mechanics for a mid-merge bail. The orphan-row scenario
+    /// that used to trigger this is now the skip path covered below; a
+    /// remote schema looser than local (nullable `label`) aborts on the
+    /// NOT NULL check instead — after owners already merged, so the
+    /// rollback and DETACH paths stay covered.
     #[test]
     fn failed_merge_rolls_back_and_detaches() {
         let space = dir("lockleak");
         let local_path = space.path().join("local.db");
         let remote_path = space.path().join("remote.db");
 
-        let schema = r#"
+        let local_schema = r#"
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE owners (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
 CREATE TABLE items (
     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
     label TEXT NOT NULL, updated_at TEXT NOT NULL);
 "#;
+        let remote_schema = r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE owners (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
+CREATE TABLE items (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+    label TEXT, updated_at TEXT NOT NULL);
+"#;
         const FK_TABLES: &[TableSpec] = &[t("owners"), t("items")];
 
         let local = Connection::open(&local_path).unwrap();
         local.pragma_update(None, "foreign_keys", "ON").unwrap();
-        local.execute_batch(schema).unwrap();
+        local.execute_batch(local_schema).unwrap();
         set_meta(&local, META_SYNC_VERSION, "1:a").unwrap();
         let remote = Connection::open(&remote_path).unwrap();
-        // Bundled SQLite compiles with SQLITE_DEFAULT_FOREIGN_KEYS=1; the
-        // authoring side must not enforce the constraint the merge violates.
-        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        remote.execute_batch(schema).unwrap();
+        remote.execute_batch(remote_schema).unwrap();
         remote
             .execute(
                 "INSERT INTO owners(id, updated_at) VALUES('o1', '2026-08-21T10:00:00+00:00')",
                 [],
             )
             .unwrap();
-        // Child row references an owner the snapshot never carries: the
-        // items pass aborts mid-transaction on the immediate FK check.
         remote
             .execute(
                 "INSERT INTO items(id, owner_id, label, updated_at)
-                 VALUES('i1', 'missing', 'orphan', '2026-08-21T10:00:00+00:00')",
+                 VALUES('i1', 'o1', NULL, '2026-08-21T10:00:00+00:00')",
                 [],
             )
             .unwrap();
         drop(remote);
 
-        assert!(merge_remote(&local, &remote_path, FK_TABLES).is_err());
+        let err = merge_remote(&local, &remote_path, FK_TABLES)
+            .err()
+            .expect("remote NULL label must abort the pass");
+        assert!(
+            err.to_string().contains("NOT NULL constraint failed"),
+            "unexpected error: {err:#}"
+        );
 
         // No partial state survived (the write transaction rolled back)...
         let n: i64 = local
@@ -2248,6 +2395,197 @@ CREATE TABLE items (
         // ...and the connection's write lock is free again.
         local.execute_batch("BEGIN IMMEDIATE").unwrap();
         local.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Real-device finding 2026-10-28: a snapshot carrying child rows whose
+    /// parents were hard-deleted out-of-band on the publishing device used
+    /// to abort the merge on the first orphan (SQLITE_CONSTRAINT_FOREIGNKEY
+    /// 787), wedging the pulling client forever. The FK guard skips the
+    /// orphans; every other row merges.
+    #[test]
+    fn orphaned_remote_rows_skip_instead_of_aborting() {
+        let space = dir("orphan-skip");
+        let local_path = space.path().join("local.db");
+        let remote_path = space.path().join("remote.db");
+
+        let schema = r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE owners (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
+CREATE TABLE items (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+    label TEXT NOT NULL, updated_at TEXT NOT NULL);
+"#;
+        const FK_TABLES: &[TableSpec] = &[t("owners"), t("items")];
+
+        let local = Connection::open(&local_path).unwrap();
+        local.pragma_update(None, "foreign_keys", "ON").unwrap();
+        local.execute_batch(schema).unwrap();
+        set_meta(&local, META_SYNC_VERSION, "1:a").unwrap();
+        let remote = Connection::open(&remote_path).unwrap();
+        // Bundled SQLite compiles with SQLITE_DEFAULT_FOREIGN_KEYS=1; the
+        // authoring side must not enforce the constraint the merge guards.
+        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        remote.execute_batch(schema).unwrap();
+        remote
+            .execute_batch(
+                "INSERT INTO owners(id, updated_at) VALUES('o1', '2026-10-13T10:00:00+00:00');
+                 INSERT INTO items(id, owner_id, label, updated_at) VALUES
+                    ('i1', 'o1', 'valid', '2026-10-13T10:00:00+00:00'),
+                    ('i2', 'missing', 'orphan', '2026-10-13T10:00:00+00:00');",
+            )
+            .unwrap();
+        drop(remote);
+
+        let report = merge_remote(&local, &remote_path, FK_TABLES)
+            .expect("orphaned remote rows must not abort the pass");
+        let items = &report
+            .tables
+            .iter()
+            .find(|(name, _)| *name == "items")
+            .unwrap()
+            .1;
+        assert_eq!(items.inserted, 1, "only the parented row lands: {report:?}");
+
+        let (valid, orphan): (i64, i64) = local
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE id = 'i1'),
+                        COUNT(*) FILTER (WHERE id = 'i2')
+                 FROM items",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(valid, 1, "parented row must merge");
+        assert_eq!(orphan, 0, "orphan must be skipped this pass");
+        let violations: i64 = local
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0, "merged state must satisfy all FKs");
+    }
+
+    /// A skipped orphan is not lost: it stays in the remote snapshot and
+    /// merges on a later pass once its parent appears (e.g. the parent
+    /// shipped in a subsequent version of the snapshot).
+    #[test]
+    fn skipped_orphan_merges_once_parent_appears() {
+        let space = dir("orphan-retry");
+        let local_path = space.path().join("local.db");
+        let remote_path = space.path().join("remote.db");
+
+        let schema = r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE owners (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
+CREATE TABLE items (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+    label TEXT NOT NULL, updated_at TEXT NOT NULL);
+"#;
+        const FK_TABLES: &[TableSpec] = &[t("owners"), t("items")];
+
+        let local = Connection::open(&local_path).unwrap();
+        local.pragma_update(None, "foreign_keys", "ON").unwrap();
+        local.execute_batch(schema).unwrap();
+        set_meta(&local, META_SYNC_VERSION, "1:a").unwrap();
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        remote.execute_batch(schema).unwrap();
+        remote
+            .execute_batch(
+                "INSERT INTO items(id, owner_id, label, updated_at)
+                 VALUES('i2', 'missing', 'orphan', '2026-10-13T10:00:00+00:00');",
+            )
+            .unwrap();
+        drop(remote);
+
+        // Pass 1: the item references a parent nobody carries — skipped.
+        merge_remote(&local, &remote_path, FK_TABLES).unwrap();
+        let n: i64 = local
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // Pass 2: the parent shows up in the snapshot; the item lands.
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        remote
+            .execute(
+                "INSERT INTO owners(id, updated_at) VALUES('missing', '2026-10-13T11:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        drop(remote);
+        let report = merge_remote(&local, &remote_path, FK_TABLES).unwrap();
+        let items = &report
+            .tables
+            .iter()
+            .find(|(name, _)| *name == "items")
+            .unwrap()
+            .1;
+        assert_eq!(
+            items.inserted, 1,
+            "the earlier orphan must land: {report:?}"
+        );
+        let n: i64 = local
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// The immutable path (INSERT OR IGNORE, natural-UNIQUE junction rows)
+    /// must skip orphans the same way — the guard is not upsert-specific.
+    #[test]
+    fn orphaned_immutable_rows_skip_too() {
+        let space = dir("orphan-immutable");
+        let local_path = space.path().join("local.db");
+        let remote_path = space.path().join("remote.db");
+
+        let local = Connection::open(&local_path).unwrap();
+        local.pragma_update(None, "foreign_keys", "ON").unwrap();
+        local.execute_batch(SCHEMA_SQL).unwrap();
+        set_meta(&local, META_SYNC_VERSION, "1:a").unwrap();
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        remote.execute_batch(SCHEMA_SQL).unwrap();
+        remote
+            .execute_batch(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES('c1', 't', '2026-10-13T10:00:00+00:00', '2026-10-13T10:00:00+00:00');
+                 INSERT INTO files(id, file_name, created_at, updated_at)
+                 VALUES('f1', 'a.txt', '2026-10-13T10:00:00+00:00', '2026-10-13T10:00:00+00:00');
+                 INSERT INTO messages(id, conversation_id, sender_type, content, created_at, updated_at)
+                 VALUES('m1', 'c1', 'user', 'hi', '2026-10-13T10:00:00+00:00', '2026-10-13T10:00:00+00:00');
+                 INSERT INTO message_attachments(id, message_id, attachment_id, created_at) VALUES
+                    ('a1', 'm1', 'f1', '2026-10-13T10:00:00+00:00'),
+                    ('a2', 'm1', 'ghost-file', '2026-10-13T10:00:00+00:00');",
+            )
+            .unwrap();
+        drop(remote);
+
+        let report = merge_remote(&local, &remote_path, TEST_TABLES)
+            .expect("immutable orphans must not abort the pass");
+        let attachments = &report
+            .tables
+            .iter()
+            .find(|(name, _)| *name == "message_attachments")
+            .unwrap()
+            .1;
+        assert_eq!(
+            attachments.inserted, 1,
+            "only the parented row lands: {report:?}"
+        );
+
+        let (valid, orphan): (i64, i64) = local
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE id = 'a1'),
+                        COUNT(*) FILTER (WHERE id = 'a2')
+                 FROM message_attachments",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(valid, 1);
+        assert_eq!(orphan, 0, "attachment with a missing file must be skipped");
     }
 }
 
