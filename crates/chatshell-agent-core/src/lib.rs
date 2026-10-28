@@ -22,6 +22,7 @@ pub mod sync;
 pub mod sync_crypto;
 pub mod sync_schema;
 pub mod thinking;
+pub mod tokenizer;
 pub mod tool_definitions;
 pub mod tool_fs;
 pub mod tools;
@@ -40,6 +41,7 @@ pub use provider_registry::{
     is_supported_fetch_provider, requires_api_key_for_model_fetch,
 };
 pub use thinking::{ParsedContent, parse_thinking_content};
+pub use tokenizer::{tokenize_for_search, tokenize_query};
 pub use tool_definitions::{builtin_tool_definitions, web_fetch_definition, web_search_definition};
 pub use types::{
     AgentError, AgentEvent, AgentRequest, ChatMessage, ChatMessageImage, ChatToolCall,

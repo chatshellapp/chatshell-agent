@@ -688,6 +688,21 @@ pub fn resolve_yahoo_redirect_url(href: String) -> String {
     core::web_search::resolve_yahoo_redirect_url(&href)
 }
 
+/// Tokenize text for a local FTS message index (jieba search mode,
+/// space-joined). Pure function - callers persist the result in their
+/// platform-local `messages_fts` table.
+#[uniffi::export]
+pub fn tokenize_for_search(text: String) -> String {
+    core::tokenizer::tokenize_for_search(&text)
+}
+
+/// Tokenize an FTS `MATCH` query the same way indexed content was
+/// tokenized, so query terms exist in the index.
+#[uniffi::export]
+pub fn tokenize_query(query: String) -> String {
+    core::tokenizer::tokenize_query(&query)
+}
+
 impl From<AgentRequest> for core::AgentRequest {
     fn from(value: AgentRequest) -> Self {
         Self {

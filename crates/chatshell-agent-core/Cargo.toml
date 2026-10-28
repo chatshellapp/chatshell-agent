@@ -10,6 +10,10 @@ rustls = ["reqwest/rustls", "rig/rustls"]
 
 [dependencies]
 dirs = "5"
+# CJK segmentation for the shared local-FTS tokenizer; pinned to the same
+# 0.7 line desktop's tokenizer has always used so both platforms segment
+# identically (dictionary drift across major versions changes results).
+jieba-rs = "0.7"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
