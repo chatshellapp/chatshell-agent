@@ -688,6 +688,21 @@ pub fn resolve_yahoo_redirect_url(href: String) -> String {
     core::web_search::resolve_yahoo_redirect_url(&href)
 }
 
+/// Parse Bing HTML search results. Pure function - caller fetches the HTML.
+#[uniffi::export]
+pub fn parse_bing_results(html: String, max: u64) -> Vec<SearchResult> {
+    core::web_search::parse_bing_results(&html, max as usize)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Decode Bing's `/ck/a` redirect wrapper to extract the real URL.
+#[uniffi::export]
+pub fn resolve_bing_redirect_url(href: String) -> String {
+    core::web_search::resolve_bing_redirect_url(&href)
+}
+
 /// Tokenize text for a local FTS message index (jieba search mode,
 /// space-joined). Pure function - callers persist the result in their
 /// platform-local `messages_fts` table.
