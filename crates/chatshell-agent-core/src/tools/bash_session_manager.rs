@@ -24,6 +24,12 @@ pub struct BashSessionManager {
     sessions: Mutex<HashMap<String, SessionEntry>>,
 }
 
+impl Default for BashSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BashSessionManager {
     pub fn new() -> Self {
         Self {

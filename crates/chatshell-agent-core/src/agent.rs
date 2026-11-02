@@ -84,14 +84,18 @@ pub async fn run_generation(
 
     run_stream(
         agent,
-        prompt,
-        history,
-        request.tools.clone(),
-        system_prompt.as_deref(),
+        Turn {
+            prompt,
+            history,
+            tools: request.tools.clone(),
+            system_prompt: system_prompt.as_deref(),
+        },
         &request.parameters,
         default_max_tokens,
-        &sender,
-        &cancellation,
+        &EventSink {
+            sender: &sender,
+            cancellation: &cancellation,
+        },
     )
     .await
 }
@@ -530,18 +534,30 @@ async fn stream_agent(
     .await
 }
 
+/// One completion turn's request: the new prompt, its history, the client
+/// tool definitions, and the system prompt.
+struct Turn<'a> {
+    prompt: Message,
+    history: Vec<Message>,
+    tools: Vec<crate::types::ClientToolDefinition>,
+    system_prompt: Option<&'a str>,
+}
+
+/// Where a generation reports events, and how it learns to stop.
+#[derive(Clone, Copy)]
+struct EventSink<'a> {
+    sender: &'a mpsc::Sender<Result<AgentEvent, AgentError>>,
+    cancellation: &'a CancellationToken,
+}
+
 /// Route a generation to the normal multi-turn stream or the client-side tool
 /// stream depending on whether tool definitions were provided.
 async fn run_stream(
     agent: ProviderAgent,
-    prompt: Message,
-    history: Vec<Message>,
-    tools: Vec<crate::types::ClientToolDefinition>,
-    system_prompt: Option<&str>,
+    turn: Turn<'_>,
     parameters: &SamplingParameters,
     default_max_tokens: Option<u64>,
-    sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
-    cancellation: &CancellationToken,
+    sink: &EventSink<'_>,
 ) -> Result<(), AgentError> {
     let parameters = match default_max_tokens {
         Some(default) => sampling_parameters_with_default_max_tokens(parameters, default),
@@ -550,20 +566,17 @@ async fn run_stream(
 
     let ProviderAgent { agent, model, .. } = agent;
 
-    if tools.is_empty() {
-        stream_agent(agent, prompt, history, sender, cancellation).await
-    } else {
-        stream_agent_with_client_tools(
-            Arc::new(model),
-            prompt,
-            history,
-            tools,
-            system_prompt,
-            &parameters,
-            sender,
-            cancellation,
+    if turn.tools.is_empty() {
+        stream_agent(
+            agent,
+            turn.prompt,
+            turn.history,
+            sink.sender,
+            sink.cancellation,
         )
         .await
+    } else {
+        stream_agent_with_client_tools(Arc::new(model), turn, &parameters, sink).await
     }
 }
 
@@ -575,14 +588,20 @@ async fn run_stream(
 /// the client (Swift), reusing the platform's native networking.
 async fn stream_agent_with_client_tools(
     model: Arc<ModelHandle>,
-    prompt: Message,
-    history: Vec<Message>,
-    tools: Vec<crate::types::ClientToolDefinition>,
-    system_prompt: Option<&str>,
+    turn: Turn<'_>,
     parameters: &SamplingParameters,
-    sender: &mpsc::Sender<Result<AgentEvent, AgentError>>,
-    cancellation: &CancellationToken,
+    sink: &EventSink<'_>,
 ) -> Result<(), AgentError> {
+    let Turn {
+        prompt,
+        history,
+        tools,
+        system_prompt,
+    } = turn;
+    let EventSink {
+        sender,
+        cancellation,
+    } = *sink;
     let tool_defs: Vec<ToolDefinition> = tools
         .into_iter()
         .map(|t| {

@@ -253,7 +253,7 @@ impl AgentCore {
             let result =
                 core::run_generation(request.into(), sender.clone(), task_cancellation).await;
             if let Err(error) = result {
-                let _ = sender.send(Err(error.into())).await;
+                let _ = sender.send(Err(error)).await;
             }
         });
         Arc::new(Generation {

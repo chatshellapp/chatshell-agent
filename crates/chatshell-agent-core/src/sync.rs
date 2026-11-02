@@ -177,9 +177,12 @@ struct ForeignKey {
 /// The table's declared foreign keys, grouped by constraint id in
 /// declaration order (`PRAGMA foreign_key_list` emits one row per child
 /// column, ordered by `seq` within each constraint).
+/// One `PRAGMA foreign_key_list` row: (id, seq, parent table, from, to).
+type ForeignKeyRow = (i64, i64, Option<String>, String, Option<String>);
+
 fn table_foreign_keys(local: &Connection, table: &str) -> Result<Vec<ForeignKey>> {
     let mut stmt = local.prepare(&format!("PRAGMA main.foreign_key_list({table})"))?;
-    let mut rows: Vec<(i64, i64, Option<String>, String, Option<String>)> = stmt
+    let mut rows: Vec<ForeignKeyRow> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -201,11 +204,11 @@ fn table_foreign_keys(local: &Connection, table: &str) -> Result<Vec<ForeignKey>
         let (Some(parent), Some(to)) = (parent, to) else {
             continue;
         };
-        if current_id == Some(id) {
-            if let Some(fk) = fks.last_mut() {
-                fk.pairs.push((from, to));
-                continue;
-            }
+        if current_id == Some(id)
+            && let Some(fk) = fks.last_mut()
+        {
+            fk.pairs.push((from, to));
+            continue;
         }
         current_id = Some(id);
         fks.push(ForeignKey {
@@ -2376,8 +2379,7 @@ CREATE TABLE items (
         drop(remote);
 
         let err = merge_remote(&local, &remote_path, FK_TABLES)
-            .err()
-            .expect("remote NULL label must abort the pass");
+            .expect_err("remote NULL label must abort the pass");
         assert!(
             err.to_string().contains("NOT NULL constraint failed"),
             "unexpected error: {err:#}"

@@ -117,12 +117,10 @@ pub async fn fetch_http(url: &str, max_chars: Option<usize>) -> FetchedResource 
 
     if mime_type.contains("html") {
         process_html(url, &body, &mime_type, max_chars)
-    } else if mime_type.contains("json") {
-        process_text(url, &body, &mime_type, max_chars, true)
-    } else if mime_type.contains("xml") {
-        process_text(url, &body, &mime_type, max_chars, false)
     } else {
-        process_text(url, &body, &mime_type, max_chars, false)
+        // JSON is pretty-printed; XML and everything else pass through as text.
+        let is_json = mime_type.contains("json");
+        process_text(url, &body, &mime_type, max_chars, is_json)
     }
 }
 

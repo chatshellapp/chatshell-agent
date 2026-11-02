@@ -5,7 +5,6 @@ use chatshell_agent_core::types::{
     AgentEvent, AgentRequest, ChatMessage, MessageRole, ProviderConfig, ProviderKind,
     SamplingParameters,
 };
-use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
