@@ -896,7 +896,13 @@ fn row_watermark(conn: &Connection, tables: &[TableSpec]) -> String {
 /// Minimum wall-clock spacing between tick-driven publishes. Each publish is
 /// a full `VACUUM INTO` of the database plus a cloud upload, so an idle or
 /// lightly-used app must not republish on every timer tick.
-const PUBLISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+///
+/// Deliberately shorter than the hosts' 5-minute tick: `last_publish_at` is
+/// stamped when a publish *finishes*, so with throttle == tick the next tick
+/// always saw `elapsed = tick - pass_duration < throttle` and skipped,
+/// doubling the effective ship cadence to 10 minutes. The slack absorbs the
+/// pass duration plus timer jitter.
+pub const PUBLISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60 - 30);
 
 /// Age at which leftover staging files in the cache dir become sweepable
 /// (audit 2026-08-28, low): a crashed pass can leave decrypted snapshots
