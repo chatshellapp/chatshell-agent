@@ -1434,3 +1434,115 @@ impl SyncCrypto {
             .map_err(Into::into)
     }
 }
+
+// ---------------------------------------------------------------------------
+// SVG figures (core `svg_figure`)
+// ---------------------------------------------------------------------------
+
+/// Theme colors a figure's `var(--name)` tokens resolve to.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SvgPalette {
+    pub fg: String,
+    pub muted: String,
+    pub border: String,
+    pub surface: String,
+    pub accent: String,
+    pub success: String,
+    pub warning: String,
+    pub error: String,
+    pub is_dark: bool,
+}
+
+impl From<SvgPalette> for core::svg_figure::SvgPalette {
+    fn from(value: SvgPalette) -> Self {
+        Self {
+            fg: value.fg,
+            muted: value.muted,
+            border: value.border,
+            surface: value.surface,
+            accent: value.accent,
+            success: value.success,
+            warning: value.warning,
+            error: value.error,
+            is_dark: value.is_dark,
+        }
+    }
+}
+
+/// How `prepare_svg_figure` treats its input.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct SvgPrepareOptions {
+    /// The fence is still streaming: repair the truncated tail first.
+    pub streaming: bool,
+    /// Remove SMIL and CSS animation (reduced motion, or paused).
+    pub strip_animation: bool,
+}
+
+/// A sanitized, themed, well-formed figure.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PreparedSvg {
+    pub svg: String,
+    pub width: f64,
+    pub height: f64,
+    pub animated: bool,
+    pub removed: u32,
+}
+
+/// Why a figure could not be prepared.
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
+pub enum SvgFigureError {
+    #[error("SVG root tag is incomplete")]
+    Incomplete,
+    #[error("Invalid SVG: {message}")]
+    Parse { message: String },
+    #[error("Root element is not <svg>")]
+    NoRoot,
+    #[error("SVG exceeds size limits")]
+    TooLarge,
+    #[error("SVG has nothing to draw")]
+    Empty,
+}
+
+impl From<core::svg_figure::SvgFigureError> for SvgFigureError {
+    fn from(value: core::svg_figure::SvgFigureError) -> Self {
+        use core::svg_figure::SvgFigureError as E;
+        match value {
+            E::Incomplete => Self::Incomplete,
+            E::Parse(message) => Self::Parse { message },
+            E::NoRoot => Self::NoRoot,
+            E::TooLarge => Self::TooLarge,
+            E::Empty => Self::Empty,
+        }
+    }
+}
+
+/// Repair (when streaming), theme, sanitize and size a ```svg fence body.
+#[uniffi::export]
+pub fn prepare_svg_figure(
+    source: String,
+    palette: SvgPalette,
+    options: SvgPrepareOptions,
+) -> Result<PreparedSvg, SvgFigureError> {
+    let prepared = core::svg_figure::prepare_svg_figure(
+        &source,
+        &palette.into(),
+        &core::svg_figure::PrepareOptions {
+            streaming: options.streaming,
+            strip_animation: options.strip_animation,
+        },
+    )?;
+    Ok(PreparedSvg {
+        svg: prepared.svg,
+        width: prepared.width,
+        height: prepared.height,
+        animated: prepared.animated,
+        removed: prepared.removed,
+    })
+}
+
+/// System-prompt fragment inviting SVG figures; `mermaid` when the client
+/// also renders ```mermaid fences.
+#[uniffi::export]
+pub fn svg_figure_prompt(mermaid: bool) -> String {
+    core::svg_figure::svg_figure_prompt(mermaid)
+}

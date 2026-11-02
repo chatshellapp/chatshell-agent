@@ -18,6 +18,7 @@ pub mod process_api;
 pub mod provider_catalog;
 pub mod provider_registry;
 pub mod snapcompact;
+pub mod svg_figure;
 pub mod sync;
 pub mod sync_crypto;
 pub mod sync_schema;
