@@ -685,13 +685,33 @@ pub fn plan_sync_header(local: &Connection, header: &ArtifactHeader) -> Result<S
     if remote_counter == local_counter {
         return Ok(SyncAction::Merge);
     }
-    Ok(SyncAction::UpToDate) // stale remote
+    plan_lower_counter(local, &header.sync_version)
+}
+
+/// Verdict for a remote artifact whose lineage counter is BELOW ours.
+///
+/// A lower counter does not mean older content: the counter only counts a
+/// device's own publishes, so a peer that published from a stale view (cloud
+/// propagation lag) and then won the provider's file-level conflict leaves a
+/// lower-counter artifact carrying rows we never saw. Treating every such
+/// artifact as stale stranded those rows while both devices reported
+/// up-to-date (the counter-strand failure, ADR 06). The merge is a lossless,
+/// idempotent union, so a lower-counter artifact is merged exactly once:
+/// `META_LAST_MERGED_REMOTE` remembers the last remote version merged, which
+/// keeps idle ticks against an unchanged artifact on the header-only path.
+fn plan_lower_counter(local: &Connection, remote_version: &str) -> Result<SyncAction> {
+    let last_merged = get_meta(local, META_LAST_MERGED_REMOTE)?;
+    if last_merged.as_deref() == Some(remote_version) {
+        return Ok(SyncAction::UpToDate);
+    }
+    Ok(SyncAction::Merge)
 }
 
 /// Version compare. Version ids are `<counter>:<device_id>` — unique per
 /// publish (a bare counter collides when two devices branch from one base
 /// and both mint the same number). Only the counter orders lineage; an id
-/// tie means the snapshot was published by us (or already adopted).
+/// tie means the snapshot was published by us (or already adopted). A lower
+/// remote counter merges once (see [`plan_lower_counter`]).
 pub fn plan_sync(local: &Connection, remote: &Connection) -> Result<SyncAction> {
     let local_version = get_meta(local, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
     let remote_version = get_meta(remote, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
@@ -709,7 +729,105 @@ pub fn plan_sync(local: &Connection, remote: &Connection) -> Result<SyncAction> 
     if remote_counter == local_counter {
         return Ok(SyncAction::Merge);
     }
-    Ok(SyncAction::UpToDate) // stale remote
+    plan_lower_counter(local, &remote_version)
+}
+
+/// Count local rows the remote snapshot does not carry: rows whose primary
+/// key is absent remotely, or present only with an OLDER `updated_at`
+/// (tombstones included — a newer local `deleted_at` is content too).
+///
+/// A zero-row merge alone does not prove local == remote: it proves only
+/// remote ⊆ local. Adopting the remote id on a strict superset marked the
+/// extra local rows as shipped and stranded them (real-device
+/// counter-strand finding 2026-08-28). This check supplies the other
+/// direction.
+///
+/// Deliberately one-directional so it cannot ping-pong with rows the local
+/// merge legitimately refused: remote FK orphans and remote natural-key
+/// twins are remote-only rows and never count here. A local natural-key
+/// twin (same natural key, different id) counts as present, because the
+/// peer would drop it on merge anyway.
+fn local_rows_absent_from_remote(
+    local: &Connection,
+    remote_path: &Path,
+    tables: &[TableSpec],
+) -> Result<usize> {
+    local.execute(
+        "ATTACH DATABASE ?1 AS remote_db",
+        [remote_path.to_string_lossy().as_ref()],
+    )?;
+    let count = || -> Result<usize> {
+        let mut total = 0usize;
+        for spec in tables {
+            let remote_cols: Vec<String> = {
+                let mut stmt = local.prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{}') WHERE schema = 'remote_db'",
+                    spec.name
+                ))?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            // Remote predates the table: nothing to compare against; the
+            // peer's merge skips the table too, so it cannot be "unshipped"
+            // in any way a republish would fix.
+            if remote_cols.is_empty() {
+                continue;
+            }
+            let local_cols = table_columns(local, spec.name)?;
+            let has =
+                |c: &str| local_cols.iter().any(|x| x == c) && remote_cols.iter().any(|x| x == c);
+            // Same instant-based LWW compare as the merge (strict `>` there,
+            // so a tie keeps the peer's row and counts as present here).
+            let freshness = if spec.mutable && has("updated_at") {
+                " AND COALESCE(julianday(r.updated_at), 0.0) >= \
+                 COALESCE(julianday(m.updated_at), 0.0)"
+            } else {
+                ""
+            };
+            let natural = spec
+                .natural_key
+                .map(|nk| {
+                    let cols: Vec<&str> = nk.split(',').map(str::trim).collect();
+                    if cols.iter().all(|c| has(c)) {
+                        let eqs = cols
+                            .iter()
+                            .map(|c| format!("r.{c} = m.{c}"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        format!(
+                            " OR EXISTS (SELECT 1 FROM remote_db.{name} r WHERE {eqs})",
+                            name = spec.name
+                        )
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default();
+            let n: i64 = local.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM main.{name} m WHERE NOT ( \
+                     EXISTS (SELECT 1 FROM remote_db.{name} r \
+                             WHERE r.{pk} = m.{pk}{freshness}){natural})",
+                    name = spec.name,
+                    pk = spec.pk
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            if n > 0 {
+                tracing::info!(
+                    table = spec.name,
+                    rows = n,
+                    "local rows missing from the remote snapshot"
+                );
+            }
+            total += n.max(0) as usize;
+        }
+        Ok(total)
+    };
+    let result = count();
+    let _ = local.execute("DETACH DATABASE remote_db", []);
+    result
 }
 
 /// Wall-clock marker for the meta table's own `updated_at` (never merged, so
@@ -856,9 +974,19 @@ const META_CLEAN_EXIT: &str = "sync_clean_exit";
 /// data_version is unusable for this: fresh WAL connections don't observe
 /// prior processes' commits). Value format is opaque ([`row_watermark`]).
 const META_SHIPPED_ROW_WATERMARK: &str = "sync_shipped_row_watermark";
+/// Meta key carrying the remote version (header form in encrypted mode) of
+/// the last artifact this device merged; a lower-counter artifact is merged
+/// only when it differs from this (see [`plan_lower_counter`]).
+const META_LAST_MERGED_REMOTE: &str = "sync_last_merged_remote";
+
+/// Modulus for the watermark's stamp sum: keeps every per-row term below
+/// 2^30 so SQLite's 64-bit integer SUM cannot overflow at any realistic
+/// row count, while two different edits colliding stays negligible.
+const WATERMARK_MODULUS: i64 = 1_000_000_007;
 
 /// Change detector over the registry's live rows: `<count>:<sum>` where
-/// `sum` adds the julianday-normalized `updated_at` of every live row.
+/// `sum` adds every live row's `updated_at` as integer Unix milliseconds
+/// (reduced modulo [`WATERMARK_MODULUS`]).
 ///
 /// The merge path compares timestamps via `julianday()` because desktop
 /// (`+00:00` suffix, variable fraction width) and iOS (`Z` suffix) stamp
@@ -869,31 +997,36 @@ const META_SHIPPED_ROW_WATERMARK: &str = "sync_shipped_row_watermark";
 /// across engine restarts and manual passes (audit 2026-08-28, M1).
 ///
 /// Count catches inserts and soft-deletes independent of stamps; the sum
-/// (millisecond resolution, matching `julianday`) catches any edit because
-/// an edit always advances that row's stamp. Unparseable stamps coalesce
-/// to 0.0, as in the merge's LWW compare. A watermark stored by an older
-/// engine (raw string) simply mismatches once, arming one idempotent
-/// republish on the first pass after the upgrade.
+/// catches any edit because an edit always advances that row's stamp. The
+/// sum is exact integer milliseconds: the previous float sum of julianday
+/// DAYS printed with three decimals resolved only 0.001 day (86.4 s), so
+/// an edit landing within about a minute of the row's previous stamp — a
+/// streaming reply finishing after a mid-stream publish — left the
+/// watermark unchanged and stranded as "shipped" across restarts.
+/// Unparseable stamps contribute 0, as in the merge's LWW compare. A
+/// watermark stored by an older engine simply mismatches once, arming one
+/// idempotent republish on the first pass after the upgrade.
 fn row_watermark(conn: &Connection, tables: &[TableSpec]) -> String {
     let mut count: u64 = 0;
-    let mut sum: f64 = 0.0;
+    let mut sum: i64 = 0;
     for spec in tables {
         let Ok((rows, stamped)) = conn.query_row(
             &format!(
-                "SELECT COUNT(*), \
-                 COALESCE(SUM(COALESCE(julianday(updated_at), 0.0)), 0.0) \
+                "SELECT COUNT(*), COALESCE(SUM( \
+                 COALESCE(CAST(ROUND((julianday(updated_at) - 2440587.5) * 86400000.0) \
+                 AS INTEGER), 0) % {WATERMARK_MODULUS}), 0) \
                  FROM {} WHERE deleted_at IS NULL",
                 spec.name
             ),
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         ) else {
             continue;
         };
         count += rows.max(0) as u64;
-        sum += stamped;
+        sum = (sum + stamped.rem_euclid(WATERMARK_MODULUS)) % WATERMARK_MODULUS;
     }
-    format!("{count}:{sum:.3}")
+    format!("{count}:{sum}")
 }
 
 /// Minimum wall-clock spacing between tick-driven publishes. Each publish is
@@ -1404,13 +1537,26 @@ impl SyncEngine {
             .ok()
             .and_then(|c| get_meta(&c, META_SYNC_VERSION).ok().flatten())
             .unwrap_or_else(|| "0:none".to_string());
+        // Remember what was merged, in the same form the planner compares
+        // (header form when encrypted), so a lower-counter artifact is
+        // merged once rather than on every tick.
+        let merged_marker = header
+            .map(|h| h.sync_version.clone())
+            .unwrap_or_else(|| remote_version.clone());
+        set_meta(&self.conn, META_LAST_MERGED_REMOTE, &merged_marker)?;
+        // A zero-row merge proves only remote ⊆ local; local may still hold
+        // rows the snapshot lacks (a peer published from a stale view, or
+        // the snapshot outranks us by counter alone).
+        let local_ahead = rows_merged == 0
+            && local_rows_absent_from_remote(&self.conn, snapshot, self.tables)? > 0;
 
-        if rows_merged == 0 {
+        if rows_merged == 0 && !local_ahead {
             // Content already equal: adopt the remote version id and
             // converge - republishing under a new id would ping-pong.
-            // Adoption proves local content == the remote snapshot, so
-            // every local row IS shipped: mark the watermark accordingly
-            // or the unshipped-rows heal would republish on the next pass.
+            // Both directions are checked (nothing merged in, nothing
+            // local missing remotely), so every local row IS shipped: mark
+            // the watermark accordingly or the unshipped-rows heal would
+            // republish on the next pass.
             // `pool_baseline_data_version` is intentionally NOT refreshed
             // here: pool writes since construction are still unshipped and
             // must stay detectable below.
@@ -1433,7 +1579,9 @@ impl SyncEngine {
                 republished: flushed,
             })
         } else {
-            // Fresh local state: mint a new version and publish it.
+            // Fresh local state (rows merged in, or local rows the remote
+            // lacks): mint a version above both lineages and publish it, so
+            // every peer sees a strictly newer artifact carrying the union.
             let local_counter = self
                 .current_version()
                 .split(':')
@@ -1459,7 +1607,12 @@ impl SyncEngine {
             self.last_published_data_version = Some(seen);
             self.publish()?;
             Ok(SyncOutcome {
-                action: "merged".into(),
+                action: if rows_merged > 0 {
+                    "merged"
+                } else {
+                    "republished-ahead"
+                }
+                .into(),
                 rows_merged,
                 republished: true,
             })
@@ -1501,12 +1654,13 @@ CREATE TABLE conversations (
         SyncEngine::new_with_tables(db, cloud, cache, None, ENGINE_TABLES).unwrap()
     }
 
-    /// The manual escape hatch for the counter-strand failure mode: a
+    /// The counter-strand failure mode (real-device finding 2026-08-28): a
     /// device whose rows were outranked by a peer's higher lineage counter
-    /// reports up-to-date forever; `force_publish` bumps and re-ships so
-    /// the stranded peer merges them (real-device finding 2026-08-28).
+    /// used to adopt the peer's id on the zero-row merge and report
+    /// up-to-date forever, needing the manual `force_publish`. The
+    /// superset check now heals it on the very next ordinary pass.
     #[test]
-    fn force_publish_rescues_stranded_peer() {
+    fn outranked_rows_self_heal_without_force_publish() {
         let space = dir("force-publish");
         let a_path = space.path().join("a.db");
         let b_path = space.path().join("b.db");
@@ -1537,14 +1691,13 @@ CREATE TABLE conversations (
         b.force_publish().unwrap();
         b.force_publish().unwrap();
 
-        // Now A itself reports converged/up-to-date with a2 stranded: the
-        // zero-row adopt branch takes B's version id without republishing,
-        // and nothing B does ever pulls a2 in.
-        assert_eq!(a.sync_now().unwrap().action, "converged");
-        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+        // A's zero-row merge notices it holds a2 while the snapshot does
+        // not, and republishes above B's counter instead of adopting it.
+        let out_a = a.sync_now().unwrap();
+        assert_eq!(out_a.action, "republished-ahead", "{out_a:?}");
+        assert!(out_a.republished);
 
-        // The escape hatch: A force-publishes, B merges the stranded row.
-        a.force_publish().unwrap();
+        // B merges the formerly stranded row on its next ordinary pass.
         let out = b.sync_now().unwrap();
         assert_eq!(out.action, "merged");
         assert_eq!(out.rows_merged, 1, "stranded row must land: {out:?}");
@@ -1553,6 +1706,213 @@ CREATE TABLE conversations (
             .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+
+        // And the pair settles: no further churn once both hold the union.
+        assert_eq!(a.sync_now().unwrap().action, "converged");
+        assert_eq!(a.sync_now().unwrap().action, "up-to-date");
+        assert_eq!(b.sync_now().unwrap().action, "up-to-date");
+    }
+
+    /// The lower-counter strand (review 2026-11-03): B publishes from a
+    /// stale view of the cloud (propagation lag) and its artifact wins the
+    /// provider's file-level conflict, landing a LOWER counter than A's.
+    /// A used to dismiss it as a stale remote, so B's row never reached A
+    /// and A's rows never reached B while both reported up-to-date.
+    #[test]
+    fn lower_counter_remote_is_merged_once() {
+        let space = dir("lower-counter");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        // Two folders model the two devices' local views of one container;
+        // copying an artifact between them is the provider delivering it.
+        let cloud_a = space.path().join("cloud-a");
+        let cloud_b = space.path().join("cloud-b");
+        std::fs::create_dir_all(&cloud_a).unwrap();
+        std::fs::create_dir_all(&cloud_b).unwrap();
+        let artifact = |cloud: &Path| compressed_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        let deliver = |from: &Path, to: &Path| {
+            std::fs::copy(artifact(from), artifact(to)).unwrap();
+        };
+        let insert = |conn: &Connection, id: &str, stamp: &str| {
+            conn.execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at)
+                 VALUES(?1, ?1, ?2, ?2)",
+                rusqlite::params![id, stamp],
+            )
+            .unwrap();
+        };
+        let ids = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT id FROM conversations ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+
+        // Common base: A publishes, B converges on it.
+        seed(&a_path, "base", "base");
+        let mut a = plain_engine(&a_path, cloud_a.clone(), space.path().join("cache-a"));
+        a.min_publish_interval = std::time::Duration::ZERO;
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+        deliver(&cloud_a, &cloud_b);
+        seed(&b_path, "base", "base");
+        let mut b = plain_engine(&b_path, cloud_b.clone(), space.path().join("cache-b"));
+        b.min_publish_interval = std::time::Duration::ZERO;
+        assert_eq!(b.sync_now().unwrap().action, "converged");
+
+        // A ships two versions that B never receives.
+        insert(a.connection(), "a1", "2026-11-03T10:00:00+00:00");
+        assert_eq!(a.sync_now().unwrap().action, "flushed");
+        insert(a.connection(), "a2", "2026-11-03T10:01:00+00:00");
+        assert_eq!(a.sync_now().unwrap().action, "flushed");
+
+        // B writes from its stale view and publishes a lower counter,
+        // whose file then wins the conflict in A's container.
+        insert(b.connection(), "b1", "2026-11-03T10:02:00+00:00");
+        assert_eq!(b.sync_now().unwrap().action, "flushed");
+        let counter = |e: &SyncEngine| counter_of(&e.current_version());
+        assert!(counter(&b) < counter(&a), "precondition: B is behind");
+        deliver(&cloud_b, &cloud_a);
+
+        // A merges the lower-counter artifact instead of dismissing it.
+        let out_a = a.sync_now().unwrap();
+        assert_eq!(out_a.action, "merged", "{out_a:?}");
+        assert_eq!(out_a.rows_merged, 1);
+        assert_eq!(ids(a.connection()), ["a1", "a2", "b1", "base"]);
+
+        // The republished union reaches B.
+        deliver(&cloud_a, &cloud_b);
+        let out_b = b.sync_now().unwrap();
+        assert_eq!(out_b.rows_merged, 2, "{out_b:?}");
+        assert_eq!(ids(b.connection()), ["a1", "a2", "b1", "base"]);
+
+        // An unchanged lower-counter artifact is merged only once: the
+        // stale file reappearing must stay on the header-only path.
+        set_meta(a.connection(), META_LAST_MERGED_REMOTE, "1:stale").unwrap();
+        let stale = Connection::open_in_memory().unwrap();
+        stale
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL); \
+                 INSERT INTO meta VALUES ('sync_version', '1:stale', '');",
+            )
+            .unwrap();
+        assert_eq!(
+            plan_sync(a.connection(), &stale).unwrap(),
+            SyncAction::UpToDate,
+            "already-merged lower counter must not re-merge"
+        );
+        set_meta(a.connection(), META_LAST_MERGED_REMOTE, "0:other").unwrap();
+        assert_eq!(
+            plan_sync(a.connection(), &stale).unwrap(),
+            SyncAction::Merge,
+            "unseen lower counter must merge"
+        );
+    }
+
+    /// Review 2026-11-03: the watermark summed julianday DAYS and printed
+    /// three decimals (0.001 day = 86.4 s), so an edit within about a
+    /// minute of the row's previous stamp left it unchanged. Written while
+    /// no engine ran (crash after a mid-stream publish), such an edit never
+    /// shipped on the next launch.
+    #[test]
+    fn sub_minute_edit_ships_across_restart() {
+        let space = dir("sub-minute");
+        let a_path = space.path().join("a.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+
+        seed(&a_path, "c1", "partial reply");
+        let mut a = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        assert_eq!(a.sync_now().unwrap().action, "published-initial");
+        let before = row_watermark(a.connection(), ENGINE_TABLES);
+        drop(a);
+
+        // 20 s later, with the engine gone, the row is finalized.
+        let pool = Connection::open(&a_path).unwrap();
+        pool.execute(
+            "UPDATE conversations SET title = 'complete reply', \
+             updated_at = '2026-08-21T10:00:20+00:00' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert_ne!(
+            row_watermark(&pool, ENGINE_TABLES),
+            before,
+            "a 20 s edit must move the watermark"
+        );
+        drop(pool);
+
+        let mut a2 = plain_engine(&a_path, cloud.clone(), space.path().join("cache-a"));
+        let out = a2.sync_now().unwrap();
+        assert!(out.republished, "the finalized row must ship: {out:?}");
+
+        let reader_db = space.path().join("reader.db");
+        seed(&reader_db, "r1", "reader");
+        let mut reader = plain_engine(&reader_db, cloud, space.path().join("cache-r"));
+        reader.sync_now().unwrap();
+        let title: String = reader
+            .connection()
+            .query_row("SELECT title FROM conversations WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "complete reply");
+    }
+
+    /// The superset check must not ping-pong over rows a merge refuses:
+    /// a natural-key twin (same name, different id) on each side.
+    #[test]
+    fn natural_key_twins_do_not_ping_pong() {
+        static TABLES: &[TableSpec] = &[tnk("tags", "name")];
+        let space = dir("twins");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let make = |name: &str, id: &str| -> PathBuf {
+            let path = space.path().join(format!("{name}.db"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL);
+                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, \
+                 updated_at TEXT NOT NULL, deleted_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tags VALUES (?1, 'work', '2026-11-03T10:00:00+00:00', NULL)",
+                [id],
+            )
+            .unwrap();
+            path
+        };
+        let a_path = make("a", "id-a");
+        let b_path = make("b", "id-b");
+        let engine = |p: &Path, tag: &str| {
+            let mut e = SyncEngine::new_with_tables(
+                p,
+                cloud.clone(),
+                space.path().join(format!("cache-{tag}")),
+                None,
+                TABLES,
+            )
+            .unwrap();
+            e.min_publish_interval = std::time::Duration::ZERO;
+            e
+        };
+        let mut a = engine(&a_path, "a");
+        let mut b = engine(&b_path, "b");
+        a.sync_now().unwrap();
+        let out_b = b.sync_now().unwrap();
+        assert_eq!(
+            out_b.action, "converged",
+            "twin counts as present: {out_b:?}"
+        );
+        for _ in 0..3 {
+            assert!(!a.sync_now().unwrap().republished);
+            assert!(!b.sync_now().unwrap().republished);
+        }
     }
 
     #[test]
@@ -1999,8 +2359,13 @@ CREATE TABLE conversations (
             .unwrap();
         }
 
+        // The zero-row merge sees B holding a row the snapshot lacks and
+        // republishes instead of adopting A's id.
         let out_b = b.sync_now().unwrap();
-        assert_eq!(out_b.action, "flushed", "adoption must not strand writes");
+        assert_eq!(
+            out_b.action, "republished-ahead",
+            "adoption must not strand writes"
+        );
         assert!(out_b.republished);
 
         // A pulls B's pending row on its next pass.
