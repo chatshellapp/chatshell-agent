@@ -26,16 +26,36 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Conversation-level permission mode for the approval gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// There is deliberately no `Default`: hosts source the mode from an
+/// explicit setting, never from a compiled-in fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     /// Prompt before write- and exec-tier tool calls; session grants
     /// cache approvals.
     Ask,
+    /// Bash runs inside the OS sandbox without prompting, and file writes
+    /// inside the workspace run silently. Prompts remain for escaping the
+    /// sandbox, out-of-workspace writes, MCP, `kill_shell`, unknown tools,
+    /// classifier warnings, egress, and private-network fetches. Without a
+    /// usable sandbox, bash falls back to per-command prompts.
+    Auto,
     /// Run tool calls without prompts. Catastrophic operations are still
     /// hard-denied by the in-tool blocklist and path policy in every mode.
-    #[default]
     Yolo,
+}
+
+/// Per-turn facts the resolver needs beyond the mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateContext {
+    /// The conversation working directory (writes inside it are silent in
+    /// `auto`).
+    pub workspace: Option<PathBuf>,
+    /// The bash session runs inside a working OS sandbox.
+    pub sandbox_available: bool,
+    /// "Allow network this session" was granted.
+    pub network_allowed: bool,
 }
 
 /// Risk tier of a tool call.
@@ -309,13 +329,15 @@ pub fn remember_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
 /// Classifier signal that forces a bash prompt in prompting modes, most
 /// specific first: network egress, classifier warning, then an AST layer
 /// that could not run (fail closed: its validators were skipped).
+/// Classifier signal that forces a bash prompt in prompting modes: a
+/// classifier warning first (the most serious), then an AST layer that
+/// could not run (fail closed: its validators were skipped), then network
+/// egress (skipped when the session already holds a network grant).
 fn bash_forced_prompt(
     command: &str,
     classification: &bash_security::CommandClassification,
+    network_allowed: bool,
 ) -> Option<(ForcedPromptKind, String)> {
-    if let Some(egress) = net_policy::detect_egress(command) {
-        return Some((ForcedPromptKind::Network, egress));
-    }
     if let SecurityVerdict::Warn(message) = &classification.verdict {
         return Some((ForcedPromptKind::Security, message.clone()));
     }
@@ -325,16 +347,45 @@ fn bash_forced_prompt(
             "Command could not be fully analyzed (too long or unparseable)".to_string(),
         ));
     }
+    if !network_allowed && let Some(egress) = net_policy::detect_egress(command) {
+        return Some((ForcedPromptKind::Network, egress));
+    }
     None
 }
 
-/// Resolve one tool call against the mode and session grants.
+/// True when `path` (a file-tool argument) resolves inside `workspace`.
+fn inside_workspace(path: &str, workspace: &Path) -> bool {
+    let Some(target) = grant_keys::grant_path(path) else {
+        return false;
+    };
+    let root = workspace
+        .to_str()
+        .and_then(grant_keys::grant_path)
+        .unwrap_or_else(|| workspace.to_path_buf());
+    target.starts_with(&root) && target != root
+}
+
+/// Resolve one tool call against the mode and session grants, with no
+/// workspace, no sandbox, and no network grant.
 pub fn resolve(
     mode: PermissionMode,
     tool_name: &str,
     args: &Value,
     grants: &SessionGrants,
 ) -> GateDecision {
+    resolve_in(mode, &GateContext::default(), tool_name, args, grants)
+}
+
+/// Resolve one tool call against the mode, the turn context, and the
+/// session grants.
+pub fn resolve_in(
+    mode: PermissionMode,
+    ctx: &GateContext,
+    tool_name: &str,
+    args: &Value,
+    grants: &SessionGrants,
+) -> GateDecision {
+    let sandboxed_auto = mode == PermissionMode::Auto && ctx.sandbox_available;
     // Bash: hard-deny pre-check, then the mode, forced prompts, grants.
     // The authoritative blocklist lives inside the bash tool; this
     // pre-check denies before an approval prompt would be shown for a
@@ -355,10 +406,16 @@ pub fn resolve(
         if mode == PermissionMode::Yolo {
             return GateDecision::Allow;
         }
-        if let Some((kind, detail)) = bash_forced_prompt(command, &classification) {
+        // The network grant only means something when a sandbox enforces
+        // the alternative; without one, egress always prompts.
+        let network_allowed = sandboxed_auto && ctx.network_allowed;
+        if let Some((kind, detail)) = bash_forced_prompt(command, &classification, network_allowed)
+        {
             return GateDecision::forced(command, kind, detail);
         }
-        if grants.bash_command_granted(command) {
+        // In sandboxed auto the OS sandbox absorbs everything else;
+        // escapes surface as sandbox escalations after execution.
+        if sandboxed_auto || grants.bash_command_granted(command) {
             return GateDecision::Allow;
         }
         return GateDecision::prompt(command);
@@ -381,6 +438,17 @@ pub fn resolve(
                 format!("Fetch targets a private or local network address: {url}"),
             );
         }
+        return GateDecision::Allow;
+    }
+
+    // Auto: file writes inside the workspace run silently. The tools'
+    // path policy still refuses protected paths in every mode.
+    if mode == PermissionMode::Auto
+        && matches!(tool_name, "edit" | "write")
+        && let (Some(path), Some(workspace)) =
+            (args.get("path").and_then(Value::as_str), &ctx.workspace)
+        && inside_workspace(path, workspace)
+    {
         return GateDecision::Allow;
     }
 
@@ -416,11 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_is_yolo() {
-        assert_eq!(PermissionMode::default(), PermissionMode::Yolo);
-    }
-
-    #[test]
     fn wire_values_are_lowercase() {
         assert_eq!(
             serde_json::to_value(PermissionMode::Ask).unwrap(),
@@ -433,6 +496,10 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PermissionMode>(json!("yolo")).unwrap(),
             PermissionMode::Yolo
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionMode::Auto).unwrap(),
+            json!("auto")
         );
     }
 
@@ -902,5 +969,179 @@ mod tests {
         );
         // Relative paths are never remembered.
         assert_eq!(remember_scope("edit", &json!({"path": "src/a.rs"})), None);
+    }
+
+    fn auto_ctx(workspace: &std::path::Path, sandbox: bool, network: bool) -> GateContext {
+        GateContext {
+            workspace: Some(workspace.to_path_buf()),
+            sandbox_available: sandbox,
+            network_allowed: network,
+        }
+    }
+
+    fn auto(ctx: &GateContext, tool: &str, args: Value) -> GateDecision {
+        resolve_in(
+            PermissionMode::Auto,
+            ctx,
+            tool,
+            &args,
+            &SessionGrants::default(),
+        )
+    }
+
+    fn temp_workspace() -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("auto-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn auto_runs_typical_work_without_prompts() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        for command in ["ls -la", "cargo build", "npm test", "git commit -m wip"] {
+            assert_eq!(
+                auto(&ctx, "bash", json!({ "command": command })),
+                GateDecision::Allow,
+                "{command}"
+            );
+        }
+        let inside = ws.join("src").join("main.rs");
+        for tool in ["edit", "write"] {
+            assert_eq!(
+                auto(&ctx, tool, json!({ "path": inside.to_str().unwrap() })),
+                GateDecision::Allow
+            );
+        }
+        assert_eq!(
+            auto(&ctx, "read", json!({ "path": "/etc/hosts" })),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn auto_prompts_out_of_workspace_writes_mcp_kill_shell_and_unknown_tools() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        let outside = ws.with_file_name("outside.txt");
+        let traversal = format!("{}/../escape.txt", ws.display());
+        for (tool, args) in [
+            ("write", json!({ "path": outside.to_str().unwrap() })),
+            ("edit", json!({ "path": traversal })),
+            ("write", json!({ "path": "relative.txt" })),
+            ("mcp_tool_use", json!({ "server": "s", "tool": "t" })),
+            ("kill_shell", json!({})),
+            ("custom_exec", json!({})),
+        ] {
+            assert!(
+                matches!(auto(&ctx, tool, args.clone()), GateDecision::Prompt { .. }),
+                "{tool} {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_keeps_forced_prompts() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        let kind = |decision: GateDecision| forced_kind(&decision);
+        assert_eq!(
+            kind(auto(&ctx, "bash", json!({ "command": "echo $(whoami)" }))),
+            Some(ForcedPromptKind::Security)
+        );
+        assert_eq!(
+            kind(auto(
+                &ctx,
+                "bash",
+                json!({ "command": format!("echo {}", "a".repeat(12_000)) })
+            )),
+            Some(ForcedPromptKind::Unparsed)
+        );
+        assert_eq!(
+            kind(auto(
+                &ctx,
+                "bash",
+                json!({ "command": "curl https://example.com" })
+            )),
+            Some(ForcedPromptKind::Network)
+        );
+        assert_eq!(
+            kind(auto(
+                &ctx,
+                "web_fetch",
+                json!({ "url": "http://10.0.0.1/" })
+            )),
+            Some(ForcedPromptKind::PrivateNetwork)
+        );
+        assert!(matches!(
+            auto(&ctx, "bash", json!({ "command": "rm -rf /" })),
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn auto_network_grant_silences_egress_only_with_a_sandbox() {
+        let ws = temp_workspace();
+        let curl = json!({ "command": "curl https://example.com" });
+        assert_eq!(
+            auto(&auto_ctx(&ws, true, true), "bash", curl.clone()),
+            GateDecision::Allow
+        );
+        assert!(matches!(
+            auto(&auto_ctx(&ws, false, true), "bash", curl),
+            GateDecision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn auto_without_sandbox_prompts_bash_per_command() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, false, false);
+        assert_eq!(
+            auto(&ctx, "bash", json!({ "command": "ls" })),
+            GateDecision::prompt("ls")
+        );
+        // Session grants still apply, exactly as in ask.
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["ls"]);
+        assert_eq!(
+            resolve_in(
+                PermissionMode::Auto,
+                &ctx,
+                "bash",
+                &json!({ "command": "ls" }),
+                &grants
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_ignores_network_grant_and_workspace() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, true);
+        assert!(matches!(
+            resolve_in(
+                PermissionMode::Ask,
+                &ctx,
+                "bash",
+                &json!({ "command": "curl https://example.com" }),
+                &SessionGrants::default()
+            ),
+            GateDecision::Prompt { .. }
+        ));
+        assert!(matches!(
+            resolve_in(
+                PermissionMode::Ask,
+                &ctx,
+                "write",
+                &json!({ "path": ws.join("a.txt").to_str().unwrap() }),
+                &SessionGrants::default()
+            ),
+            GateDecision::Prompt { .. }
+        ));
     }
 }
