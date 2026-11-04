@@ -387,6 +387,7 @@ impl<S: ShellSpawner + Default> BashTool<S> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn check_dangerous(command: &str) -> Option<&'static str> {
         bash_security::check_dangerous(command)
     }
@@ -549,7 +550,9 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             .ok_or_else(|| BashError("No command provided".into()))?;
 
         // --- security checks (dangerous patterns + compound analysis + injection) ---
-        let security_warning = match bash_security::check_command(command, Self::check_dangerous) {
+        // Memoized: the approval gate classified this exact command a moment
+        // ago, so the pipeline does not run twice per call.
+        let security_warning = match bash_security::classify_command(command).verdict {
             SecurityVerdict::Block(msg) => {
                 tracing::warn!("🛡️ [bash] Command blocked: {}", command);
                 return Err(BashError(msg));

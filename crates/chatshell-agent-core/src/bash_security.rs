@@ -1302,9 +1302,82 @@ pub fn check_command(
     command: &str,
     check_dangerous: fn(&str) -> Option<&'static str>,
 ) -> SecurityVerdict {
+    check_command_inner(command, check_dangerous).verdict
+}
+
+/// Full classifier output for one command: the verdict plus whether the
+/// tree-sitter AST layer actually ran. When it did not (command longer
+/// than the AST limit, parser failure) the AST-only validators were
+/// silently skipped, so an `Allow` is weaker than usual; the approval
+/// gate uses this to fail closed in prompting modes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandClassification {
+    pub verdict: SecurityVerdict,
+    pub ast_available: bool,
+}
+
+/// Classify a command with the standard dangerous-pattern list, memoized.
+///
+/// The approval gate and the bash tool both need the verdict for the same
+/// command within one tool call; the memo makes the 18-validator pipeline
+/// run once. The classifier is a pure function of the command text, so
+/// sharing results is sound.
+pub fn classify_command(command: &str) -> CommandClassification {
+    static CACHE: std::sync::LazyLock<ClassificationCache> =
+        std::sync::LazyLock::new(ClassificationCache::default);
+    CACHE.get_or_classify(command, |c| check_command_inner(c, check_dangerous))
+}
+
+/// Number of recent classifications kept by [`classify_command`].
+const CLASSIFICATION_CACHE_CAPACITY: usize = 32;
+
+/// Small FIFO memo of recent command classifications.
+#[derive(Default)]
+pub struct ClassificationCache {
+    entries: std::sync::Mutex<std::collections::VecDeque<(String, CommandClassification)>>,
+}
+
+impl ClassificationCache {
+    /// Return the cached classification for `command`, or run `classify`
+    /// and remember the result.
+    pub fn get_or_classify(
+        &self,
+        command: &str,
+        classify: impl FnOnce(&str) -> CommandClassification,
+    ) -> CommandClassification {
+        if let Some((_, hit)) = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key == command)
+        {
+            return hit.clone();
+        }
+        // Classify outside the lock: the pipeline is the slow part.
+        let result = classify(command);
+        let mut entries = self.entries.lock().unwrap();
+        if !entries.iter().any(|(key, _)| key == command) {
+            if entries.len() >= CLASSIFICATION_CACHE_CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back((command.to_string(), result.clone()));
+        }
+        result
+    }
+}
+
+fn check_command_inner(
+    command: &str,
+    check_dangerous: fn(&str) -> Option<&'static str>,
+) -> CommandClassification {
+    let blocked = |reason: String| CommandClassification {
+        verdict: SecurityVerdict::Block(reason),
+        ast_available: true,
+    };
     // 1. Check the full command for dangerous patterns.
     if let Some(msg) = check_dangerous(command) {
-        return SecurityVerdict::Block(msg.to_string());
+        return blocked(msg.to_string());
     }
 
     // 1b. Also check after stripping safe wrappers (e.g. `timeout 5 rm -rf /`).
@@ -1312,7 +1385,7 @@ pub fn check_command(
     if stripped != command
         && let Some(msg) = check_dangerous(stripped)
     {
-        return SecurityVerdict::Block(format!(
+        return blocked(format!(
             "{} (after normalizing wrappers: {})",
             msg,
             truncate_for_log(stripped, 80),
@@ -1323,7 +1396,7 @@ pub fn check_command(
     let subs = split_compound_command(command);
     for sub in &subs {
         if let Some(msg) = check_dangerous(sub) {
-            return SecurityVerdict::Block(format!(
+            return blocked(format!(
                 "{} (in subcommand: {})",
                 msg,
                 truncate_for_log(sub, 80),
@@ -1334,7 +1407,7 @@ pub fn check_command(
         if stripped_sub != *sub
             && let Some(msg) = check_dangerous(stripped_sub)
         {
-            return SecurityVerdict::Block(format!(
+            return blocked(format!(
                 "{} (in subcommand after normalizing wrappers: {})",
                 msg,
                 truncate_for_log(stripped_sub, 80),
@@ -1344,6 +1417,11 @@ pub fn check_command(
 
     // 3. Build validation context and run the validator pipeline.
     let ctx = ValidationContext::new(command);
+    let ast_available = ctx.ast.is_some();
+    let done = |verdict: SecurityVerdict| CommandClassification {
+        verdict,
+        ast_available,
+    };
 
     // Each validator returns Allow (continue), Warn (collect), or Block (stop).
     // AST-based validators run alongside regex validators for defense-in-depth.
@@ -1374,7 +1452,7 @@ pub fn check_command(
 
     for validator in validators {
         match validator(&ctx) {
-            SecurityVerdict::Block(msg) => return SecurityVerdict::Block(msg),
+            SecurityVerdict::Block(msg) => return done(SecurityVerdict::Block(msg)),
             SecurityVerdict::Warn(msg) => {
                 if worst_warn.is_none() {
                     worst_warn = Some(msg.clone());
@@ -1387,16 +1465,16 @@ pub fn check_command(
 
     if let Some(first) = worst_warn {
         if all_warnings.len() > 1 {
-            return SecurityVerdict::Warn(format!(
+            return done(SecurityVerdict::Warn(format!(
                 "{}; (+{} more warning(s))",
                 first,
                 all_warnings.len() - 1
-            ));
+            )));
         }
-        return SecurityVerdict::Warn(first);
+        return done(SecurityVerdict::Warn(first));
     }
 
-    SecurityVerdict::Allow
+    done(SecurityVerdict::Allow)
 }
 
 // ---------------------------------------------------------------------------
@@ -2617,5 +2695,66 @@ mod tests {
             result.is_err(),
             "Should block writes to /etc/ regardless of project root"
         );
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cache_runs_pipeline_once_per_command() {
+        let cache = ClassificationCache::default();
+        let runs = AtomicUsize::new(0);
+        let classify = |command: &str| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            check_command_inner(command, check_dangerous)
+        };
+        let first = cache.get_or_classify("cargo test", classify);
+        let second = cache.get_or_classify("cargo test", |command: &str| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            check_command_inner(command, check_dangerous)
+        });
+        assert_eq!(first, second);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_evicts_oldest_beyond_capacity() {
+        let cache = ClassificationCache::default();
+        let runs = AtomicUsize::new(0);
+        let count = |command: &str| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            check_command_inner(command, check_dangerous)
+        };
+        for i in 0..=CLASSIFICATION_CACHE_CAPACITY {
+            cache.get_or_classify(&format!("echo {i}"), count);
+        }
+        let before = runs.load(Ordering::SeqCst);
+        // "echo 0" was evicted; "echo 1" is still cached.
+        cache.get_or_classify("echo 1", count);
+        assert_eq!(runs.load(Ordering::SeqCst), before);
+        cache.get_or_classify("echo 0", count);
+        assert_eq!(runs.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn classification_reports_ast_availability() {
+        assert!(classify_command("ls -la").ast_available);
+        let long = format!("echo {}", "a".repeat(12_000));
+        let classified = classify_command(&long);
+        assert!(!classified.ast_available);
+        assert_eq!(classified.verdict, SecurityVerdict::Allow);
+    }
+
+    #[test]
+    fn classify_matches_check_command() {
+        for command in ["ls", "echo $(whoami)", "rm -rf /"] {
+            assert_eq!(
+                classify_command(command).verdict,
+                check_command(command, check_dangerous)
+            );
+        }
     }
 }

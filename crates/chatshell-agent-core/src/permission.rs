@@ -3,7 +3,13 @@
 //! Pure logic: no I/O, no UI, no clock. The host supplies the permission
 //! mode and the session grants and receives a three-valued decision
 //! (allow / deny / prompt). Precedence: hard deny (classifier blocklist)
-//! -> session-grant lookup -> mode/tier matrix -> prompt.
+//! -> `yolo` allow -> forced prompt (classifier warning, unparsed command,
+//! network egress, private-network fetch) -> session-grant lookup ->
+//! mode/tier matrix -> prompt.
+//!
+//! Forced prompts ignore session grants and never offer one: the signal
+//! that forced them is about this specific call, so an earlier approval
+//! of the same base command must not silence it.
 //!
 //! The authoritative blocklist enforcement stays inside the tool bodies
 //! (`bash_security`, `path_policy`) so it holds in every mode, including
@@ -12,6 +18,7 @@
 //! anyway.
 
 use crate::bash_security::{self, SecurityVerdict};
+use crate::net_policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -58,6 +65,30 @@ impl PermissionTier {
     }
 }
 
+/// Why a prompt is forced past session grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedPromptKind {
+    /// The bash classifier returned a `Warn` verdict (injection patterns,
+    /// `eval`, substitutions, malformed syntax, ...).
+    Security,
+    /// The AST layer could not analyze the command (too long or parser
+    /// failure), so its validators did not run.
+    Unparsed,
+    /// The command contacts a non-local host through a network client.
+    Network,
+    /// A fetch targets a private or local network address.
+    PrivateNetwork,
+}
+
+/// A prompt that session grants cannot satisfy, with the detail shown
+/// on the approval card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedPrompt {
+    pub kind: ForcedPromptKind,
+    pub detail: String,
+}
+
 /// Gate verdict for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
@@ -66,7 +97,28 @@ pub enum GateDecision {
     /// Refuse; `reason` is fed back to the model as the tool result.
     Deny { reason: String },
     /// Ask the user; `subject` is the human-readable target of the call.
-    Prompt { subject: String },
+    /// `forced` is set when a classifier signal requires this prompt
+    /// regardless of session grants; such prompts offer no grant.
+    Prompt {
+        subject: String,
+        forced: Option<ForcedPrompt>,
+    },
+}
+
+impl GateDecision {
+    fn prompt(subject: impl Into<String>) -> Self {
+        GateDecision::Prompt {
+            subject: subject.into(),
+            forced: None,
+        }
+    }
+
+    fn forced(subject: impl Into<String>, kind: ForcedPromptKind, detail: String) -> Self {
+        GateDecision::Prompt {
+            subject: subject.into(),
+            forced: Some(ForcedPrompt { kind, detail }),
+        }
+    }
 }
 
 /// What an "allow for this session" answer grants.
@@ -75,7 +127,7 @@ pub enum GrantScope {
     /// Every base command of the approved bash call (all future commands
     /// whose segments are covered by these base commands).
     BashCommands(Vec<String>),
-    /// The whole tool (edit/write only).
+    /// The whole tool (`edit`/`write`, and `kill_shell`).
     Tool(String),
     /// One tool on one MCP server. MCP grants stay this narrow on
     /// purpose: approving a benign tool must not unlock other tools or
@@ -181,9 +233,10 @@ pub fn subject_for(tool_name: &str, args: &Value) -> String {
 
 /// What an "allow for this session" answer memoizes for this call.
 ///
-/// `None` when no session grant is offered (exec tier other than bash, or
-/// an MCP call missing its server/tool args): the UI hides the session
-/// button for those.
+/// `None` when no session grant is offered (exec tier other than bash and
+/// `kill_shell`, or an MCP call missing its server/tool args): the UI
+/// hides the session button for those. Forced prompts never offer a
+/// grant either; the gate drops the scope for them.
 pub fn grant_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
     if tool_name == "bash" {
         return args
@@ -202,8 +255,32 @@ pub fn grant_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
         }
         return None;
     }
-    if matches!(PermissionTier::for_tool(tool_name), PermissionTier::Write) {
+    if tool_name == "kill_shell"
+        || matches!(PermissionTier::for_tool(tool_name), PermissionTier::Write)
+    {
         return Some(GrantScope::Tool(tool_name.to_string()));
+    }
+    None
+}
+
+/// Classifier signal that forces a bash prompt in prompting modes, most
+/// specific first: network egress, classifier warning, then an AST layer
+/// that could not run (fail closed: its validators were skipped).
+fn bash_forced_prompt(
+    command: &str,
+    classification: &bash_security::CommandClassification,
+) -> Option<(ForcedPromptKind, String)> {
+    if let Some(egress) = net_policy::detect_egress(command) {
+        return Some((ForcedPromptKind::Network, egress));
+    }
+    if let SecurityVerdict::Warn(message) = &classification.verdict {
+        return Some((ForcedPromptKind::Security, message.clone()));
+    }
+    if !classification.ast_available {
+        return Some((
+            ForcedPromptKind::Unparsed,
+            "Command could not be fully analyzed (too long or unparseable)".to_string(),
+        ));
     }
     None
 }
@@ -215,61 +292,69 @@ pub fn resolve(
     args: &Value,
     grants: &SessionGrants,
 ) -> GateDecision {
-    // Bash: hard-deny pre-check, then grants, then the mode matrix. The
-    // authoritative blocklist lives inside the bash tool; this pre-check
-    // denies before an approval prompt would be shown for a command the
-    // tool would refuse anyway.
-    if tool_name == "bash"
-        && let Some(command) = args.get("command").and_then(Value::as_str)
-    {
-        if let SecurityVerdict::Block(reason) =
-            bash_security::check_command(command, bash_security::check_dangerous)
-        {
-            return GateDecision::Deny { reason };
+    // Bash: hard-deny pre-check, then the mode, forced prompts, grants.
+    // The authoritative blocklist lives inside the bash tool; this
+    // pre-check denies before an approval prompt would be shown for a
+    // command the tool would refuse anyway. The classification is
+    // memoized, so the tool reuses it instead of re-running the pipeline.
+    if tool_name == "bash" {
+        // Bash without a command argument: let the tool itself surface
+        // the "No command provided" error instead of prompting.
+        let Some(command) = args.get("command").and_then(Value::as_str) else {
+            return GateDecision::Allow;
+        };
+        let classification = bash_security::classify_command(command);
+        if let SecurityVerdict::Block(reason) = &classification.verdict {
+            return GateDecision::Deny {
+                reason: reason.clone(),
+            };
+        }
+        if mode == PermissionMode::Yolo {
+            return GateDecision::Allow;
+        }
+        if let Some((kind, detail)) = bash_forced_prompt(command, &classification) {
+            return GateDecision::forced(command, kind, detail);
         }
         if grants.bash_command_granted(command) {
             return GateDecision::Allow;
         }
-        return match mode {
-            PermissionMode::Yolo => GateDecision::Allow,
-            PermissionMode::Ask => GateDecision::Prompt {
-                subject: command.to_string(),
-            },
-        };
+        return GateDecision::prompt(command);
     }
-    // Bash without a command argument: let the tool itself surface the
-    // "No command provided" error instead of prompting.
-    if tool_name == "bash" {
+
+    if mode == PermissionMode::Yolo {
         return GateDecision::Allow;
     }
 
+    // Read tier runs silently, except fetches into private networks.
     let tier = PermissionTier::for_tool(tool_name);
-    let needs_prompt = match mode {
-        PermissionMode::Yolo => false,
-        PermissionMode::Ask => !matches!(tier, PermissionTier::Read),
-    };
-    if !needs_prompt {
+    if matches!(tier, PermissionTier::Read) {
+        if tool_name == "web_fetch"
+            && let Some(url) = args.get("url").and_then(Value::as_str)
+            && net_policy::is_private_url(url)
+        {
+            return GateDecision::forced(
+                url,
+                ForcedPromptKind::PrivateNetwork,
+                format!("Fetch targets a private or local network address: {url}"),
+            );
+        }
         return GateDecision::Allow;
     }
-    if matches!(tier, PermissionTier::Write) {
-        if tool_name == "mcp_tool_use" {
-            // MCP grants are per server/tool pair; a call missing either
-            // arg matches no grant and falls through to a prompt
-            // (fail-safe).
-            if let (Some(server), Some(tool)) = (
-                args.get("server").and_then(Value::as_str),
-                args.get("tool").and_then(Value::as_str),
-            ) && grants.server_tool_granted(server, tool)
-            {
-                return GateDecision::Allow;
-            }
-        } else if grants.tool_granted(tool_name) {
+
+    if tool_name == "mcp_tool_use" {
+        // MCP grants are per server/tool pair; a call missing either arg
+        // matches no grant and falls through to a prompt (fail-safe).
+        if let (Some(server), Some(tool)) = (
+            args.get("server").and_then(Value::as_str),
+            args.get("tool").and_then(Value::as_str),
+        ) && grants.server_tool_granted(server, tool)
+        {
             return GateDecision::Allow;
         }
+    } else if grant_scope(tool_name, args).is_some() && grants.tool_granted(tool_name) {
+        return GateDecision::Allow;
     }
-    GateDecision::Prompt {
-        subject: subject_for(tool_name, args),
-    }
+    GateDecision::prompt(subject_for(tool_name, args))
 }
 
 #[cfg(test)]
@@ -339,16 +424,12 @@ mod tests {
         let write = json!({"path": "/tmp/a.txt", "content": "x"});
         assert_eq!(
             resolve_simple(PermissionMode::Ask, "write", write.clone()),
-            GateDecision::Prompt {
-                subject: "/tmp/a.txt".to_string()
-            }
+            GateDecision::prompt("/tmp/a.txt")
         );
         let bash = json!({"command": "cargo test"});
         assert_eq!(
             resolve_simple(PermissionMode::Ask, "bash", bash),
-            GateDecision::Prompt {
-                subject: "cargo test".to_string()
-            }
+            GateDecision::prompt("cargo test")
         );
         let read = json!({"path": "/tmp/a.txt"});
         assert_eq!(
@@ -401,9 +482,7 @@ mod tests {
                 &json!({"command": "cargo build && npm install"}),
                 &grants
             ),
-            GateDecision::Prompt {
-                subject: "cargo build && npm install".to_string()
-            }
+            GateDecision::prompt("cargo build && npm install")
         );
     }
 
@@ -427,9 +506,7 @@ mod tests {
                 &json!({"path": "/tmp/a.txt"}),
                 &grants
             ),
-            GateDecision::Prompt {
-                subject: "/tmp/a.txt".to_string()
-            }
+            GateDecision::prompt("/tmp/a.txt")
         );
     }
 
@@ -481,8 +558,12 @@ mod tests {
     }
 
     #[test]
-    fn grant_scope_none_for_exec_tools_without_bash() {
-        assert_eq!(grant_scope("kill_shell", &json!({})), None);
+    fn grant_scope_for_exec_tools_covers_bash_and_kill_shell_only() {
+        assert_eq!(
+            grant_scope("kill_shell", &json!({})),
+            Some(GrantScope::Tool("kill_shell".to_string()))
+        );
+        assert_eq!(grant_scope("some_custom_mcp_thing", &json!({})), None);
         assert_eq!(
             grant_scope("bash", &json!({"command": "git status && git push"})),
             Some(GrantScope::BashCommands(vec!["git".to_string()]))
@@ -534,5 +615,144 @@ mod tests {
                 tool: "t".to_string()
             })
         );
+    }
+
+    fn forced_kind(decision: &GateDecision) -> Option<ForcedPromptKind> {
+        match decision {
+            GateDecision::Prompt {
+                forced: Some(forced),
+                ..
+            } => Some(forced.kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn warn_verdict_forces_prompt_past_session_grant() {
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["echo"]);
+        let args = json!({"command": "echo $(whoami)"});
+        let decision = resolve(PermissionMode::Ask, "bash", &args, &grants);
+        assert_eq!(forced_kind(&decision), Some(ForcedPromptKind::Security));
+        // The same base without the flagged construct stays covered.
+        assert_eq!(
+            resolve(
+                PermissionMode::Ask,
+                "bash",
+                &json!({"command": "echo hi"}),
+                &grants
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn yolo_keeps_blocklist_floor_only() {
+        for command in [
+            "echo $(whoami)",
+            "curl https://example.com",
+            &format!("echo {}", "a".repeat(12_000)),
+        ] {
+            assert_eq!(
+                resolve_simple(PermissionMode::Yolo, "bash", json!({ "command": command })),
+                GateDecision::Allow,
+                "{command:.40}"
+            );
+        }
+    }
+
+    #[test]
+    fn unanalyzable_command_fails_closed_in_ask() {
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["echo"]);
+        let long = format!("echo {}", "a".repeat(12_000));
+        let decision = resolve(
+            PermissionMode::Ask,
+            "bash",
+            &json!({ "command": long }),
+            &grants,
+        );
+        assert_eq!(forced_kind(&decision), Some(ForcedPromptKind::Unparsed));
+    }
+
+    #[test]
+    fn malformed_syntax_forces_prompt_in_ask() {
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["echo"]);
+        let decision = resolve(
+            PermissionMode::Ask,
+            "bash",
+            &json!({"command": "echo 'unterminated"}),
+            &grants,
+        );
+        assert!(forced_kind(&decision).is_some(), "got {decision:?}");
+    }
+
+    #[test]
+    fn egress_forces_network_prompt_in_ask() {
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["curl"]);
+        let decision = resolve(
+            PermissionMode::Ask,
+            "bash",
+            &json!({"command": "curl https://example.com"}),
+            &grants,
+        );
+        assert_eq!(forced_kind(&decision), Some(ForcedPromptKind::Network));
+        // Loopback is not egress: the grant applies.
+        assert_eq!(
+            resolve(
+                PermissionMode::Ask,
+                "bash",
+                &json!({"command": "curl http://localhost:8080/health"}),
+                &grants
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn private_url_fetch_prompts_in_ask_only() {
+        let private = json!({"url": "http://192.168.1.1/"});
+        assert_eq!(
+            forced_kind(&resolve_simple(
+                PermissionMode::Ask,
+                "web_fetch",
+                private.clone()
+            )),
+            Some(ForcedPromptKind::PrivateNetwork)
+        );
+        assert_eq!(
+            resolve_simple(PermissionMode::Yolo, "web_fetch", private),
+            GateDecision::Allow
+        );
+        assert_eq!(
+            resolve_simple(
+                PermissionMode::Ask,
+                "web_fetch",
+                json!({"url": "https://example.com/"})
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn kill_shell_session_grant_silences_later_calls() {
+        let mut grants = SessionGrants::default();
+        assert!(matches!(
+            resolve(PermissionMode::Ask, "kill_shell", &json!({}), &grants),
+            GateDecision::Prompt { forced: None, .. }
+        ));
+        grants.grant_tool("kill_shell");
+        assert_eq!(
+            resolve(PermissionMode::Ask, "kill_shell", &json!({}), &grants),
+            GateDecision::Allow
+        );
+        // A tool grant never covers an unknown exec-tier tool.
+        grants.grant_tool("custom_exec");
+        assert!(matches!(
+            resolve(PermissionMode::Ask, "custom_exec", &json!({}), &grants),
+            GateDecision::Prompt { .. }
+        ));
     }
 }
