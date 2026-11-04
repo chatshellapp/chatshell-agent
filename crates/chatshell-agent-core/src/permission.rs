@@ -18,10 +18,12 @@
 //! anyway.
 
 use crate::bash_security::{self, SecurityVerdict};
+use crate::grant_keys::{self, FileTier};
 use crate::net_policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Conversation-level permission mode for the approval gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -121,35 +123,65 @@ impl GateDecision {
     }
 }
 
-/// What an "allow for this session" answer grants.
+/// What an approval grants: the session scope ("allow for this
+/// session") or the remember scope ("remember on this device").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantScope {
-    /// Every base command of the approved bash call (all future commands
-    /// whose segments are covered by these base commands).
+    /// Every segment key of the approved bash call (see
+    /// [`grant_keys::bash_grant_keys`]): `git push`, `ls`, ... All future
+    /// commands whose segments are all covered run without a prompt.
     BashCommands(Vec<String>),
-    /// The whole tool (`edit`/`write`, and `kill_shell`).
+    /// The whole tool (`edit`/`write` for the session, and `kill_shell`).
     Tool(String),
     /// One tool on one MCP server. MCP grants stay this narrow on
     /// purpose: approving a benign tool must not unlock other tools or
-    /// other servers for the session.
+    /// other servers.
     ServerTool { server: String, tool: String },
+    /// Writes to the direct entries of one directory (remembered file
+    /// grants; a whole-tool grant is too broad to keep across sessions).
+    WriteDirectory { tool: String, dir: PathBuf },
 }
 
-/// In-memory session grants ("allow for this session" answers).
+impl GrantScope {
+    /// Grant keys this scope adds to a grant set.
+    pub fn keys(&self) -> Vec<String> {
+        match self {
+            GrantScope::BashCommands(keys) => keys.iter().map(|k| format!("bash:{k}")).collect(),
+            GrantScope::Tool(tool) => vec![format!("tool:{tool}")],
+            GrantScope::ServerTool { server, tool } => vec![format!("mcp:{server}/{tool}")],
+            GrantScope::WriteDirectory { dir, .. } => {
+                vec![grant_keys::dir_key(FileTier::Write, dir)]
+            }
+        }
+    }
+}
+
+/// A set of grant keys consulted by [`resolve`].
 ///
-/// Never persisted and never synced: a grant made in one session or on
-/// one device must not take effect elsewhere.
+/// The session store keeps one per conversation in RAM; the gate merges
+/// the device's remembered keys into a snapshot before resolving. Never
+/// synced: a grant made on one device must not take effect elsewhere.
 #[derive(Debug, Default, Clone)]
 pub struct SessionGrants {
     keys: HashSet<String>,
 }
 
 impl SessionGrants {
-    /// Grant every base command of an approved bash call.
-    pub fn grant_bash_commands(&mut self, bases: &[&str]) {
-        for base in bases {
-            self.keys.insert(format!("bash:{base}"));
+    /// Grant bash segment keys (`git push`, `ls`, ...).
+    pub fn grant_bash_commands(&mut self, keys: &[&str]) {
+        for key in keys {
+            self.keys.insert(format!("bash:{key}"));
         }
+    }
+
+    /// Add every key of `scope`.
+    pub fn grant_scope(&mut self, scope: &GrantScope) {
+        self.keys.extend(scope.keys());
+    }
+
+    /// Add raw grant keys (remembered grants loaded from the device store).
+    pub fn extend_keys(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.keys.extend(keys);
     }
 
     /// Grant a whole tool for the rest of the session (write-tier tools).
@@ -162,14 +194,22 @@ impl SessionGrants {
         self.keys.insert(format!("mcp:{server}/{tool}"));
     }
 
-    /// True when every segment base command of `command` is granted. A
-    /// partial grant never authorizes a compound command.
+    /// True when every segment key of `command` is granted. A partial
+    /// grant never authorizes a compound command; an unkeyable command is
+    /// never covered.
     pub fn bash_command_granted(&self, command: &str) -> bool {
-        let bases = base_commands(command);
-        !bases.is_empty()
-            && bases
-                .iter()
-                .all(|base| self.keys.contains(&format!("bash:{base}")))
+        grant_keys::bash_grant_keys(command).is_some_and(|keys| {
+            keys.iter()
+                .all(|key| self.keys.contains(&format!("bash:{key}")))
+        })
+    }
+
+    /// True when a file grant covers a `tier` call on `path` (already
+    /// resolved with [`grant_keys::grant_path`]).
+    pub fn file_granted(&self, tier: FileTier, path: &Path) -> bool {
+        grant_keys::covering_file_keys(tier, path)
+            .iter()
+            .any(|key| self.keys.contains(key))
     }
 
     /// True when the tool was granted for the session.
@@ -191,25 +231,6 @@ impl SessionGrants {
     pub fn clear(&mut self) {
         self.keys.clear();
     }
-}
-
-/// Base commands of a (possibly compound) bash invocation: one entry per
-/// `&&`/`||`/`;`/`|` segment, wrappers stripped, first word only. Sorted
-/// and deduplicated so grant keys are stable.
-pub fn base_commands(command: &str) -> Vec<String> {
-    let mut bases: Vec<String> = bash_security::split_compound_command(command)
-        .into_iter()
-        .filter_map(|segment| {
-            let stripped = bash_security::strip_safe_wrappers(segment);
-            stripped
-                .split_whitespace()
-                .find(|word| !matches!(*word, "command" | "builtin" | "noglob" | "nocorrect"))
-        })
-        .map(str::to_string)
-        .collect();
-    bases.sort_unstable();
-    bases.dedup();
-    bases
 }
 
 /// Human-readable target of a tool call, shown in approval prompts.
@@ -242,7 +263,8 @@ pub fn grant_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
         return args
             .get("command")
             .and_then(Value::as_str)
-            .map(|command| GrantScope::BashCommands(base_commands(command)));
+            .and_then(grant_keys::bash_grant_keys)
+            .map(GrantScope::BashCommands);
     }
     if tool_name == "mcp_tool_use" {
         let server = args.get("server").and_then(Value::as_str);
@@ -261,6 +283,27 @@ pub fn grant_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
         return Some(GrantScope::Tool(tool_name.to_string()));
     }
     None
+}
+
+/// What "remember on this device" persists for this call (mode-source
+/// prompts only; the gate never offers it on forced prompts).
+///
+/// Narrower than the session scope where the session scope is too broad
+/// to keep: file tools remember writes to the target's directory (direct
+/// entries) instead of the whole tool, and only for absolute paths.
+pub fn remember_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
+    match tool_name {
+        "edit" | "write" => {
+            let path = args.get("path").and_then(Value::as_str)?;
+            let resolved = grant_keys::grant_path(path)?;
+            let dir = resolved.parent()?.to_path_buf();
+            Some(GrantScope::WriteDirectory {
+                tool: tool_name.to_string(),
+                dir,
+            })
+        }
+        _ => grant_scope(tool_name, args),
+    }
 }
 
 /// Classifier signal that forces a bash prompt in prompting modes, most
@@ -352,6 +395,12 @@ pub fn resolve(
             return GateDecision::Allow;
         }
     } else if grant_scope(tool_name, args).is_some() && grants.tool_granted(tool_name) {
+        return GateDecision::Allow;
+    } else if matches!(tool_name, "edit" | "write")
+        && let Some(path) = args.get("path").and_then(Value::as_str)
+        && let Some(resolved) = grant_keys::grant_path(path)
+        && grants.file_granted(FileTier::Write, &resolved)
+    {
         return GateDecision::Allow;
     }
     GateDecision::prompt(subject_for(tool_name, args))
@@ -465,7 +514,7 @@ mod tests {
     #[test]
     fn bash_grant_covers_single_command_but_not_compounds() {
         let mut grants = SessionGrants::default();
-        grants.grant_bash_commands(&["cargo"]);
+        grants.grant_bash_commands(&["cargo build"]);
         assert_eq!(
             resolve(
                 PermissionMode::Ask,
@@ -519,21 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn base_commands_strips_wrappers_and_splits_compounds() {
-        assert_eq!(base_commands("cargo build"), vec!["cargo".to_string()]);
-        assert_eq!(
-            base_commands("nice -n 10 cargo build"),
-            vec!["cargo".to_string()]
-        );
-        assert_eq!(base_commands("GOOS=linux go build"), vec!["go".to_string()]);
-        assert_eq!(
-            base_commands("git status && git push | tee log"),
-            vec!["git".to_string(), "tee".to_string()]
-        );
-        assert_eq!(base_commands(""), Vec::<String>::new());
-    }
-
-    #[test]
     fn subjects_cover_each_tool_family() {
         assert_eq!(
             subject_for("bash", &json!({"command": "ls"})),
@@ -566,7 +600,10 @@ mod tests {
         assert_eq!(grant_scope("some_custom_mcp_thing", &json!({})), None);
         assert_eq!(
             grant_scope("bash", &json!({"command": "git status && git push"})),
-            Some(GrantScope::BashCommands(vec!["git".to_string()]))
+            Some(GrantScope::BashCommands(vec![
+                "git push".to_string(),
+                "git status".to_string()
+            ]))
         );
         assert_eq!(
             grant_scope("edit", &json!({"path": "/tmp/a"})),
@@ -754,5 +791,116 @@ mod tests {
             resolve(PermissionMode::Ask, "custom_exec", &json!({}), &grants),
             GateDecision::Prompt { .. }
         ));
+    }
+
+    #[test]
+    fn subcommand_grant_does_not_cover_other_subcommands() {
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["git status"]);
+        let ask = |command: &str| {
+            resolve(
+                PermissionMode::Ask,
+                "bash",
+                &json!({ "command": command }),
+                &grants,
+            )
+        };
+        assert_eq!(ask("git status --short"), GateDecision::Allow);
+        assert!(matches!(
+            ask("git push --force"),
+            GateDecision::Prompt { .. }
+        ));
+        assert!(matches!(
+            ask("git -C repo push --force"),
+            GateDecision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn unkeyable_bash_offers_no_grant_and_is_never_covered() {
+        assert_eq!(
+            grant_scope("bash", &json!({"command": "git --weird push"})),
+            None
+        );
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["git push"]);
+        assert!(matches!(
+            resolve(
+                PermissionMode::Ask,
+                "bash",
+                &json!({"command": "git --weird push"}),
+                &grants
+            ),
+            GateDecision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn remembered_directory_grant_covers_direct_entries_only() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("perm-dir-grant-{}", std::process::id()));
+        let file = root.join("a.txt");
+        let scope = remember_scope("write", &json!({"path": file.to_str().unwrap()})).unwrap();
+        assert_eq!(
+            scope,
+            GrantScope::WriteDirectory {
+                tool: "write".to_string(),
+                dir: root.clone()
+            }
+        );
+        let mut grants = SessionGrants::default();
+        grants.grant_scope(&scope);
+        let call = |tool: &str, path: &std::path::Path| {
+            resolve(
+                PermissionMode::Ask,
+                tool,
+                &json!({ "path": path.to_str().unwrap() }),
+                &grants,
+            )
+        };
+        // Sibling file, either file tool: covered.
+        assert_eq!(call("edit", &root.join("b.txt")), GateDecision::Allow);
+        // Nested directory and parent directory: not covered.
+        assert!(matches!(
+            call("write", &root.join("nested").join("c.txt")),
+            GateDecision::Prompt { .. }
+        ));
+        assert!(matches!(
+            call("write", &root.with_file_name("outside.txt")),
+            GateDecision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn read_file_grant_never_covers_write() {
+        let path = std::env::temp_dir().canonicalize().unwrap().join("r.txt");
+        let mut grants = SessionGrants::default();
+        grants.extend_keys([grant_keys::file_key(FileTier::Read, &path)]);
+        assert!(matches!(
+            resolve(
+                PermissionMode::Ask,
+                "write",
+                &json!({ "path": path.to_str().unwrap() }),
+                &grants
+            ),
+            GateDecision::Prompt { .. }
+        ));
+        assert!(grants.file_granted(FileTier::Read, &path));
+    }
+
+    #[test]
+    fn remember_scope_matches_session_scope_except_file_tools() {
+        assert_eq!(
+            remember_scope("bash", &json!({"command": "cargo test"})),
+            Some(GrantScope::BashCommands(vec!["cargo test".to_string()]))
+        );
+        assert_eq!(
+            remember_scope("kill_shell", &json!({})),
+            Some(GrantScope::Tool("kill_shell".to_string()))
+        );
+        // Relative paths are never remembered.
+        assert_eq!(remember_scope("edit", &json!({"path": "src/a.rs"})), None);
     }
 }
