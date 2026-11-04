@@ -10,7 +10,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -49,16 +49,40 @@ pub trait ShellProcess: Send + 'static {
     fn wait_dead(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
+/// Everything needed to launch a shell process. The bash tool builds one
+/// per session: a sandbox wraps `program`/`args` (e.g. `sandbox-exec ...
+/// -- bash`) and env minimization replaces the inherited environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnSpec {
+    /// Executable to run (an absolute path for sandbox launchers).
+    pub program: String,
+    /// Arguments after `program`.
+    pub args: Vec<String>,
+    /// Working directory of the new process.
+    pub cwd: PathBuf,
+    /// `None`: inherit the host environment. `Some`: start from an empty
+    /// environment containing exactly these variables.
+    pub env: Option<Vec<(String, String)>>,
+}
+
+impl SpawnSpec {
+    /// Run `program` with no arguments in `cwd`, inheriting the environment.
+    pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: cwd.into(),
+            env: None,
+        }
+    }
+}
+
 /// Factory spawning shell processes.
 pub trait ShellSpawner: Send + Sync + Clone + 'static {
     type Shell: ShellProcess;
 
-    /// Spawn `program` in `cwd` with piped stdin/stdout and null stderr.
-    fn spawn(
-        &self,
-        program: &str,
-        cwd: &Path,
-    ) -> impl Future<Output = io::Result<Self::Shell>> + Send;
+    /// Spawn `spec` with piped stdin/stdout and null stderr.
+    fn spawn(&self, spec: &SpawnSpec) -> impl Future<Output = io::Result<Self::Shell>> + Send;
 }
 
 /// tokio-backed [`ShellProcess`] over a real child process.
@@ -75,9 +99,13 @@ pub struct TokioSpawner;
 impl ShellSpawner for TokioSpawner {
     type Shell = TokioShell;
 
-    async fn spawn(&self, program: &str, cwd: &Path) -> io::Result<TokioShell> {
-        let mut cmd = Command::new(program);
-        cmd.current_dir(cwd)
+    async fn spawn(&self, spec: &SpawnSpec) -> io::Result<TokioShell> {
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.args);
+        if let Some(env) = &spec.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
+        cmd.current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr is merged into stdout by the shell itself (`exec 2>&1`)

@@ -1,0 +1,579 @@
+//! OS sandbox for the bash session (macOS Seatbelt, Linux bubblewrap).
+//!
+//! [`wrap`] turns the bash [`SpawnSpec`] into one that launches bash under
+//! the platform sandbox with a fixed profile:
+//!
+//! - writes confined to the writable roots (the conversation working
+//!   directory and a per-conversation scratch directory), with the
+//!   `path_policy` home write-blocklist and each root's `.git/hooks` and
+//!   `.git/config` denied on top (code-execution vectors);
+//! - reads open except the `path_policy` read-blocklist (credential
+//!   files, `.env`-style secrets);
+//! - network limited to loopback unless `allow_network` is set.
+//!
+//! macOS: `/usr/bin/sandbox-exec` is invoked by absolute path (a `PATH`
+//! entry can never substitute it) and every path travels as a `-D`
+//! parameter; the profile text contains only constants. Each writable root
+//! carries an anchor deny on unlinking/renaming the root itself, so the
+//! carveout cannot be relocated from inside the sandbox.
+//!
+//! Linux: bubblewrap from a fixed system location; read-only bind of `/`,
+//! writable binds of the roots, masks over blocked files.
+
+use crate::grant_keys;
+use crate::path_policy;
+use crate::process_api::SpawnSpec;
+use std::path::{Path, PathBuf};
+
+/// Absolute path of the macOS sandbox launcher.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Fixed locations searched for bubblewrap (never `PATH`).
+pub const BWRAP_PATHS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
+
+/// Upper bound on entries visited when scanning writable roots for
+/// blocked file names (bubblewrap cannot mask by pattern).
+const MASK_SCAN_LIMIT: usize = 20_000;
+
+/// Directories skipped by the mask scan (large, and not where secrets live).
+const MASK_SCAN_SKIP: &[&str] = &[".git", "node_modules", "target", ".venv", "venv", "dist"];
+
+/// Repository paths under each writable root that stay read-only.
+const ROOT_PROTECTED: &[&str] = &[".git/hooks", ".git/config"];
+
+/// An available sandbox launcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxBackend {
+    /// macOS Seatbelt via [`SANDBOX_EXEC`].
+    Seatbelt,
+    /// Linux bubblewrap at this absolute path.
+    Bubblewrap(PathBuf),
+}
+
+/// The sandbox backend usable on this machine, if any.
+pub fn detect_backend() -> Option<SandboxBackend> {
+    if cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).is_file() {
+        return Some(SandboxBackend::Seatbelt);
+    }
+    if cfg!(target_os = "linux") {
+        return BWRAP_PATHS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .map(|path| SandboxBackend::Bubblewrap(path.to_path_buf()));
+    }
+    None
+}
+
+/// What the sandboxed bash may do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// Directories bash may write (each must exist).
+    pub writable_roots: Vec<PathBuf>,
+    /// Allow non-loopback network access.
+    pub allow_network: bool,
+    /// User home directory, for home-relative blocklists.
+    pub home: Option<PathBuf>,
+}
+
+/// Why a policy cannot be sandboxed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SandboxError {
+    #[error("writable root {0} is not an existing absolute directory")]
+    InvalidRoot(PathBuf),
+    #[error("refusing to make the filesystem root writable")]
+    RootIsFilesystemRoot,
+}
+
+/// Wrap `inner` (the bash launch) so it runs inside the sandbox.
+pub fn wrap(
+    backend: &SandboxBackend,
+    policy: &SandboxPolicy,
+    inner: SpawnSpec,
+) -> Result<SpawnSpec, SandboxError> {
+    let roots = canonical_roots(&policy.writable_roots)?;
+    match backend {
+        SandboxBackend::Seatbelt => Ok(seatbelt_spec(policy, &roots, inner)),
+        SandboxBackend::Bubblewrap(bwrap) => Ok(bubblewrap_spec(bwrap, policy, &roots, inner)),
+    }
+}
+
+fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, SandboxError> {
+    let mut out = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !root.is_absolute() {
+            return Err(SandboxError::InvalidRoot(root.clone()));
+        }
+        let canonical = root
+            .canonicalize()
+            .ok()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| SandboxError::InvalidRoot(root.clone()))?;
+        if canonical.parent().is_none() {
+            return Err(SandboxError::RootIsFilesystemRoot);
+        }
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    Ok(out)
+}
+
+/// A home-relative read-blocklist entry, classified.
+enum HomeEntry {
+    /// Whole path (file or directory).
+    Path(PathBuf),
+    /// Entries of `dir` whose name starts with `prefix` (`.ssh/id_`).
+    Prefix { dir: PathBuf, prefix: String },
+}
+
+fn home_read_entries(home: &Path) -> Vec<HomeEntry> {
+    path_policy::READ_BLOCKED_HOME_PREFIXES
+        .iter()
+        .map(|entry| {
+            let trimmed = entry.trim_end_matches('/');
+            if !entry.ends_with('/') && trimmed.ends_with('_') {
+                let (dir, prefix) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+                HomeEntry::Prefix {
+                    dir: home.join(dir),
+                    prefix: prefix.to_string(),
+                }
+            } else {
+                HomeEntry::Path(home.join(trimmed))
+            }
+        })
+        .collect()
+}
+
+/// Resolve a blocklist path the way the kernel will see it (`/etc` is
+/// `/private/etc` on macOS), tolerating paths that do not exist yet.
+fn resolved(path: &Path) -> PathBuf {
+    path.to_str()
+        .and_then(grant_keys::grant_path)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn write_denied_paths(home: Option<&Path>, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        for entry in path_policy::WRITE_BLOCKED_HOME {
+            paths.push(resolved(&home.join(entry.trim_end_matches('/'))));
+        }
+    }
+    for root in roots {
+        for protected in ROOT_PROTECTED {
+            paths.push(root.join(protected));
+        }
+    }
+    paths.dedup();
+    paths
+}
+
+// ---------------------------------------------------------------------------
+// macOS Seatbelt
+// ---------------------------------------------------------------------------
+
+/// Base policy: deny by default, allow what ordinary command-line tools
+/// need (process control, sysctl reads, tty/null devices, POSIX IPC, the
+/// directory/user lookup and TLS trust services).
+const SEATBELT_BASE: &str = r#"(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow user-preference-read)
+(allow file-read*)
+(allow file-read-metadata)
+(allow file-write-data file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/fd/[0-9]+$"))
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))
+(allow ipc-posix-sem)
+(allow ipc-posix-shm)
+(allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.ocspd"))
+"#;
+
+/// Network rules when non-loopback access is allowed.
+const SEATBELT_NETWORK_ON: &str = r#"(allow network*)
+(allow system-socket)
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.configd"))
+"#;
+
+/// Network rules otherwise: loopback only (local dev servers, databases).
+const SEATBELT_NETWORK_LOOPBACK: &str = r#"(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-bind (local ip "localhost:*"))
+"#;
+
+/// Escape a constant for an SBPL `#"..."` regex literal.
+fn sbpl_regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if r".^$|?*+()[]{}\".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Builds the profile text and its `-D` parameters together so every
+/// path appears only as a parameter reference.
+struct SeatbeltBuilder {
+    profile: String,
+    params: Vec<(String, PathBuf)>,
+}
+
+impl SeatbeltBuilder {
+    fn param(&mut self, prefix: &str, path: PathBuf) -> String {
+        let name = format!("{prefix}_{}", self.params.len());
+        self.params.push((name.clone(), path));
+        name
+    }
+}
+
+fn seatbelt_profile(policy: &SandboxPolicy, roots: &[PathBuf]) -> SeatbeltBuilder {
+    let mut b = SeatbeltBuilder {
+        profile: String::from(SEATBELT_BASE),
+        params: Vec::new(),
+    };
+
+    b.profile.push_str(if policy.allow_network {
+        SEATBELT_NETWORK_ON
+    } else {
+        SEATBELT_NETWORK_LOOPBACK
+    });
+
+    // Writable roots.
+    for root in roots {
+        let name = b.param("WRITABLE_ROOT", root.clone());
+        b.profile.push_str(&format!(
+            "(allow file-write* (subpath (param \"{name}\")))\n"
+        ));
+    }
+
+    // Denies come after the allows: the last matching rule wins.
+    for path in write_denied_paths(policy.home.as_deref(), roots) {
+        let name = b.param("WRITE_DENY", path);
+        b.profile.push_str(&format!(
+            "(deny file-write* (subpath (param \"{name}\")))\n"
+        ));
+    }
+    // Anchor denies: the root directory itself cannot be removed or
+    // renamed, so the carveout always names the same directory.
+    for root in roots {
+        let name = b.param("ANCHOR", root.clone());
+        b.profile.push_str(&format!(
+            "(deny file-write-unlink (literal (param \"{name}\")))\n"
+        ));
+    }
+
+    // Read blocklist.
+    if let Some(home) = &policy.home {
+        for entry in home_read_entries(home) {
+            match entry {
+                HomeEntry::Path(path) => {
+                    let name = b.param("READ_DENY", resolved(&path));
+                    b.profile
+                        .push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
+                }
+                HomeEntry::Prefix { dir, prefix } => {
+                    let name = b.param("READ_DENY_DIR", resolved(&dir));
+                    b.profile.push_str(&format!(
+                        "(deny file-read* (require-all (subpath (param \"{name}\")) \
+                         (regex #\"/{}[^/]*$\")))\n",
+                        sbpl_regex_escape(&prefix)
+                    ));
+                }
+            }
+        }
+    }
+    for absolute in path_policy::READ_BLOCKED_ABSOLUTE {
+        let name = b.param("READ_DENY", resolved(Path::new(absolute)));
+        b.profile
+            .push_str(&format!("(deny file-read* (literal (param \"{name}\")))\n"));
+    }
+    for file_name in path_policy::READ_BLOCKED_FILENAMES {
+        b.profile.push_str(&format!(
+            "(deny file-read* (regex #\"/{}$\"))\n",
+            sbpl_regex_escape(file_name)
+        ));
+    }
+    b
+}
+
+fn seatbelt_spec(policy: &SandboxPolicy, roots: &[PathBuf], inner: SpawnSpec) -> SpawnSpec {
+    let built = seatbelt_profile(policy, roots);
+    let mut args = vec!["-p".to_string(), built.profile];
+    for (name, path) in built.params {
+        args.push("-D".to_string());
+        args.push(format!("{name}={}", path.display()));
+    }
+    args.push("--".to_string());
+    args.push(inner.program);
+    args.extend(inner.args);
+    SpawnSpec {
+        program: SANDBOX_EXEC.to_string(),
+        args,
+        cwd: inner.cwd,
+        env: inner.env,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux bubblewrap
+// ---------------------------------------------------------------------------
+
+fn bubblewrap_spec(
+    bwrap: &Path,
+    policy: &SandboxPolicy,
+    roots: &[PathBuf],
+    inner: SpawnSpec,
+) -> SpawnSpec {
+    let mut args: Vec<String> = vec![
+        "--die-with-parent".into(),
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+    ];
+    let push3 = |args: &mut Vec<String>, flag: &str, a: &Path, b: &Path| {
+        args.push(flag.to_string());
+        args.push(a.display().to_string());
+        args.push(b.display().to_string());
+    };
+    for root in roots {
+        push3(&mut args, "--bind", root, root);
+    }
+    for path in write_denied_paths(policy.home.as_deref(), roots) {
+        if path.exists() {
+            push3(&mut args, "--ro-bind", &path, &path);
+        }
+    }
+    for path in bubblewrap_read_masks(policy, roots) {
+        if path.is_dir() {
+            args.push("--tmpfs".into());
+            args.push(path.display().to_string());
+        } else if path.exists() {
+            push3(&mut args, "--ro-bind", Path::new("/dev/null"), &path);
+        }
+    }
+    if !policy.allow_network {
+        args.push("--unshare-net".into());
+    }
+    args.push("--chdir".into());
+    args.push(inner.cwd.display().to_string());
+    args.push("--".into());
+    args.push(inner.program);
+    args.extend(inner.args);
+    SpawnSpec {
+        program: bwrap.display().to_string(),
+        args,
+        cwd: inner.cwd,
+        env: inner.env,
+    }
+}
+
+/// Existing paths bubblewrap must mask: home entries, absolute entries,
+/// and blocked file names found under the writable roots (bubblewrap
+/// cannot mask by pattern, so files created later are left to the
+/// in-tool `path_policy` check).
+fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut masks = Vec::new();
+    if let Some(home) = &policy.home {
+        for entry in home_read_entries(home) {
+            match entry {
+                HomeEntry::Path(path) => masks.push(path),
+                HomeEntry::Prefix { dir, prefix } => {
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        masks.extend(
+                            entries
+                                .flatten()
+                                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                                .map(|e| e.path()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    masks.extend(path_policy::READ_BLOCKED_ABSOLUTE.iter().map(PathBuf::from));
+    let mut budget = MASK_SCAN_LIMIT;
+    for root in roots {
+        scan_blocked_names(root, 0, &mut budget, &mut masks);
+    }
+    masks.sort();
+    masks.dedup();
+    masks
+}
+
+fn scan_blocked_names(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<PathBuf>) {
+    if depth > 8 || *budget == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if !MASK_SCAN_SKIP.contains(&name.as_ref()) {
+                scan_blocked_names(&entry.path(), depth + 1, budget, out);
+            }
+        } else if path_policy::READ_BLOCKED_FILENAMES.contains(&name.as_ref()) {
+            out.push(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(root: &Path, network: bool) -> SandboxPolicy {
+        SandboxPolicy {
+            writable_roots: vec![root.to_path_buf()],
+            allow_network: network,
+            home: Some(PathBuf::from("/Users/tester")),
+        }
+    }
+
+    fn inner(cwd: &Path) -> SpawnSpec {
+        SpawnSpec::new("bash", cwd)
+    }
+
+    #[test]
+    fn seatbelt_passes_paths_only_as_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let spec = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, false),
+            inner(&root),
+        )
+        .unwrap();
+        assert_eq!(spec.program, SANDBOX_EXEC);
+        let profile = &spec.args[1];
+        assert!(!profile.contains(&root.display().to_string()));
+        assert!(!profile.contains("/Users/tester"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == &format!("WRITABLE_ROOT_0={}", root.display()))
+        );
+        let dash = spec.args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(spec.args[dash + 1], "bash");
+    }
+
+    #[test]
+    fn seatbelt_network_rules_follow_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let off = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, false),
+            inner(&root),
+        )
+        .unwrap();
+        assert!(off.args[1].contains("localhost:*"));
+        assert!(!off.args[1].contains("(allow network*)"));
+        let on = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, true),
+            inner(&root),
+        )
+        .unwrap();
+        assert!(on.args[1].contains("(allow network*)"));
+    }
+
+    #[test]
+    fn seatbelt_profile_has_anchor_and_read_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let spec = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, false),
+            inner(&root),
+        )
+        .unwrap();
+        let profile = &spec.args[1];
+        assert!(profile.contains("(deny file-write-unlink (literal (param \"ANCHOR_"));
+        assert!(profile.contains(r#"(regex #"/\.env$")"#));
+        assert!(profile.contains(r#"(regex #"/id_[^/]*$")"#));
+    }
+
+    #[test]
+    fn invalid_roots_are_rejected() {
+        let backend = SandboxBackend::Seatbelt;
+        let mut p = policy(Path::new("relative"), false);
+        assert!(matches!(
+            wrap(&backend, &p, inner(Path::new("/"))),
+            Err(SandboxError::InvalidRoot(_))
+        ));
+        p.writable_roots = vec![PathBuf::from("/")];
+        assert_eq!(
+            wrap(&backend, &p, inner(Path::new("/"))),
+            Err(SandboxError::RootIsFilesystemRoot)
+        );
+        p.writable_roots = vec![PathBuf::from("/definitely/not/here")];
+        assert!(wrap(&backend, &p, inner(Path::new("/"))).is_err());
+    }
+
+    #[test]
+    fn bubblewrap_argv_binds_roots_and_masks_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/.env"), "SECRET=1").unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let spec = wrap(&backend, &policy(&root, false), inner(&root)).unwrap();
+        assert_eq!(spec.program, "/usr/bin/bwrap");
+        let args = spec.args.join(" ");
+        let root_s = root.display().to_string();
+        assert!(args.contains(&format!("--bind {root_s} {root_s}")));
+        assert!(args.contains(&format!("--ro-bind /dev/null {root_s}/app/.env")));
+        assert!(args.contains("--unshare-net"));
+        let on = wrap(&backend, &policy(&root, true), inner(&root)).unwrap();
+        assert!(!on.args.iter().any(|a| a == "--unshare-net"));
+    }
+
+    #[test]
+    fn regex_escape_covers_metacharacters() {
+        assert_eq!(sbpl_regex_escape(".env.local"), r"\.env\.local");
+        assert_eq!(sbpl_regex_escape("a+b"), r"a\+b");
+    }
+}

@@ -14,8 +14,15 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::bash_security::{self, SecurityVerdict};
-use crate::process_api::{ShellProcess, ShellSpawner, TokioSpawner};
+use crate::process_api::{ShellProcess, ShellSpawner, SpawnSpec, TokioSpawner};
+use crate::sandbox::{self, SandboxPolicy};
+use crate::shell_env;
 use crate::tool_fs::{Fs, StdFs};
+use crate::tools::bash_sandbox::{
+    BashSandbox, EscalationDecision, EscalationRequest, NOTE_NETWORK_ALLOWED,
+    NOTE_RETRIED_UNSANDBOXED, NOTE_SANDBOX_UNAVAILABLE, detect_denial, note_denied,
+};
+use std::sync::atomic::Ordering;
 
 /// Maximum output length returned to the LLM (chars)
 const MAX_OUTPUT_CHARS: usize = 20_000;
@@ -48,6 +55,9 @@ struct CommandOutput {
 
 pub struct BashSession<P: ShellProcess> {
     proc: P,
+    /// How this session was launched; a different desired launch (sandbox
+    /// toggled, network granted, env changed) respawns the session.
+    launch: SpawnSpec,
 }
 
 /// Shared session handle for a spawner `S`, used by `BashTool`,
@@ -69,12 +79,16 @@ impl<P: ShellProcess> fmt::Debug for BashSession<P> {
 }
 
 impl<P: ShellProcess> BashSession<P> {
-    async fn new<S: ShellSpawner<Shell = P>>(spawner: &S, cwd: &str) -> Result<Self, BashError> {
+    async fn new<S: ShellSpawner<Shell = P>>(
+        spawner: &S,
+        launch: SpawnSpec,
+    ) -> Result<Self, BashError> {
         let mut session = Self {
             proc: spawner
-                .spawn("bash", std::path::Path::new(cwd))
+                .spawn(&launch)
                 .await
                 .map_err(|e| BashError(format!("Failed to spawn bash: {}", e)))?,
+            launch,
         };
         session.initialize().await?;
         Ok(session)
@@ -286,6 +300,13 @@ pub struct BashTool<S: ShellSpawner = TokioSpawner> {
     project_root: Option<PathBuf>,
     #[serde(skip, default = "default_fs")]
     fs: std::sync::Arc<dyn Fs>,
+    /// `Some`: bash gets only the allowlist plus these app variables.
+    /// `None`: bash inherits the host environment.
+    #[serde(skip)]
+    env_passthrough: Option<Vec<String>>,
+    /// OS sandbox for the session; `None` runs unconfined.
+    #[serde(skip)]
+    sandbox: Option<BashSandbox>,
 }
 
 impl<S: ShellSpawner> fmt::Debug for BashTool<S> {
@@ -312,6 +333,8 @@ impl<S: ShellSpawner + Default> BashTool<S> {
             abort_notify: None,
             project_root: None,
             fs: std::sync::Arc::new(StdFs),
+            env_passthrough: None,
+            sandbox: None,
         }
     }
 
@@ -333,6 +356,18 @@ impl<S: ShellSpawner + Default> BashTool<S> {
     /// Route temp-file spill and cleanup through a custom [`Fs`].
     pub fn with_fs(mut self, fs: std::sync::Arc<dyn Fs>) -> Self {
         self.fs = fs;
+        self
+    }
+
+    /// Minimize the session environment: the allowlist plus `passthrough`.
+    pub fn with_env_passthrough(mut self, passthrough: Vec<String>) -> Self {
+        self.env_passthrough = Some(passthrough);
+        self
+    }
+
+    /// Run the session inside the OS sandbox.
+    pub fn with_sandbox(mut self, sandbox: BashSandbox) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -372,18 +407,28 @@ impl<S: ShellSpawner + Default> BashTool<S> {
     /// Ensure `*guard` contains a live session, creating one if needed.
     async fn ensure_session(
         &self,
-        guard: &mut tokio::sync::MutexGuard<'_, Option<BashSession<S::Shell>>>,
+        slot: &mut Option<BashSession<S::Shell>>,
+        launch: &SpawnSpec,
     ) -> Result<(), BashError> {
-        if let Some(ref mut s) = **guard {
-            if s.is_alive() {
+        if let Some(ref mut s) = *slot {
+            if s.is_alive() && s.launch == *launch {
                 return Ok(());
             }
-            tracing::warn!("🖥️ [bash] Session died, creating a new one");
+            if s.is_alive() {
+                tracing::info!("🖥️ [bash] Launch settings changed, restarting session");
+                s.kill().await;
+            } else {
+                tracing::warn!("🖥️ [bash] Session died, creating a new one");
+            }
+            *slot = None;
         }
 
-        let cwd = self.resolve_cwd();
-        tracing::info!("🖥️ [bash] Starting persistent session in: {}", cwd);
-        **guard = Some(BashSession::new(&self.spawner, &cwd).await?);
+        tracing::info!(
+            "🖥️ [bash] Starting persistent session in: {} (program {})",
+            launch.cwd.display(),
+            launch.program
+        );
+        *slot = Some(BashSession::new(&self.spawner, launch.clone()).await?);
         Ok(())
     }
 
@@ -581,101 +626,21 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             command.to_string()
         };
 
-        // --- ensure session ---
-        self.ensure_session(&mut guard).await?;
-
         let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, 600);
+        let timeout = Duration::from_secs(timeout_secs);
+        let warn_prefix = security_warning
+            .as_ref()
+            .map(|w| format!("{}\n", w))
+            .unwrap_or_default();
 
-        let session = guard.as_mut().unwrap();
-        let result = if let Some(ref abort) = self.abort_notify {
-            tokio::select! {
-                biased;
-                _ = abort.notified() => {
-                    tracing::info!("🛑 [bash] Command aborted: generation was stopped");
-                    if let Some(mut s) = guard.take() {
-                        s.kill().await;
-                    }
-                    Err(BashError("Command aborted: generation was stopped.".into()))
-                }
-                r = session.execute(&effective_command, Duration::from_secs(timeout_secs)) => r,
-            }
-        } else {
-            session
-                .execute(&effective_command, Duration::from_secs(timeout_secs))
-                .await
-        };
+        // --- ensure session (respawned when the launch config changed) ---
+        let launch = self.launch()?;
+        self.ensure_session(&mut guard, &launch.spec).await?;
+        let mut notes: Vec<String> = launch.note.into_iter().collect();
 
-        match result {
-            Ok(cmd) => {
-                tracing::info!(
-                    "🔧 [tool-result] bash: exit_code={} output_len={}",
-                    cmd.exit_code,
-                    cmd.output.len()
-                );
-
-                let (text, temp_file) = Self::smart_truncate(cmd.output.trim_end());
-                if let Some(ref path_str) = temp_file
-                    && let Ok(mut files) = self.temp_files.lock()
-                {
-                    files.push(PathBuf::from(path_str));
-                }
-                let file_notice = temp_file
-                    .map(|p| {
-                        format!(
-                            "\n[full output saved to {} -- use the read tool to view]",
-                            p
-                        )
-                    })
-                    .unwrap_or_default();
-
-                let warn_prefix = security_warning
-                    .as_ref()
-                    .map(|w| format!("{}\n", w))
-                    .unwrap_or_default();
-
-                let timeout_note = if cmd.timed_out {
-                    format!(
-                        "[command timed out after {}s — session was reset; \
-                         partial output below (the command may still have been running)]\n",
-                        timeout_secs
-                    )
-                } else {
-                    String::new()
-                };
-                let capture_note = if cmd.capture_truncated {
-                    format!("\n[output capture stopped at {} bytes]", MAX_CAPTURE_BYTES)
-                } else {
-                    String::new()
-                };
-
-                if cmd.timed_out {
-                    return Ok(format!(
-                        "{}{}{}{}{}",
-                        warn_prefix, timeout_note, text, capture_note, file_notice
-                    ));
-                }
-
-                if cmd.exit_code == 0 {
-                    if text.is_empty() {
-                        Ok(format!("{}(no output){}", warn_prefix, capture_note))
-                    } else {
-                        Ok(format!(
-                            "{}{}{}{}",
-                            warn_prefix, text, capture_note, file_notice
-                        ))
-                    }
-                } else if text.is_empty() {
-                    Ok(format!(
-                        "{}[exit code: {}]{}{}",
-                        warn_prefix, cmd.exit_code, capture_note, file_notice
-                    ))
-                } else {
-                    Ok(format!(
-                        "{}[exit code: {}]\n{}{}{}",
-                        warn_prefix, cmd.exit_code, text, capture_note, file_notice
-                    ))
-                }
-            }
+        let result = self.run_in(&mut guard, &effective_command, timeout).await;
+        let mut cmd = match result {
+            Ok(cmd) => cmd,
             Err(e) => {
                 // Mark the session dead so it gets recreated next time.
                 if let Some(ref mut s) = *guard
@@ -684,8 +649,237 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
                     tracing::warn!("🖥️ [bash] Session dead after error, will recreate");
                     *guard = None;
                 }
-                Err(e)
+                return Err(e);
             }
+        };
+
+        // --- sandbox escalation ---
+        if launch.sandboxed
+            && !cmd.timed_out
+            && cmd.exit_code != 0
+            && let Some(sandbox) = &self.sandbox
+            && let Some((kind, detail)) =
+                detect_denial(&cmd.output, sandbox.network_allowed.load(Ordering::SeqCst))
+        {
+            tracing::info!("🛡️ [bash] Sandbox denial ({kind:?}): {detail}");
+            let decision = match &sandbox.escalator {
+                Some(escalator) => Some(
+                    escalator
+                        .escalate(EscalationRequest {
+                            command: command.to_string(),
+                            kind,
+                            detail,
+                        })
+                        .await,
+                ),
+                None => None,
+            };
+            match decision {
+                Some(EscalationDecision::RetryUnsandboxed) => {
+                    let spec = self.launch_spec(None)?.spec;
+                    let mut once: Option<BashSession<S::Shell>> =
+                        Some(BashSession::new(&self.spawner, spec).await?);
+                    let rerun = self.run_in(&mut once, &effective_command, timeout).await;
+                    if let Some(mut session) = once.take() {
+                        session.kill().await;
+                    }
+                    cmd = rerun?;
+                    notes.push(NOTE_RETRIED_UNSANDBOXED.to_string());
+                }
+                Some(EscalationDecision::AllowNetworkSession) => {
+                    sandbox.network_allowed.store(true, Ordering::SeqCst);
+                    let relaunch = self.launch()?;
+                    self.ensure_session(&mut guard, &relaunch.spec).await?;
+                    match self.run_in(&mut guard, &effective_command, timeout).await {
+                        Ok(rerun) => cmd = rerun,
+                        Err(e) => {
+                            *guard = None;
+                            return Err(e);
+                        }
+                    }
+                    notes.push(NOTE_NETWORK_ALLOWED.to_string());
+                }
+                Some(EscalationDecision::Deny) => notes.push(note_denied(kind, true)),
+                None => notes.push(note_denied(kind, false)),
+            }
+        }
+
+        // --- withheld-variable hint (env minimization) ---
+        if !cmd.timed_out
+            && cmd.exit_code != 0
+            && let Some(passthrough) = &self.env_passthrough
+            && let Some(hint) = shell_env::missing_variable_hint(&cmd.output, passthrough, |name| {
+                std::env::var(name).ok()
+            })
+        {
+            notes.push(hint);
+        }
+
+        Ok(self.render(cmd, timeout_secs, &warn_prefix, &notes))
+    }
+}
+
+/// How the tool will launch its session, and what to tell the model
+/// about it.
+struct Launch {
+    spec: SpawnSpec,
+    sandboxed: bool,
+    note: Option<String>,
+}
+
+impl<S: ShellSpawner + Default> BashTool<S> {
+    /// Launch spec for the session under the current settings.
+    fn launch(&self) -> Result<Launch, BashError> {
+        self.launch_spec(self.sandbox.as_ref())
+    }
+
+    /// Launch spec with `sandbox` applied (`None`: unconfined, still with
+    /// the minimized environment).
+    fn launch_spec(&self, sandbox: Option<&BashSandbox>) -> Result<Launch, BashError> {
+        let cwd = self.resolve_cwd();
+        let mut spec = SpawnSpec::new("bash", &cwd);
+        if let Some(passthrough) = &self.env_passthrough {
+            spec.env = Some(shell_env::minimized_env(passthrough, |name| {
+                std::env::var(name).ok()
+            }));
+        }
+        let Some(sandbox) = sandbox else {
+            return Ok(Launch {
+                spec,
+                sandboxed: false,
+                note: None,
+            });
+        };
+        let Some(backend) = &sandbox.backend else {
+            return Ok(Launch {
+                spec,
+                sandboxed: false,
+                note: Some(NOTE_SANDBOX_UNAVAILABLE.to_string()),
+            });
+        };
+        std::fs::create_dir_all(&sandbox.scratch_dir).map_err(|e| {
+            BashError(format!(
+                "Sandbox could not start: cannot create scratch directory {}: {e}",
+                sandbox.scratch_dir.display()
+            ))
+        })?;
+        if let Some(env) = spec.env.as_mut() {
+            env.retain(|(name, _)| name != "TMPDIR");
+            env.push((
+                "TMPDIR".to_string(),
+                sandbox.scratch_dir.display().to_string(),
+            ));
+        }
+        // Writable: the explicit working directory (never the home
+        // fallback) plus the scratch directory.
+        let mut writable_roots: Vec<PathBuf> = self.default_cwd.iter().map(PathBuf::from).collect();
+        writable_roots.push(sandbox.scratch_dir.clone());
+        let policy = SandboxPolicy {
+            writable_roots,
+            allow_network: sandbox.network_allowed.load(Ordering::SeqCst),
+            home: dirs::home_dir(),
+        };
+        let spec = sandbox::wrap(backend, &policy, spec)
+            .map_err(|e| BashError(format!("Sandbox could not start: {e}")))?;
+        Ok(Launch {
+            spec,
+            sandboxed: true,
+            note: None,
+        })
+    }
+
+    /// Run one command in `slot`'s session, honoring the abort signal
+    /// (abort kills the session and empties the slot).
+    async fn run_in(
+        &self,
+        slot: &mut Option<BashSession<S::Shell>>,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutput, BashError> {
+        let session = slot
+            .as_mut()
+            .ok_or_else(|| BashError("Session not started".into()))?;
+        let Some(abort) = &self.abort_notify else {
+            return session.execute(command, timeout).await;
+        };
+        let aborted = tokio::select! {
+            biased;
+            _ = abort.notified() => true,
+            r = session.execute(command, timeout) => return r,
+        };
+        debug_assert!(aborted);
+        tracing::info!("🛑 [bash] Command aborted: generation was stopped");
+        if let Some(mut s) = slot.take() {
+            s.kill().await;
+        }
+        Err(BashError("Command aborted: generation was stopped.".into()))
+    }
+
+    /// Format a command result for the model.
+    fn render(
+        &self,
+        cmd: CommandOutput,
+        timeout_secs: u64,
+        warn_prefix: &str,
+        notes: &[String],
+    ) -> String {
+        tracing::info!(
+            "🔧 [tool-result] bash: exit_code={} output_len={}",
+            cmd.exit_code,
+            cmd.output.len()
+        );
+
+        let (text, temp_file) = Self::smart_truncate(cmd.output.trim_end());
+        if let Some(ref path_str) = temp_file
+            && let Ok(mut files) = self.temp_files.lock()
+        {
+            files.push(PathBuf::from(path_str));
+        }
+        let file_notice = temp_file
+            .map(|p| {
+                format!(
+                    "\n[full output saved to {} -- use the read tool to view]",
+                    p
+                )
+            })
+            .unwrap_or_default();
+        let notes_prefix: String = notes.iter().map(|note| format!("{note}\n")).collect();
+        let warn_prefix = format!("{warn_prefix}{notes_prefix}");
+
+        let capture_note = if cmd.capture_truncated {
+            format!("\n[output capture stopped at {} bytes]", MAX_CAPTURE_BYTES)
+        } else {
+            String::new()
+        };
+
+        if cmd.timed_out {
+            let timeout_note = format!(
+                "[command timed out after {}s — session was reset; \
+                 partial output below (the command may still have been running)]\n",
+                timeout_secs
+            );
+            return format!(
+                "{}{}{}{}{}",
+                warn_prefix, timeout_note, text, capture_note, file_notice
+            );
+        }
+
+        if cmd.exit_code == 0 {
+            if text.is_empty() {
+                format!("{}(no output){}", warn_prefix, capture_note)
+            } else {
+                format!("{}{}{}{}", warn_prefix, text, capture_note, file_notice)
+            }
+        } else if text.is_empty() {
+            format!(
+                "{}[exit code: {}]{}{}",
+                warn_prefix, cmd.exit_code, capture_note, file_notice
+            )
+        } else {
+            format!(
+                "{}[exit code: {}]\n{}{}{}",
+                warn_prefix, cmd.exit_code, text, capture_note, file_notice
+            )
         }
     }
 }
@@ -753,7 +947,9 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_returns_partial_output() {
-        let mut session = BashSession::new(&TokioSpawner, "/tmp").await.unwrap();
+        let mut session = BashSession::new(&TokioSpawner, SpawnSpec::new("bash", "/tmp"))
+            .await
+            .unwrap();
 
         let out = session
             .execute(
@@ -775,7 +971,9 @@ mod tests {
 
     #[tokio::test]
     async fn fast_command_still_reports_exit_code() {
-        let mut session = BashSession::new(&TokioSpawner, "/tmp").await.unwrap();
+        let mut session = BashSession::new(&TokioSpawner, SpawnSpec::new("bash", "/tmp"))
+            .await
+            .unwrap();
         let out = session
             .execute("echo ok; (exit 3)", Duration::from_secs(10))
             .await

@@ -6,6 +6,7 @@
 //! by a background task to prevent resource leaks.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,20 @@ pub(crate) type BashAbortHandle = Arc<tokio::sync::Notify>;
 struct SessionEntry {
     session: SharedBashSession,
     abort_handle: BashAbortHandle,
+    /// "Allow network this session" sandbox escalation flag.
+    network_allowed: Arc<AtomicBool>,
     last_used_at: Instant,
+}
+
+impl SessionEntry {
+    fn new() -> Self {
+        Self {
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+            abort_handle: Arc::new(tokio::sync::Notify::new()),
+            network_allowed: Arc::new(AtomicBool::new(false)),
+            last_used_at: Instant::now(),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -47,13 +61,27 @@ impl BashSessionManager {
         let mut map = self.sessions.lock().unwrap();
         let entry = map
             .entry(conversation_id.to_string())
-            .or_insert_with(|| SessionEntry {
-                session: Arc::new(tokio::sync::Mutex::new(None)),
-                abort_handle: Arc::new(tokio::sync::Notify::new()),
-                last_used_at: Instant::now(),
-            });
+            .or_insert_with(SessionEntry::new);
         entry.last_used_at = Instant::now();
         (entry.session.clone(), entry.abort_handle.clone())
+    }
+
+    /// The conversation's "allow network this session" sandbox flag
+    /// (created with the session entry, dropped with it).
+    pub fn network_flag(&self, conversation_id: &str) -> Arc<AtomicBool> {
+        let mut map = self.sessions.lock().unwrap();
+        map.entry(conversation_id.to_string())
+            .or_insert_with(SessionEntry::new)
+            .network_allowed
+            .clone()
+    }
+
+    /// Withdraw a network escalation (permission mode switched). The next
+    /// command respawns the session without network.
+    pub fn reset_network(&self, conversation_id: &str) {
+        if let Some(entry) = self.sessions.lock().unwrap().get(conversation_id) {
+            entry.network_allowed.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Signal the abort handle for the given conversation so that a running
@@ -180,6 +208,20 @@ mod tests {
             !Arc::ptr_eq(&session_a, &session_c),
             "conversations must not share sessions"
         );
+    }
+
+    #[test]
+    fn network_flag_is_per_conversation_and_resettable() {
+        let manager = BashSessionManager::new();
+        let flag = manager.network_flag("conv-1");
+        flag.store(true, Ordering::SeqCst);
+        assert!(manager.network_flag("conv-1").load(Ordering::SeqCst));
+        assert!(!manager.network_flag("conv-2").load(Ordering::SeqCst));
+        manager.reset_network("conv-1");
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        manager.remove("conv-1");
+        assert!(!manager.network_flag("conv-1").load(Ordering::SeqCst));
     }
 
     #[tokio::test]

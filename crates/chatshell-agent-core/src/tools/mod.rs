@@ -6,6 +6,7 @@
 //! surface the schemas to client-side tool callers (iOS).
 
 pub mod bash;
+pub mod bash_sandbox;
 pub mod bash_session_manager;
 pub mod edit;
 pub mod glob;

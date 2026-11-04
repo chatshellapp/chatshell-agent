@@ -20,6 +20,8 @@ pub mod permission_store;
 pub mod process_api;
 pub mod provider_catalog;
 pub mod provider_registry;
+pub mod sandbox;
+pub mod shell_env;
 pub mod snapcompact;
 pub mod svg_figure;
 pub mod sync;

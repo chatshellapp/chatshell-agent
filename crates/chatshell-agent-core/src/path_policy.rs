@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 /// Home-relative path prefixes that must never be read.
-const READ_BLOCKED_HOME_PREFIXES: &[&str] = &[
+pub(crate) const READ_BLOCKED_HOME_PREFIXES: &[&str] = &[
     ".ssh/id_",
     ".ssh/id_rsa",
     ".ssh/id_ed25519",
@@ -28,10 +28,11 @@ const READ_BLOCKED_HOME_PREFIXES: &[&str] = &[
 ];
 
 /// Absolute path prefixes that must never be read.
-const READ_BLOCKED_ABSOLUTE: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/master.passwd"];
+pub(crate) const READ_BLOCKED_ABSOLUTE: &[&str] =
+    &["/etc/shadow", "/etc/gshadow", "/etc/master.passwd"];
 
 /// Filenames (basename) that must never be read regardless of location.
-const READ_BLOCKED_FILENAMES: &[&str] = &[
+pub(crate) const READ_BLOCKED_FILENAMES: &[&str] = &[
     ".env",
     ".env.local",
     ".env.production",
@@ -62,7 +63,7 @@ const WRITE_BLOCKED_REPO_PREFIXES: &[&str] = &[
 ];
 
 /// Home-relative paths that must never be written.
-const WRITE_BLOCKED_HOME: &[&str] = &[
+pub(crate) const WRITE_BLOCKED_HOME: &[&str] = &[
     ".bashrc",
     ".zshrc",
     ".profile",
