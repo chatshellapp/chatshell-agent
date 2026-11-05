@@ -21,8 +21,8 @@
 //! moving it back fails at the first step.
 //!
 //! Linux: bubblewrap from a fixed system location; read-only bind of `/`,
-//! writable binds of the roots, masks over blocked files, and private pid
-//! and session namespaces. A `.git` directory is bound onto itself so it
+//! writable binds of the roots, masks over blocked files, a private pid
+//! namespace, and a new session (no controlling terminal). A `.git` directory is bound onto itself so it
 //! becomes a mount point, which the kernel refuses to rename or remove
 //! (`EBUSY`); a `.git` file (worktree pointer) is bound read-only. A
 //! symlinked or absent `.git` cannot be anchored by bubblewrap and is
@@ -111,6 +111,7 @@ fn bubblewrap_works(bwrap: &Path) -> bool {
             "--proc",
             "/proc",
             "--unshare-net",
+            "--new-session",
             "--",
             true_bin,
         ])
@@ -229,6 +230,15 @@ fn home_write_denied_paths(home: Option<&Path>) -> Vec<PathBuf> {
 /// Base policy: deny by default, allow what ordinary command-line tools
 /// need (process control, sysctl reads, tty/null devices, POSIX IPC, the
 /// directory/user lookup and TLS trust services).
+///
+/// Another process's argv and environment (`kern.procargs2`, the `ps eww`
+/// path) are readable if either the sysctl or `process-info-pidinfo` is
+/// allowed, and `(deny default)` does not cover pidinfo. Both are denied
+/// and pidinfo is re-allowed only inside the sandbox, so environments of
+/// processes outside it (which carry API keys) stay unreadable.
+///
+/// The keychain's `com.apple.SecurityServer` service is not reachable:
+/// file denies do not stop keychain IPC.
 const SEATBELT_BASE: &str = r#"(version 1)
 (deny default)
 (allow process-exec)
@@ -236,6 +246,9 @@ const SEATBELT_BASE: &str = r#"(version 1)
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
 (allow sysctl-read)
+(deny sysctl-read (sysctl-name-regex #"procargs"))
+(deny process-info-pidinfo)
+(allow process-info-pidinfo (target same-sandbox))
 (allow user-preference-read)
 (allow file-read*)
 (allow file-read-metadata)
@@ -260,7 +273,6 @@ const SEATBELT_BASE: &str = r#"(version 1)
   (global-name "com.apple.logd")
   (global-name "com.apple.cfprefsd.daemon")
   (global-name "com.apple.cfprefsd.agent")
-  (global-name "com.apple.SecurityServer")
   (global-name "com.apple.trustd.agent")
   (global-name "com.apple.ocspd"))
 "#;
@@ -434,6 +446,10 @@ fn bubblewrap_spec(
         "--unshare-pid".into(),
         "--proc".into(),
         "/proc".into(),
+        // A new session detaches bash from the app's controlling
+        // terminal: no TIOCSTI keystroke injection into it, and no
+        // signals to its foreground process group.
+        "--new-session".into(),
     ];
     let push3 = |args: &mut Vec<String>, flag: &str, a: &Path, b: &Path| {
         args.push(flag.to_string());
@@ -743,6 +759,40 @@ mod tests {
         let pid = spec.args.iter().position(|a| a == "--unshare-pid").unwrap();
         let proc = spec.args.iter().position(|a| a == "--proc").unwrap();
         assert!(pid < proc);
+    }
+
+    #[test]
+    fn seatbelt_hides_other_process_environments_and_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let spec = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, true),
+            inner(&root),
+        )
+        .unwrap();
+        let profile = &spec.args[1];
+        let allow = profile.find("(allow sysctl-read)\n").unwrap();
+        let deny = profile
+            .find(r#"(deny sysctl-read (sysctl-name-regex #"procargs"))"#)
+            .expect("procargs deny");
+        let pid_deny = profile.find("(deny process-info-pidinfo)").unwrap();
+        let pid_allow = profile
+            .find("(allow process-info-pidinfo (target same-sandbox))")
+            .unwrap();
+        assert!(allow < deny && pid_deny < pid_allow);
+        assert!(!profile.contains("com.apple.SecurityServer"));
+    }
+
+    #[test]
+    fn bubblewrap_starts_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let spec = wrap(&backend, &policy(&root, false), inner(&root)).unwrap();
+        let session = spec.args.iter().position(|a| a == "--new-session");
+        let dash = spec.args.iter().position(|a| a == "--").unwrap();
+        assert!(session.is_some_and(|at| at < dash), "{:?}", spec.args);
     }
 
     #[test]

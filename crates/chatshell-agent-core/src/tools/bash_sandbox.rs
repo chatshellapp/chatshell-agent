@@ -497,6 +497,74 @@ mod os_sandbox_integration {
         assert!(out.contains("unsignalable"), "{out}");
     }
 
+    /// Reads another process's argv and environment through
+    /// `sysctl(KERN_PROCARGS2)`, the call behind `ps eww`.
+    const PROCARGS_PROBE: &str = r#"
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))
+size = ctypes.c_size_t(1 << 20)
+buf = ctypes.create_string_buffer(size.value)
+if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+    print("procargs-denied")
+elif b"CARGO_MANIFEST_DIR=" in buf.raw[: size.value]:
+    print("procargs-leaked")
+else:
+    print("procargs-empty")
+"#;
+
+    #[tokio::test]
+    async fn other_process_environments_are_unreadable() {
+        if !cfg!(target_os = "macos") || std::env::var("CARGO_MANIFEST_DIR").is_err() {
+            return;
+        }
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        std::fs::write(f.root.join("probe.py"), PROCARGS_PROBE).unwrap();
+        let has_python = run(&f.tool, "command -v python3 >/dev/null && echo py-ok").await;
+        if !has_python.contains("py-ok") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Control: outside the sandbox the probe sees this test process's
+        // environment (an unsigned binary started by cargo).
+        let host_pid = std::process::id();
+        let control = std::process::Command::new("python3")
+            .args(["-I", "probe.py", &host_pid.to_string()])
+            .current_dir(&f.root)
+            .output()
+            .unwrap();
+        let control = String::from_utf8_lossy(&control.stdout);
+        assert!(control.contains("procargs-leaked"), "control: {control}");
+        let out = run(&f.tool, &format!("python3 -I probe.py {host_pid}")).await;
+        assert!(out.contains("procargs-denied"), "{out}");
+        // Processes inside the sandbox stay inspectable.
+        let out = run(
+            &f.tool,
+            "CARGO_MANIFEST_DIR=x bash -c 'python3 -I probe.py $$'",
+        )
+        .await;
+        assert!(out.contains("procargs-leaked"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn tls_works_without_the_keychain_service() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        f.network.store(true, Ordering::SeqCst);
+        let out = run(
+            &f.tool,
+            "curl -sS --max-time 15 https://example.com -o /dev/null && echo curl-ok; \
+             git ls-remote https://github.com/git/git HEAD >/dev/null && echo git-ok",
+        )
+        .await;
+        assert!(out.contains("curl-ok"), "{out}");
+        assert!(out.contains("git-ok"), "{out}");
+        assert!(requests(&f).is_empty(), "{out}");
+    }
+
     #[tokio::test]
     async fn network_is_blocked_and_escalates_as_network() {
         let Some(f) = fixture(EscalationDecision::Deny) else {
