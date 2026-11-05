@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod context_pruning;
 pub mod crypto;
 pub mod edit_anchor;
+pub mod file_history;
 pub mod fuzzy_match;
 pub mod grant_keys;
 pub mod history;

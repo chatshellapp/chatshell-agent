@@ -35,6 +35,9 @@ pub struct WriteTool {
     project_root: Option<PathBuf>,
     #[serde(skip, default = "default_fs")]
     fs: Arc<dyn Fs>,
+    /// Records each file's state before the turn's first write to it.
+    #[serde(skip)]
+    history: Option<Arc<crate::file_history::FileHistory>>,
 }
 
 impl Default for WriteTool {
@@ -48,6 +51,7 @@ impl WriteTool {
         Self {
             project_root: None,
             fs: Arc::new(StdFs),
+            history: None,
         }
     }
 
@@ -61,6 +65,12 @@ impl WriteTool {
     /// Route IO through a custom [`Fs`] implementation.
     pub fn with_fs(mut self, fs: Arc<dyn Fs>) -> Self {
         self.fs = fs;
+        self
+    }
+
+    /// Back up files before this turn's first write to them.
+    pub fn with_file_history(mut self, history: Arc<crate::file_history::FileHistory>) -> Self {
+        self.history = Some(history);
         self
     }
 }
@@ -212,6 +222,9 @@ impl Tool for WriteTool {
                 .map_err(|e| WriteError(format!("Failed to create directories: {}", e)))?;
         }
 
+        if let Some(history) = &self.history {
+            history.capture(path);
+        }
         fs.write(path, args.content.as_bytes())
             .map_err(|e| WriteError(format!("Failed to write file: {}", e)))?;
 
