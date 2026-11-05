@@ -18,23 +18,12 @@ use crate::process_api::{ShellProcess, ShellSpawner, SpawnSpec, TokioSpawner};
 use crate::sandbox::{self, SandboxPolicy};
 use crate::shell_env;
 use crate::tool_fs::{Fs, StdFs};
+use crate::tools::bash_output::{Captured, OutputCapture, SpillTarget, spill_notice};
 use crate::tools::bash_sandbox::{
     BashSandbox, EscalationDecision, EscalationRequest, NOTE_NETWORK_ALLOWED,
     NOTE_RETRIED_UNSANDBOXED, NOTE_SANDBOX_UNAVAILABLE, detect_denial, note_denied,
 };
 use std::sync::atomic::Ordering;
-
-/// Maximum output length returned to the LLM (chars)
-const MAX_OUTPUT_CHARS: usize = 20_000;
-
-/// Characters kept from the start when truncating
-const TRUNCATE_HEAD_CHARS: usize = 5_000;
-
-/// Characters kept from the end when truncating
-const TRUNCATE_TAIL_CHARS: usize = 10_000;
-
-/// Stop accumulating output beyond this to prevent OOM
-const MAX_CAPTURE_BYTES: usize = 100_000;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
@@ -43,14 +32,12 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 // ---------------------------------------------------------------------------
 
 struct CommandOutput {
-    output: String,
+    captured: Captured,
     exit_code: i32,
-    /// True when the command exceeded its timeout: `output` is the partial
-    /// capture and `exit_code` is meaningless. The session was killed and
-    /// will be recreated on the next call.
+    /// True when the command exceeded its timeout: `captured` is the
+    /// partial capture and `exit_code` is meaningless. The session was
+    /// killed and will be recreated on the next call.
     timed_out: bool,
-    /// True when capture stopped at [`MAX_CAPTURE_BYTES`].
-    capture_truncated: bool,
 }
 
 pub struct BashSession<P: ShellProcess> {
@@ -149,6 +136,7 @@ impl<P: ShellProcess> BashSession<P> {
         &mut self,
         command: &str,
         timeout: Duration,
+        spill: Option<SpillTarget>,
     ) -> Result<CommandOutput, BashError> {
         let marker = Self::make_marker("DONE");
 
@@ -165,60 +153,58 @@ impl<P: ShellProcess> BashSession<P> {
             .await
             .map_err(|e| BashError(format!("Flush failed: {}", e)))?;
 
-        // `output`/`capture_truncated` stay owned by this frame; the timeout
-        // future only borrows them, so a timeout keeps the partial capture.
-        let mut output = String::new();
-        let mut capture_truncated = false;
+        // The capture stays owned by this frame; the timeout future only
+        // borrows it, so a timeout keeps the partial capture.
+        let mut capture = OutputCapture::new(spill);
 
-        let result: Result<Result<(String, i32), BashError>, _> =
-            tokio::time::timeout(timeout, async {
-                let mut buf = Vec::new();
-                loop {
-                    buf.clear();
-                    let n = self
-                        .proc
-                        .read_line(&mut buf)
-                        .await
-                        .map_err(|e| BashError(format!("Read failed: {}", e)))?;
-                    if n == 0 {
-                        return Err(BashError("Session ended unexpectedly".into()));
-                    }
-
-                    let line = String::from_utf8_lossy(&buf);
-
-                    if let Some(rest) = line.strip_prefix(marker.as_str()) {
-                        let exit_code = rest.trim().parse::<i32>().unwrap_or(-1);
-                        return Ok((std::mem::take(&mut output), exit_code));
-                    }
-
-                    if !capture_truncated {
-                        output.push_str(&line);
-                        if output.len() > MAX_CAPTURE_BYTES {
-                            capture_truncated = true;
-                        }
-                    }
+        let result: Result<Result<i32, BashError>, _> = tokio::time::timeout(timeout, async {
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let n = self
+                    .proc
+                    .read_line(&mut buf)
+                    .await
+                    .map_err(|e| BashError(format!("Read failed: {}", e)))?;
+                if n == 0 {
+                    return Err(BashError("Session ended unexpectedly".into()));
                 }
-            })
-            .await;
+
+                let line = String::from_utf8_lossy(&buf);
+
+                if let Some(rest) = line.strip_prefix(marker.as_str()) {
+                    return Ok(rest.trim().parse::<i32>().unwrap_or(-1));
+                }
+
+                capture.push(&line);
+            }
+        })
+        .await;
 
         match result {
-            Ok(Ok((captured, exit_code))) => Ok(CommandOutput {
-                output: captured,
+            Ok(Ok(exit_code)) => Ok(CommandOutput {
+                captured: capture.finish(),
                 exit_code,
                 timed_out: false,
-                capture_truncated,
             }),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // Close (and drop) any partial spill file.
+                if let Some(spill) = capture.finish().spill
+                    && spill.temporary
+                {
+                    let _ = std::fs::remove_file(&spill.path);
+                }
+                Err(e)
+            }
             Err(_) => {
                 // Kill the process to free resources; session will be recreated.
                 // The partial capture survives and is returned to the caller:
                 // a timeout is a labeled partial, not a hard failure.
                 self.proc.kill().await;
                 Ok(CommandOutput {
-                    output: std::mem::take(&mut output),
+                    captured: capture.finish(),
                     exit_code: -1,
                     timed_out: true,
-                    capture_truncated,
                 })
             }
         }
@@ -319,6 +305,9 @@ pub struct BashTool<S: ShellSpawner = TokioSpawner> {
     /// OS sandbox for the session; `None` runs unconfined.
     #[serde(skip)]
     sandbox: Option<BashSandbox>,
+    /// Where output past the inline cap streams to.
+    #[serde(skip, default = "SpillTarget::temp")]
+    spill: SpillTarget,
 }
 
 impl<S: ShellSpawner> fmt::Debug for BashTool<S> {
@@ -347,6 +336,7 @@ impl<S: ShellSpawner + Default> BashTool<S> {
             fs: std::sync::Arc::new(StdFs),
             env_passthrough: None,
             sandbox: None,
+            spill: SpillTarget::temp(),
         }
     }
 
@@ -374,6 +364,13 @@ impl<S: ShellSpawner + Default> BashTool<S> {
     /// Minimize the session environment: the allowlist plus `passthrough`.
     pub fn with_env_passthrough(mut self, passthrough: Vec<String>) -> Self {
         self.env_passthrough = Some(passthrough);
+        self
+    }
+
+    /// Stream output past the inline cap to `target` (default: the temp
+    /// directory, cleaned up at the end of the generation).
+    pub fn with_spill_target(mut self, target: SpillTarget) -> Self {
+        self.spill = target;
         self
     }
 
@@ -449,63 +446,6 @@ impl<S: ShellSpawner + Default> BashTool<S> {
         bash_security::check_dangerous(command)
     }
 
-    /// Keep the first `TRUNCATE_HEAD_CHARS` and last `TRUNCATE_TAIL_CHARS`,
-    /// replacing the middle with a summary line.
-    /// When truncation occurs, saves the full output to a temp file and returns
-    /// `(truncated_text, Some(temp_file_path))`.
-    fn smart_truncate(output: &str) -> (String, Option<String>) {
-        if output.len() <= MAX_OUTPUT_CHARS {
-            return (output.to_string(), None);
-        }
-
-        let temp_path = Self::save_full_output_to_temp(&StdFs, output);
-
-        let head_end = Self::char_boundary_at_or_before(output, TRUNCATE_HEAD_CHARS);
-        let tail_start = Self::char_boundary_at_or_after(
-            output,
-            output.len().saturating_sub(TRUNCATE_TAIL_CHARS),
-        );
-
-        let truncated = if head_end >= tail_start {
-            let end = Self::char_boundary_at_or_before(output, MAX_OUTPUT_CHARS);
-            format!(
-                "{}...\n[output truncated, {} chars total]",
-                &output[..end],
-                output.len()
-            )
-        } else {
-            let omitted_lines = output[head_end..tail_start].lines().count();
-            format!(
-                "{}\n\n... [{} lines omitted, {} chars total] ...\n\n{}",
-                output[..head_end].trim_end(),
-                omitted_lines,
-                output.len(),
-                output[tail_start..].trim_start()
-            )
-        };
-
-        (truncated, temp_path)
-    }
-
-    fn save_full_output_to_temp(fs: &dyn Fs, output: &str) -> Option<String> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let filename = format!("chatshell_bash_output_{:x}.txt", nanos);
-        let path = std::env::temp_dir().join(filename);
-        match fs.write(&path, output.as_bytes()) {
-            Ok(()) => {
-                tracing::info!("🖥️ [bash] Full output saved to: {}", path.display());
-                Some(path.to_string_lossy().to_string())
-            }
-            Err(e) => {
-                tracing::warn!("🖥️ [bash] Failed to save full output: {}", e);
-                None
-            }
-        }
-    }
-
     /// Delete all temp files tracked by the given handle.
     pub fn cleanup_temp_files(handle: &TempFileList) {
         if let Ok(mut files) = handle.lock() {
@@ -519,22 +459,6 @@ impl<S: ShellSpawner + Default> BashTool<S> {
                 }
             }
         }
-    }
-
-    fn char_boundary_at_or_before(s: &str, pos: usize) -> usize {
-        let mut i = pos.min(s.len());
-        while i > 0 && !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    }
-
-    fn char_boundary_at_or_after(s: &str, pos: usize) -> usize {
-        let mut i = pos.min(s.len());
-        while i < s.len() && !s.is_char_boundary(i) {
-            i += 1;
-        }
-        i
     }
 }
 
@@ -670,8 +594,10 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             && !cmd.timed_out
             && cmd.exit_code != 0
             && let Some(sandbox) = &self.sandbox
-            && let Some((kind, detail)) =
-                detect_denial(&cmd.output, sandbox.network_allowed.load(Ordering::SeqCst))
+            && let Some((kind, detail)) = detect_denial(
+                &cmd.captured.scan_text,
+                sandbox.network_allowed.load(Ordering::SeqCst),
+            )
         {
             tracing::info!("🛡️ [bash] Sandbox denial ({kind:?}): {detail}");
             let decision = match &sandbox.escalator {
@@ -720,9 +646,10 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
         if !cmd.timed_out
             && cmd.exit_code != 0
             && let Some(passthrough) = &self.env_passthrough
-            && let Some(hint) = shell_env::missing_variable_hint(&cmd.output, passthrough, |name| {
-                std::env::var(name).ok()
-            })
+            && let Some(hint) =
+                shell_env::missing_variable_hint(&cmd.captured.scan_text, passthrough, |name| {
+                    std::env::var(name).ok()
+                })
         {
             notes.push(hint);
         }
@@ -812,13 +739,14 @@ impl<S: ShellSpawner + Default> BashTool<S> {
         let session = slot
             .as_mut()
             .ok_or_else(|| BashError("Session not started".into()))?;
+        let spill = Some(self.spill.clone());
         let Some(abort) = &self.abort_notify else {
-            return session.execute(command, timeout).await;
+            return session.execute(command, timeout, spill).await;
         };
         let aborted = tokio::select! {
             biased;
             _ = abort.notified() => true,
-            r = session.execute(command, timeout) => return r,
+            r = session.execute(command, timeout, spill) => return r,
         };
         debug_assert!(aborted);
         tracing::info!("🛑 [bash] Command aborted: generation was stopped");
@@ -837,33 +765,21 @@ impl<S: ShellSpawner + Default> BashTool<S> {
         notes: &[String],
     ) -> String {
         tracing::info!(
-            "🔧 [tool-result] bash: exit_code={} output_len={}",
+            "🔧 [tool-result] bash: exit_code={} output_bytes={}",
             cmd.exit_code,
-            cmd.output.len()
+            cmd.captured.total_bytes
         );
 
-        let (text, temp_file) = Self::smart_truncate(cmd.output.trim_end());
-        if let Some(ref path_str) = temp_file
+        if let Some(spill) = &cmd.captured.spill
+            && spill.temporary
             && let Ok(mut files) = self.temp_files.lock()
         {
-            files.push(PathBuf::from(path_str));
+            files.push(spill.path.clone());
         }
-        let file_notice = temp_file
-            .map(|p| {
-                format!(
-                    "\n[full output saved to {} -- use the read tool to view]",
-                    p
-                )
-            })
-            .unwrap_or_default();
+        let file_notice = spill_notice(&cmd.captured);
+        let text = cmd.captured.inline.as_str();
         let notes_prefix: String = notes.iter().map(|note| format!("{note}\n")).collect();
         let warn_prefix = format!("{warn_prefix}{notes_prefix}");
-
-        let capture_note = if cmd.capture_truncated {
-            format!("\n[output capture stopped at {} bytes]", MAX_CAPTURE_BYTES)
-        } else {
-            String::new()
-        };
 
         if cmd.timed_out {
             let timeout_note = format!(
@@ -871,27 +787,21 @@ impl<S: ShellSpawner + Default> BashTool<S> {
                  partial output below (the command may still have been running)]\n",
                 timeout_secs
             );
-            return format!(
-                "{}{}{}{}{}",
-                warn_prefix, timeout_note, text, capture_note, file_notice
-            );
+            return format!("{warn_prefix}{timeout_note}{text}{file_notice}");
         }
 
         if cmd.exit_code == 0 {
             if text.is_empty() {
-                format!("{}(no output){}", warn_prefix, capture_note)
+                format!("{warn_prefix}(no output)")
             } else {
-                format!("{}{}{}{}", warn_prefix, text, capture_note, file_notice)
+                format!("{warn_prefix}{text}{file_notice}")
             }
         } else if text.is_empty() {
-            format!(
-                "{}[exit code: {}]{}{}",
-                warn_prefix, cmd.exit_code, capture_note, file_notice
-            )
+            format!("{warn_prefix}[exit code: {}]{file_notice}", cmd.exit_code)
         } else {
             format!(
-                "{}[exit code: {}]\n{}{}{}",
-                warn_prefix, cmd.exit_code, text, capture_note, file_notice
+                "{warn_prefix}[exit code: {}]\n{text}{file_notice}",
+                cmd.exit_code
             )
         }
     }
@@ -1022,6 +932,7 @@ mod tests {
             .execute(
                 "echo partial-before-timeout; sleep 30",
                 Duration::from_secs(1),
+                None,
             )
             .await
             .unwrap();
@@ -1029,9 +940,9 @@ mod tests {
         assert!(out.timed_out, "flagged as timed out");
         assert_eq!(out.exit_code, -1);
         assert!(
-            out.output.contains("partial-before-timeout"),
+            out.captured.inline.contains("partial-before-timeout"),
             "partial capture survives: {:?}",
-            out.output
+            out.captured.inline
         );
         assert!(!session.is_alive(), "session killed on timeout");
     }
@@ -1042,48 +953,43 @@ mod tests {
             .await
             .unwrap();
         let out = session
-            .execute("echo ok; (exit 3)", Duration::from_secs(10))
+            .execute("echo ok; (exit 3)", Duration::from_secs(10), None)
             .await
             .unwrap();
 
         assert!(!out.timed_out);
         assert_eq!(out.exit_code, 3);
-        assert_eq!(out.output.trim(), "ok");
+        assert_eq!(out.captured.inline, "ok");
     }
 
-    #[test]
-    fn test_smart_truncate_short() {
-        let short = "hello world\n";
-        let (result, temp) = BashTool::<TokioSpawner>::smart_truncate(short);
-        assert_eq!(result, short);
-        assert!(temp.is_none());
-    }
+    #[tokio::test]
+    async fn large_output_streams_past_the_old_capture_ceiling() {
+        use rig::agent::tool::Tool as _;
+        let dir = tempfile::tempdir().unwrap();
+        let tool: BashTool = BashTool::with_working_directory(dir.path().display().to_string())
+            .with_spill_target(SpillTarget {
+                dir: dir.path().join("spill"),
+                reference_scheme: Some("tool-output".to_string()),
+            });
+        let mut ctx = rig::agent::tool::ToolContext::default();
+        let args: BashArgs = serde_json::from_value(json!({ "command": "seq 1 200000" })).unwrap();
 
-    #[test]
-    fn test_smart_truncate_long() {
-        let long: String = (0..5000).map(|i| format!("line {}\n", i)).collect();
-        let (result, temp) = BashTool::<TokioSpawner>::smart_truncate(&long);
-        assert!(result.len() < long.len());
-        assert!(result.contains("lines omitted"));
-        assert!(result.contains("line 0"));
-        assert!(result.contains("line 4999"));
-        assert!(temp.is_some());
-        // Clean up temp file
-        if let Some(ref path) = temp {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+        let out = tool.call(&mut ctx, args).await.unwrap();
 
-    #[test]
-    fn test_smart_truncate_preserves_char_boundaries() {
-        for piece in ["你好世界\n", "こんにちは世界\n", "안녕하세요 세계\n"] {
-            let long: String = piece.repeat(10_000);
-            let (result, temp) = BashTool::<TokioSpawner>::smart_truncate(&long);
-            assert!(result.len() < long.len());
-            assert!(result.chars().all(|c| c != '\u{FFFD}'));
-            if let Some(path) = &temp {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+        assert!(out.contains("tool-output://bash-"), "{out}");
+        assert!(out.contains("full output"), "{out}");
+        assert!(out.starts_with("1\n2\n"), "head inline: {}", &out[..40]);
+        assert!(out.contains("200000"), "tail inline");
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("spill"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let content = std::fs::read_to_string(&files[0]).unwrap();
+        // ~1.3 MB, all of it: the old capture stopped at 100 KB.
+        assert_eq!(content.lines().count(), 200_000);
+        assert!(content.ends_with("200000\n"));
+        // Durable spills are not registered for per-generation cleanup.
+        assert!(tool.temp_files_handle().lock().unwrap().is_empty());
     }
 }

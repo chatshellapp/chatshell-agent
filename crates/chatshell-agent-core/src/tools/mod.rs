@@ -6,6 +6,7 @@
 //! surface the schemas to client-side tool callers (iOS).
 
 pub mod bash;
+pub mod bash_output;
 pub mod bash_sandbox;
 pub mod bash_session_manager;
 pub mod edit;
@@ -18,6 +19,7 @@ pub mod reference;
 pub mod write;
 
 pub use bash::{BashArgs, BashError, BashTool, SharedBashSession, TempFileList};
+pub use bash_output::SpillTarget;
 pub use bash_session_manager::BashSessionManager;
 pub use edit::{EditArgs, EditError, EditTool};
 pub use glob::{GlobArgs, GlobError, GlobTool};
