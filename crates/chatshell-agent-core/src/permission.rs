@@ -20,6 +20,7 @@
 use crate::bash_security::{self, SecurityVerdict};
 use crate::grant_keys::{self, FileTier};
 use crate::net_policy;
+use crate::path_policy::{self, ReadTier};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -101,6 +102,9 @@ pub enum ForcedPromptKind {
     Network,
     /// A fetch targets a private or local network address.
     PrivateNetwork,
+    /// A file-tool read hits an ask-tier `path_policy` group (shell
+    /// configuration files, which often hold exported API keys).
+    SensitiveRead,
 }
 
 /// A prompt that session grants cannot satisfy, with the detail shown
@@ -365,6 +369,27 @@ fn inside_workspace(path: &str, workspace: &Path) -> bool {
     target.starts_with(&root) && target != root
 }
 
+/// The ask-tier read block for a file-tool path, if any. Relative paths
+/// are also classified against the workspace. Deny-tier hits return
+/// `None`: the tool refuses them itself, so prompting would be pointless.
+fn ask_tier_read(path: &str, workspace: Option<&Path>) -> Option<path_policy::ReadBlock> {
+    let path = Path::new(path);
+    let mut candidates = vec![path.to_path_buf()];
+    if path.is_relative()
+        && let Some(workspace) = workspace
+    {
+        candidates.push(workspace.join(path));
+    }
+    let blocks: Vec<_> = candidates
+        .iter()
+        .filter_map(|candidate| path_policy::classify_read(candidate))
+        .collect();
+    if blocks.iter().any(|block| block.tier == ReadTier::Deny) {
+        return None;
+    }
+    blocks.into_iter().find(|block| block.tier == ReadTier::Ask)
+}
+
 /// Resolve one tool call against the mode and session grants, with no
 /// workspace, no sandbox, and no network grant.
 pub fn resolve(
@@ -436,6 +461,19 @@ pub fn resolve_in(
                 url,
                 ForcedPromptKind::PrivateNetwork,
                 format!("Fetch targets a private or local network address: {url}"),
+            );
+        }
+        if matches!(tool_name, "read" | "grep" | "glob")
+            && let Some(path) = args.get("path").and_then(Value::as_str)
+            && let Some(block) = ask_tier_read(path, ctx.workspace.as_deref())
+        {
+            return GateDecision::forced(
+                path,
+                ForcedPromptKind::SensitiveRead,
+                format!(
+                    "Reads a {} file, which may contain secrets: {}",
+                    block.label, block.matched
+                ),
             );
         }
         return GateDecision::Allow;
@@ -790,6 +828,68 @@ mod tests {
             &grants,
         );
         assert!(forced_kind(&decision).is_some(), "got {decision:?}");
+    }
+
+    #[test]
+    fn shell_config_reads_force_a_prompt_except_in_yolo() {
+        let home = dirs::home_dir().unwrap();
+        let zshrc = home.join(".zshrc").display().to_string();
+        let mut grants = SessionGrants::default();
+        grants.grant_tool("read");
+        for mode in [PermissionMode::Ask, PermissionMode::Auto] {
+            for tool in ["read", "grep", "glob"] {
+                let decision = resolve(mode, tool, &json!({ "path": zshrc }), &grants);
+                assert_eq!(
+                    forced_kind(&decision),
+                    Some(ForcedPromptKind::SensitiveRead),
+                    "{mode:?} {tool}"
+                );
+            }
+        }
+        assert_eq!(
+            resolve(
+                PermissionMode::Yolo,
+                "read",
+                &json!({ "path": zshrc }),
+                &grants
+            ),
+            GateDecision::Allow
+        );
+        // Relative paths are classified against the workspace.
+        let ctx = GateContext {
+            workspace: Some(home.clone()),
+            ..GateContext::default()
+        };
+        let decision = resolve_in(
+            PermissionMode::Ask,
+            &ctx,
+            "read",
+            &json!({ "path": ".bashrc" }),
+            &SessionGrants::default(),
+        );
+        assert_eq!(
+            forced_kind(&decision),
+            Some(ForcedPromptKind::SensitiveRead)
+        );
+    }
+
+    #[test]
+    fn deny_tier_and_ordinary_reads_do_not_prompt() {
+        let home = dirs::home_dir().unwrap();
+        // Deny tier: the tool refuses it; prompting would be pointless.
+        let key = home.join(".ssh/id_ed25519").display().to_string();
+        assert_eq!(
+            resolve_simple(PermissionMode::Ask, "read", json!({ "path": key })),
+            GateDecision::Allow
+        );
+        assert_eq!(
+            resolve_simple(
+                PermissionMode::Ask,
+                "read",
+                json!({ "path": "/tmp/notes.txt" })
+            ),
+            GateDecision::Allow
+        );
     }
 
     #[test]

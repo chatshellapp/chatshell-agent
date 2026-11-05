@@ -347,6 +347,23 @@ fn run_search(fs: Arc<dyn Fs>, args: &GrepArgs, search_path: &str) -> Result<Str
                 },
             )
             .map_err(|e| GrepError(format!("Failed to walk search path: {}", e)))?;
+        // The read policy covers every file searched, not just the root:
+        // an include glob re-includes hidden files (`.env`), and blocked
+        // names are not all hidden (`credentials.json`). Ask-tier files
+        // are skipped too: the approval prompt covered only the root.
+        // Walked paths are spelled under `path`; classify them under its
+        // canonical form so home-anchored entries match relative roots.
+        let policy = path_policy::ReadClassifier::new();
+        let canonical_root = fs.canonicalize(path).ok();
+        let files = files.into_iter().filter(|file| {
+            let absolute = canonical_root
+                .as_ref()
+                .zip(file.strip_prefix(path).ok())
+                .map(|(root, rel)| root.join(rel));
+            policy
+                .classify_lexical(absolute.as_deref().unwrap_or(file))
+                .is_none()
+        });
 
         for file in files {
             if run.total_matches >= run.head_limit {
@@ -741,6 +758,34 @@ mod tests {
             }
         }
         serde_json::from_value(value).expect("valid args")
+    }
+
+    #[test]
+    fn directory_search_skips_policy_blocked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("credentials.json"), "TOKEN=leak-1").unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=leak-2").unwrap();
+        std::fs::write(dir.path().join(".env.test"), "TOKEN=leak-3").unwrap();
+        std::fs::write(dir.path().join(".env.example"), "TOKEN=template").unwrap();
+        std::fs::write(dir.path().join("app.txt"), "TOKEN=fine").unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        // Default walk, then an include glob that re-includes hidden files.
+        for extra in [
+            json!({ "path": root }),
+            json!({ "path": root, "glob": ".env*" }),
+        ] {
+            let out = run_search(default_fs(), &args("TOKEN", extra.clone()), &root).unwrap();
+            assert!(!out.contains("leak"), "{extra}: {out}");
+        }
+        let out = run_search(default_fs(), &args("TOKEN", json!({ "path": root })), &root).unwrap();
+        assert!(out.contains("TOKEN=fine"), "{out}");
+        let out = run_search(
+            default_fs(),
+            &args("TOKEN", json!({ "path": root, "glob": ".env*" })),
+            &root,
+        )
+        .unwrap();
+        assert!(out.contains("TOKEN=template"), "{out}");
     }
 
     #[test]

@@ -7,8 +7,11 @@
 //!   directory and a per-conversation scratch directory), with the
 //!   `path_policy` home write-blocklist and each root's `.git/hooks` and
 //!   `.git/config` denied on top (code-execution vectors);
-//! - reads open except the `path_policy` read-blocklist (credential
-//!   files, `.env`-style secrets);
+//! - reads open except the `path_policy` read deny groups (credentials,
+//!   keychains, shell configuration and history, browser and personal
+//!   data, project secrets by file name) and the host's registered private
+//!   directories. Ask-tier groups are denied too: the jail cannot ask, so
+//!   a denial escalates instead;
 //! - network limited to loopback unless `allow_network` is set.
 //!
 //! macOS: `/usr/bin/sandbox-exec` is invoked by absolute path (a `PATH`
@@ -21,7 +24,8 @@
 //! moving it back fails at the first step.
 //!
 //! Linux: bubblewrap from a fixed system location; read-only bind of `/`,
-//! writable binds of the roots, masks over blocked files, a private pid
+//! writable binds of the roots, masks over blocked files (mode-0000, so a
+//! read fails with `EACCES` instead of returning empty content), a private pid
 //! namespace, and a new session (no controlling terminal). A `.git`
 //! directory is bound onto itself so it becomes a mount point, which the
 //! kernel refuses to rename or remove (`EBUSY`); a `.git` file (worktree
@@ -162,6 +166,9 @@ pub struct SandboxPolicy {
     pub allow_network: bool,
     /// User home directory, for home-relative blocklists.
     pub home: Option<PathBuf>,
+    /// Extra directories that must not be read (the host's own data
+    /// directory; see `path_policy::register_private_dir`).
+    pub private_dirs: Vec<PathBuf>,
 }
 
 /// Why a policy cannot be sandboxed.
@@ -207,30 +214,59 @@ fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, SandboxError> {
     Ok(out)
 }
 
-/// A home-relative read-blocklist entry, classified.
-enum HomeEntry {
-    /// Whole path (file or directory).
-    Path(PathBuf),
-    /// Entries of `dir` whose name starts with `prefix` (`.ssh/id_`).
-    Prefix { dir: PathBuf, prefix: String },
+/// The jail's read denies: every `path_policy` deny group (both tiers:
+/// the jail cannot ask, it denies and the escalation prompt takes over)
+/// plus the policy's private directories.
+#[derive(Debug, Default)]
+struct ReadDenies {
+    /// Whole paths (files or directory subtrees), kernel spelling.
+    paths: Vec<PathBuf>,
+    /// File names denied anywhere.
+    names: Vec<&'static str>,
+    /// File-name prefixes denied anywhere, with exempt names.
+    prefixes: Vec<(&'static str, &'static [&'static str])>,
 }
 
-fn home_read_entries(home: &Path) -> Vec<HomeEntry> {
-    path_policy::READ_BLOCKED_HOME_PREFIXES
-        .iter()
-        .map(|entry| {
-            let trimmed = entry.trim_end_matches('/');
-            if !entry.ends_with('/') && trimmed.ends_with('_') {
-                let (dir, prefix) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
-                HomeEntry::Prefix {
-                    dir: home.join(dir),
-                    prefix: prefix.to_string(),
+fn read_denies(policy: &SandboxPolicy, roots: &[PathBuf]) -> ReadDenies {
+    let mut denies = ReadDenies::default();
+    for group in path_policy::active_read_groups() {
+        for entry in group.entries {
+            match *entry {
+                path_policy::DenyEntry::Home(rel) => {
+                    if let Some(home) = &policy.home {
+                        denies.paths.push(resolved(&home.join(rel)));
+                    }
                 }
-            } else {
-                HomeEntry::Path(home.join(trimmed))
+                path_policy::DenyEntry::Absolute(abs) => {
+                    denies.paths.push(resolved(Path::new(abs)));
+                }
+                path_policy::DenyEntry::Name(name) => denies.names.push(name),
+                path_policy::DenyEntry::NamePrefix { prefix, except } => {
+                    denies.prefixes.push((prefix, except));
+                }
             }
+        }
+    }
+    denies
+        .paths
+        .extend(policy.private_dirs.iter().map(|dir| resolved(dir)));
+    // A deny covering a writable root would make the workspace itself
+    // unreadable (and, under bubblewrap, hide it): skip it. The file
+    // tools still refuse those paths.
+    denies
+        .paths
+        .retain(|deny| !roots.iter().any(|root| root.starts_with(deny)));
+    denies.paths.sort();
+    denies.paths.dedup();
+    denies
+}
+
+/// Whether a file name is denied by name or name prefix.
+fn name_denied(denies: &ReadDenies, name: &str) -> bool {
+    denies.names.contains(&name)
+        || denies.prefixes.iter().any(|(prefix, except)| {
+            name.starts_with(prefix) && name.len() > prefix.len() && !except.contains(&name)
         })
-        .collect()
 }
 
 /// Resolve a blocklist path the way the kernel will see it (`/etc` is
@@ -402,36 +438,32 @@ fn seatbelt_profile(policy: &SandboxPolicy, roots: &[PathBuf]) -> SeatbeltBuilde
         ));
     }
 
-    // Read blocklist.
-    if let Some(home) = &policy.home {
-        for entry in home_read_entries(home) {
-            match entry {
-                HomeEntry::Path(path) => {
-                    let name = b.param("READ_DENY", resolved(&path));
-                    b.profile
-                        .push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
-                }
-                HomeEntry::Prefix { dir, prefix } => {
-                    let name = b.param("READ_DENY_DIR", resolved(&dir));
-                    b.profile.push_str(&format!(
-                        "(deny file-read* (require-all (subpath (param \"{name}\")) \
-                         (regex #\"/{}[^/]*$\")))\n",
-                        sbpl_regex_escape(&prefix)
-                    ));
-                }
-            }
+    // Read denies. Name rules first: each name-prefix deny is followed by
+    // allows for its exempt names (`.env.example`), and the path denies
+    // after them win over those allows (the last matching rule wins).
+    let denies = read_denies(policy, roots);
+    for (prefix, except) in &denies.prefixes {
+        b.profile.push_str(&format!(
+            "(deny file-read* (regex #\"/{}[^/]+$\"))\n",
+            sbpl_regex_escape(prefix)
+        ));
+        for exempt in *except {
+            b.profile.push_str(&format!(
+                "(allow file-read* (regex #\"/{}$\"))\n",
+                sbpl_regex_escape(exempt)
+            ));
         }
     }
-    for absolute in path_policy::READ_BLOCKED_ABSOLUTE {
-        let name = b.param("READ_DENY", resolved(Path::new(absolute)));
-        b.profile
-            .push_str(&format!("(deny file-read* (literal (param \"{name}\")))\n"));
-    }
-    for file_name in path_policy::READ_BLOCKED_FILENAMES {
+    for file_name in &denies.names {
         b.profile.push_str(&format!(
             "(deny file-read* (regex #\"/{}$\"))\n",
             sbpl_regex_escape(file_name)
         ));
+    }
+    for path in denies.paths {
+        let name = b.param("READ_DENY", path);
+        b.profile
+            .push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
     }
     b
 }
@@ -498,12 +530,23 @@ fn bubblewrap_spec(
     for root in roots {
         protect_git_dir(&mut args, &root.join(GIT_DIR));
     }
+    // Masks fail reads loudly (EACCES): an unreadable empty directory or
+    // file, not an empty one that reads as blank content.
+    let placeholder = deny_placeholder();
+    let file_mask = placeholder.as_deref().unwrap_or(Path::new("/dev/null"));
     for path in bubblewrap_read_masks(policy, roots) {
-        if path.is_dir() {
-            args.push("--tmpfs".into());
-            args.push(path.display().to_string());
-        } else if path.exists() {
-            push3(&mut args, "--ro-bind", Path::new("/dev/null"), &path);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            args.extend([
+                "--perms".into(),
+                "0000".into(),
+                "--tmpfs".into(),
+                path.display().to_string(),
+            ]);
+        } else if meta.is_file() {
+            push3(&mut args, "--ro-bind", file_mask, &path);
         }
     }
     if !policy.allow_network {
@@ -565,41 +608,46 @@ fn protect_git_dir(args: &mut Vec<String>, git: &Path) {
     }
 }
 
-/// Existing paths bubblewrap must mask: home entries, absolute entries,
-/// and blocked file names found under the writable roots. bubblewrap
-/// cannot mask by pattern, so this is a spawn-time snapshot: files outside
-/// the scan bounds or created later stay readable by bash (see the module
-/// docs; the in-tool `path_policy` check covers only the file tools).
+/// Existing paths bubblewrap must mask: the deny paths, and blocked file
+/// names found under the writable roots. bubblewrap cannot mask by
+/// pattern, so this is a spawn-time snapshot: files outside the scan
+/// bounds or created later stay readable by bash (see the module docs;
+/// the in-tool `path_policy` check covers only the file tools). Masks
+/// inside an already-masked directory are dropped (the outer mask hides
+/// them, and nothing can be mounted inside an unreadable tmpfs).
 fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut masks = Vec::new();
-    if let Some(home) = &policy.home {
-        for entry in home_read_entries(home) {
-            match entry {
-                HomeEntry::Path(path) => masks.push(path),
-                HomeEntry::Prefix { dir, prefix } => {
-                    if let Ok(entries) = std::fs::read_dir(&dir) {
-                        masks.extend(
-                            entries
-                                .flatten()
-                                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-                                .map(|e| e.path()),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    masks.extend(path_policy::READ_BLOCKED_ABSOLUTE.iter().map(PathBuf::from));
+    let denies = read_denies(policy, roots);
+    let mut masks: Vec<PathBuf> = denies
+        .paths
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()))
+        .cloned()
+        .collect();
     let mut budget = MASK_SCAN_LIMIT;
     for root in roots {
-        scan_blocked_names(root, 0, &mut budget, &mut masks);
+        scan_blocked_names(&denies, root, 0, &mut budget, &mut masks);
     }
     masks.sort();
     masks.dedup();
-    masks
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(masks.len());
+    for mask in masks {
+        if !kept
+            .iter()
+            .any(|outer| mask != *outer && mask.starts_with(outer))
+        {
+            kept.push(mask);
+        }
+    }
+    kept
 }
 
-fn scan_blocked_names(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<PathBuf>) {
+fn scan_blocked_names(
+    denies: &ReadDenies,
+    dir: &Path,
+    depth: usize,
+    budget: &mut usize,
+    out: &mut Vec<PathBuf>,
+) {
     if depth > MASK_SCAN_MAX_DEPTH || *budget == 0 {
         return;
     }
@@ -618,12 +666,57 @@ fn scan_blocked_names(dir: &Path, depth: usize, budget: &mut usize, out: &mut Ve
         };
         if kind.is_dir() {
             if !MASK_SCAN_SKIP.contains(&name.as_ref()) {
-                scan_blocked_names(&entry.path(), depth + 1, budget, out);
+                scan_blocked_names(denies, &entry.path(), depth + 1, budget, out);
             }
-        } else if path_policy::READ_BLOCKED_FILENAMES.contains(&name.as_ref()) {
+        } else if kind.is_file() && name_denied(denies, &name) {
             out.push(entry.path());
         }
     }
+}
+
+/// An empty, mode-0000 file owned by this user, bound over masked files
+/// so reading them fails with `EACCES`. Lives in a private per-user
+/// directory (`$XDG_RUNTIME_DIR`, else the temp dir); `None` (fall back
+/// to `/dev/null`, which reads as empty) if it cannot be set up safely.
+#[cfg(target_os = "linux")]
+fn deny_placeholder() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    static PLACEHOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(|| {
+            // `/proc/self` is owned by the calling process's uid.
+            let uid = std::fs::metadata("/proc/self").ok()?.uid();
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("chatshell-sandbox-{uid}"));
+            let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+            let dir_meta = std::fs::symlink_metadata(&dir).ok()?;
+            if !dir_meta.is_dir() || dir_meta.uid() != uid || dir_meta.mode() & 0o077 != 0 {
+                return None;
+            }
+            let file = dir.join("deny-placeholder");
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o000)
+                .open(&file);
+            let meta = std::fs::symlink_metadata(&file).ok()?;
+            if !meta.is_file() || meta.uid() != uid || meta.len() != 0 {
+                return None;
+            }
+            if meta.permissions().mode() & 0o777 != 0 {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).ok()?;
+            }
+            Some(file)
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn deny_placeholder() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
@@ -635,6 +728,7 @@ mod tests {
             writable_roots: vec![root.to_path_buf()],
             allow_network: network,
             home: Some(PathBuf::from("/Users/tester")),
+            private_dirs: Vec::new(),
         }
     }
 
@@ -699,7 +793,23 @@ mod tests {
         let profile = &spec.args[1];
         assert!(profile.contains("(deny file-write-unlink (literal (param \"ANCHOR_"));
         assert!(profile.contains(r#"(regex #"/\.env$")"#));
-        assert!(profile.contains(r#"(regex #"/id_[^/]*$")"#));
+        let prefix = profile
+            .find(r#"(deny file-read* (regex #"/\.env\.[^/]+$"))"#)
+            .expect("env prefix deny");
+        let exempt = profile
+            .find(r#"(allow file-read* (regex #"/\.env\.example$"))"#)
+            .expect("template exemption");
+        let path_deny = profile
+            .find("(deny file-read* (subpath (param \"READ_DENY_")
+            .unwrap();
+        assert!(
+            prefix < exempt && exempt < path_deny,
+            "path denies must win"
+        );
+        assert!(
+            spec.args.iter().any(|a| a.ends_with("=/Users/tester/.ssh")),
+            "whole ~/.ssh denied"
+        );
     }
 
     #[test]
@@ -731,7 +841,10 @@ mod tests {
         let args = spec.args.join(" ");
         let root_s = root.display().to_string();
         assert!(args.contains(&format!("--bind {root_s} {root_s}")));
-        assert!(args.contains(&format!("--ro-bind /dev/null {root_s}/app/.env")));
+        let file_mask = deny_placeholder()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/dev/null".into());
+        assert!(args.contains(&format!("--ro-bind {file_mask} {root_s}/app/.env")));
         assert!(args.contains("--unshare-net"));
         let on = wrap(&backend, &policy(&root, true), inner(&root)).unwrap();
         assert!(!on.args.iter().any(|a| a == "--unshare-net"));
@@ -840,6 +953,78 @@ mod tests {
         let args = spec.args.join(" ");
         assert!(args.contains(&format!("--ro-bind {git} {git}")), "{args}");
         assert!(!args.contains(&format!("{git}/hooks")), "{args}");
+    }
+
+    #[test]
+    fn private_dirs_are_denied_unless_they_contain_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut p = policy(&root, false);
+        p.private_dirs = vec![base.join("app-data"), base.clone()];
+        let spec = wrap(&SandboxBackend::Seatbelt, &p, inner(&root)).unwrap();
+        let app_data = format!("={}", base.join("app-data").display());
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a.starts_with("READ_DENY_") && a.ends_with(&app_data))
+        );
+        // `base` contains the writable root: denying it would make the
+        // workspace unreadable, so it is skipped.
+        let base_deny = format!("={}", base.display());
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| a.starts_with("READ_DENY_") && a.ends_with(&base_deny))
+        );
+    }
+
+    #[test]
+    fn bubblewrap_masks_fail_reads_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = base.join("work");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".aws/sso")).unwrap();
+        std::fs::write(home.join(".zshrc"), "export KEY=1").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env.test"), "SECRET=1").unwrap();
+        std::fs::write(root.join(".env.example"), "SECRET=").unwrap();
+        let mut p = policy(&root, false);
+        p.home = Some(home.clone());
+        // Nested under the `~/.aws` mask: must be dropped.
+        p.private_dirs = vec![home.join(".aws/sso")];
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let spec = wrap(&backend, &p, inner(&root)).unwrap();
+        let args = spec.args.join(" ");
+        let ssh = home.join(".ssh").display().to_string();
+        assert!(
+            args.contains(&format!("--perms 0000 --tmpfs {ssh}")),
+            "{args}"
+        );
+        let aws = home.join(".aws").display().to_string();
+        assert!(
+            args.contains(&format!("--perms 0000 --tmpfs {aws} ")),
+            "{args}"
+        );
+        assert!(!args.contains(&format!("{aws}/sso")), "{args}");
+        let zshrc = home.join(".zshrc").display().to_string();
+        let file_mask = deny_placeholder()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/dev/null".into());
+        assert!(
+            args.contains(&format!("--ro-bind {file_mask} {zshrc}")),
+            "{args}"
+        );
+        let env_test = root.join(".env.test").display().to_string();
+        assert!(
+            args.contains(&format!("--ro-bind {file_mask} {env_test}")),
+            "{args}"
+        );
+        assert!(!args.contains(".env.example"), "{args}");
     }
 
     #[test]

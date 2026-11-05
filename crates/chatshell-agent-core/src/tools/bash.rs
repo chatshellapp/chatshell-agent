@@ -790,6 +790,7 @@ impl<S: ShellSpawner + Default> BashTool<S> {
             writable_roots,
             allow_network: sandbox.network_allowed.load(Ordering::SeqCst),
             home: dirs::home_dir(),
+            private_dirs: crate::path_policy::private_dirs(),
         };
         let spec = sandbox::wrap(backend, &policy, spec)
             .map_err(|e| BashError(format!("Sandbox could not start: {e}")))?;

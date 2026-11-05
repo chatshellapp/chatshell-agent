@@ -8,6 +8,7 @@
 //! annotated on the tool result, so the transcript records every approved
 //! escape and the model sees why a denied command failed.
 
+use crate::path_policy::ReadClassifier;
 use crate::sandbox::SandboxBackend;
 use std::future::Future;
 use std::path::PathBuf;
@@ -19,10 +20,13 @@ use std::sync::atomic::AtomicBool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscalationKind {
     /// A filesystem operation outside the writable roots or on a
-    /// protected path.
+    /// protected path (including reads of `path_policy`-denied files).
     Filesystem,
     /// A non-loopback network connection.
     Network,
+    /// Stored credentials (the keychain, a credential helper) that the
+    /// sandbox keeps out of reach, e.g. `git push` over HTTPS.
+    Credentials,
 }
 
 /// One escalation question for the host.
@@ -106,22 +110,59 @@ const FILESYSTEM_MARKERS: &[&str] = &[
     "deny(1)",
 ];
 
+/// bubblewrap's read masks fail with EACCES. Ordinary permission errors
+/// say the same, so this marker counts only on a line that names a path
+/// the read policy blocks.
+const MASK_MARKER: &str = "permission denied";
+
+/// Output fragments of a credential lookup that failed because the
+/// keychain or credential helper is out of reach (git falls back to an
+/// interactive prompt, which a non-interactive session cannot answer).
+const CREDENTIAL_MARKERS: &[&str] = &["could not read username for", "could not read password for"];
+
 /// Classify a failed sandboxed command's output. Network markers win
-/// when network is still blocked; otherwise filesystem markers.
+/// when network is still blocked; then filesystem markers (including a
+/// permission error on a policy-blocked path); then credential markers.
 pub fn detect_denial(output: &str, network_allowed: bool) -> Option<(EscalationKind, String)> {
+    let detail = |line: &str| line.trim().chars().take(240).collect::<String>();
     let find = |markers: &[&str]| {
         output.lines().find_map(|line| {
             let lower = line.to_ascii_lowercase();
             markers
                 .iter()
                 .any(|marker| lower.contains(marker))
-                .then(|| line.trim().chars().take(240).collect::<String>())
+                .then(|| detail(line))
         })
     };
     if !network_allowed && let Some(line) = find(NETWORK_MARKERS) {
         return Some((EscalationKind::Network, line));
     }
-    find(FILESYSTEM_MARKERS).map(|line| (EscalationKind::Filesystem, line))
+    if let Some(line) = find(FILESYSTEM_MARKERS) {
+        return Some((EscalationKind::Filesystem, line));
+    }
+    let policy = ReadClassifier::new();
+    if let Some(line) = output.lines().find(|line| {
+        line.to_ascii_lowercase().contains(MASK_MARKER) && names_blocked_path(line, &policy)
+    }) {
+        return Some((EscalationKind::Filesystem, detail(line)));
+    }
+    find(CREDENTIAL_MARKERS).map(|line| (EscalationKind::Credentials, line))
+}
+
+/// Whether an error line names a path the read policy blocks
+/// (`cat: /home/u/.zshrc: Permission denied`,
+/// `ls: cannot open directory '/home/u/.ssh': Permission denied`).
+fn names_blocked_path(line: &str, policy: &ReadClassifier) -> bool {
+    line.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c: char| matches!(c, '\'' | '"' | ':' | ',' | '`' | '‘' | '’'))
+        })
+        .filter(|token| token.contains('/') || token.starts_with('.'))
+        .any(|token| {
+            policy
+                .classify_lexical(std::path::Path::new(token))
+                .is_some()
+        })
 }
 
 /// Result annotation: the user approved one run outside the sandbox.
@@ -137,7 +178,12 @@ the rest of this session. The shell was restarted, so earlier cd/export state is
 pub fn note_denied(kind: EscalationKind, answered: bool) -> String {
     let what = match kind {
         EscalationKind::Network => "network access",
-        EscalationKind::Filesystem => "a filesystem operation outside the workspace",
+        EscalationKind::Filesystem => {
+            "a filesystem operation (a write outside the workspace, or a protected path)"
+        }
+        EscalationKind::Credentials => {
+            "access to stored credentials (keychain or credential helper)"
+        }
     };
     if answered {
         format!(
@@ -177,6 +223,42 @@ mod tests {
             detect_denial("touch: /x: Read-only file system", true).map(|(k, _)| k),
             Some(EscalationKind::Filesystem)
         );
+    }
+
+    #[test]
+    fn permission_denied_counts_only_on_blocked_paths() {
+        let home = dirs::home_dir().unwrap();
+        let masked = format!("cat: {}: Permission denied", home.join(".zshrc").display());
+        assert_eq!(
+            detect_denial(&masked, false).map(|(k, _)| k),
+            Some(EscalationKind::Filesystem)
+        );
+        let dir = format!(
+            "ls: cannot open directory '{}': Permission denied",
+            home.join(".ssh").display()
+        );
+        assert_eq!(
+            detect_denial(&dir, false).map(|(k, _)| k),
+            Some(EscalationKind::Filesystem)
+        );
+        assert_eq!(
+            detect_denial("cat: app/.env: Permission denied", false).map(|(k, _)| k),
+            Some(EscalationKind::Filesystem)
+        );
+        assert_eq!(
+            detect_denial("cat: /var/log/system.log: Permission denied", false),
+            None
+        );
+        assert_eq!(detect_denial("./build.sh: Permission denied", false), None);
+    }
+
+    #[test]
+    fn credential_failures_escalate_as_credentials() {
+        let out = "fatal: could not read Username for 'https://github.com': Device not configured";
+        let (kind, detail) = detect_denial(out, true).unwrap();
+        assert_eq!(kind, EscalationKind::Credentials);
+        assert!(detail.contains("github.com"));
+        assert!(note_denied(kind, true).contains("stored credentials"));
     }
 
     #[test]
@@ -403,6 +485,40 @@ mod os_sandbox_integration {
         std::fs::write(f.root.join(".env"), "SECRET=1").unwrap();
         let out = run(&f.tool, "cat .env").await;
         assert!(!out.contains("SECRET=1"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn policy_denied_reads_fail_and_escalate() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        // A registered private directory (as the desktop registers its
+        // data directory) and project secrets by name pattern.
+        let private = f.outside.with_file_name("app-data");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("data.db"), "OTHER-CONVERSATION").unwrap();
+        // Registered before the first command, which spawns the session.
+        crate::path_policy::register_private_dir(&private);
+        std::fs::write(f.root.join(".env.test"), "SECRET=env-test").unwrap();
+        std::fs::write(f.root.join(".env.example"), "SECRET=template").unwrap();
+        let out = run(&f.tool, "cat .env.example; cat .env.test").await;
+        assert!(out.contains("SECRET=template"), "{out}");
+        assert!(!out.contains("env-test"), "{out}");
+        let reqs = requests(&f);
+        assert_eq!(reqs.len(), 1, "{out}");
+        assert_eq!(reqs[0].kind, EscalationKind::Filesystem, "{out}");
+        let out = run(
+            &f.tool,
+            &format!(
+                "cat '{}' ; ls '{}'",
+                private.join("data.db").display(),
+                private.display()
+            ),
+        )
+        .await;
+        assert!(!out.contains("OTHER-CONVERSATION"), "{out}");
+        assert!(!out.contains("data.db\n"), "{out}");
+        assert_eq!(requests(&f).len(), 2, "{out}");
     }
 
     #[tokio::test]
