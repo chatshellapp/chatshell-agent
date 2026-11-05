@@ -59,6 +59,10 @@ pub struct ReadArgs {
     /// where a formula exists.
     #[serde(default)]
     pub formulas: bool,
+    /// For video files: a timestamp (`75`, `1:15`, `1:02:03`) selecting a
+    /// single frame instead of the contact sheet.
+    #[serde(default)]
+    pub time: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -229,6 +233,92 @@ impl ReadTool {
                 image.header, error
             )),
         }
+    }
+
+    /// A video: ffprobe metadata plus a contact sheet (or one frame at
+    /// `time`), inline for vision models, through `question` otherwise.
+    async fn read_video(
+        &self,
+        path: &std::path::Path,
+        args: &ReadArgs,
+        question: Option<&str>,
+    ) -> Result<String, ReadError> {
+        use crate::video;
+        let (Some(ffmpeg), Some(ffprobe)) =
+            (video::find_tool("ffmpeg"), video::find_tool("ffprobe"))
+        else {
+            return Ok(video::missing_tools_message());
+        };
+        let info = match video::probe(&ffprobe, path).await {
+            Ok(info) => info,
+            Err(e) => return Ok(format!("[Video] Could not read the video: {e}")),
+        };
+        let header = format!("[Video: {}]", info.summary());
+        let (label, png) = match args.time.as_deref() {
+            Some(time) => {
+                let Some(seconds) = video::parse_timestamp(time) else {
+                    return Err(ReadError(format!(
+                        "Invalid \"time\" {time:?}: use seconds (75) or a timestamp (1:15, 1:02:03)."
+                    )));
+                };
+                if let Some(duration) = info.duration_secs
+                    && seconds > duration
+                {
+                    return Err(ReadError(format!(
+                        "\"time\" {time} is past the end of the video ({}).",
+                        video::format_timestamp(duration)
+                    )));
+                }
+                let frame = video::frame_at(&ffmpeg, path, seconds, None).await;
+                (
+                    format!("frame at {}", video::format_timestamp(seconds)),
+                    frame,
+                )
+            }
+            None => {
+                let duration = info.duration_secs.unwrap_or(0.0);
+                let sheet = if duration > 0.0 {
+                    video::contact_sheet(&ffmpeg, path, duration).await
+                } else {
+                    video::frame_at(&ffmpeg, path, 0.0, Some(960)).await
+                };
+                (
+                    "contact sheet: 6 frames spread over the video, left to right, top to bottom"
+                        .to_string(),
+                    sheet,
+                )
+            }
+        };
+        let png = match png {
+            Ok(png) => png,
+            Err(e) => return Ok(format!("{header}\nCould not extract frames: {e}")),
+        };
+        if let Some(question) = question {
+            let image = build_loaded_image(png, "png")?;
+            let answer = self
+                .answer_image_question_bytes(image, &path.display().to_string(), question)
+                .await?;
+            return Ok(format!("{header} ({label})\n{answer}"));
+        }
+        if self.main_model_vision == Some(false) {
+            return Ok(format!(
+                "{header}\nThis model cannot view images. {}",
+                if self.image_question.is_some() {
+                    "Read the video again with \"question\" (optionally with \"time\") to ask a \
+                     vision model about its frames."
+                } else {
+                    "No vision model is configured to look at its frames (Settings → Auxiliary Models)."
+                }
+            ));
+        }
+        let (bytes, mime) = match crate::image_fit::fit_image(&png) {
+            Ok(fitted) => (fitted.bytes, fitted.mime_type),
+            Err(_) => (png, "image/png".to_string()),
+        };
+        Ok(format!(
+            "{header} ({label}; use \"time\" for a single full-size frame)\ndata:{mime};base64,{}",
+            BASE64.encode(&bytes)
+        ))
     }
 
     /// `question` on a scanned PDF page: the page's image goes to the
@@ -562,7 +652,9 @@ impl Tool for ReadTool {
                 for Office files, .docx/.pptx return Markdown (headings, lists, tables, slide text) \
                 and .xlsx/.xlsm return a bounded TSV view with a sheet list; use \"sheet\" and \
                 \"range\" (A1 style) to page spreadsheets, and \"formulas\" to show formulas; \
-                legacy .doc/.xls/.ppt are not supported. \
+                legacy .doc/.xls/.ppt are not supported; \
+                video files (mp4, mov, m4v, webm, mkv, avi) return metadata and a 6-frame contact \
+                sheet (\"time\" selects one frame; needs ffmpeg). \
                 supports line ranges and negative offset for text files (e.g. -20 reads the last 20 lines). \
                 URLs (http/https): image URLs return metadata and base64-encoded data (or a \
                 vision-model answer when the \"question\" argument is set); text/JSON/XML URLs \
@@ -603,6 +695,10 @@ impl Tool for ReadTool {
                 "range": {
                     "type": "string",
                     "description": "A1-style cell window for .xlsx/.xlsm files, e.g. \"A1:F40\" or \"B2\". Capped at 200 rows by 100 columns per read."
+                },
+                "time": {
+                    "type": "string",
+                    "description": "Video files: a timestamp (seconds like \"75\", or \"1:15\", \"1:02:03\") returning the single frame at that time instead of the contact sheet."
                 },
                 "formulas": {
                     "type": "boolean",
@@ -700,6 +796,9 @@ impl Tool for ReadTool {
             .as_deref()
             .map(str::trim)
             .filter(|q| !q.is_empty());
+        if crate::video::is_video_extension(&ext) {
+            return self.read_video(path, &args, question).await;
+        }
         if let Some(question) = question {
             if is_pdf_extension(&ext) {
                 return self.answer_pdf_page_question(path, &args, question).await;
@@ -1490,6 +1589,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         };
         let out = call_read(&ReadTool::new(), args).await.unwrap();
 
@@ -1561,6 +1661,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         }
     }
 
@@ -1592,6 +1693,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         };
         let out = call_read(&ReadTool::new(), args).await.unwrap();
         assert!(out.contains("[DOCX:"), "{out}");
@@ -1613,6 +1715,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         };
         let error = call_read(&ReadTool::new(), args).await.unwrap_err();
         assert!(
@@ -1792,6 +1895,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         }
     }
 
@@ -1951,6 +2055,7 @@ mod tests {
             sheet: None,
             range: None,
             formulas: false,
+            time: None,
         }
     }
 
@@ -2279,5 +2384,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exactly one page"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn videos_never_come_back_as_text_or_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"not really a video").unwrap();
+        let out = call_read(&ReadTool::new(), image_args(&path, None))
+            .await
+            .unwrap();
+        if crate::video::find_tool("ffmpeg").is_none()
+            || crate::video::find_tool("ffprobe").is_none()
+        {
+            assert!(out.contains("brew install ffmpeg"), "{out}");
+        } else {
+            assert!(out.starts_with("[Video]"), "{out}");
+        }
+        assert!(!out.contains("not really a video"));
     }
 }

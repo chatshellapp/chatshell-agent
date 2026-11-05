@@ -908,6 +908,7 @@ mod tests {
                     sheet: None,
                     range: None,
                     formulas: false,
+                    time: None,
                 },
             )
             .await
