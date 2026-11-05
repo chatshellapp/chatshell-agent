@@ -231,6 +231,49 @@ impl ReadTool {
         }
     }
 
+    /// `question` on a scanned PDF page: the page's image goes to the
+    /// vision responder.
+    async fn answer_pdf_page_question(
+        &self,
+        path: &std::path::Path,
+        args: &ReadArgs,
+        question: &str,
+    ) -> Result<String, ReadError> {
+        let pages = match args.pages.as_deref() {
+            Some(selection) => parse_page_selection(selection)?,
+            None => Vec::new(),
+        };
+        let [page] = pages.as_slice() else {
+            return Err(ReadError(
+                "For PDFs, \"question\" needs \"pages\" to select exactly one page \
+                 (e.g. pages=\"3\"); it asks a vision model about that page's scanned image."
+                    .to_string(),
+            ));
+        };
+        let bytes = self
+            .fs
+            .read(path)
+            .map_err(|e| ReadError(format!("Failed to read PDF: {}", e)))?;
+        let extracted = crate::pdf_images::extract_page_images(&bytes, *page)
+            .map_err(|e| ReadError(format!("Failed to read PDF page images: {}", e)))?;
+        let Some(scan) = extracted.images.into_iter().next() else {
+            return Ok(format!(
+                "[PDF page {page}] has no extractable page image{}. Read it without \
+                 \"question\" for its text.",
+                unsupported_note(&extracted.unsupported)
+            ));
+        };
+        let ext = if scan.mime_type == "image/jpeg" {
+            "jpg"
+        } else {
+            "png"
+        };
+        let image = build_loaded_image(scan.bytes, ext)?;
+        let label = format!("{} page {page}", path.display());
+        self.answer_image_question_bytes(image, &label, question)
+            .await
+    }
+
     /// Read a remote URL: fetch bytes through the injected seam and
     /// dispatch by content type — images take the same paths as local
     /// image files, text-ish content returns capped raw text, anything
@@ -513,7 +556,9 @@ impl Tool for ReadTool {
                 Local paths: for text files, returns content with line numbers; \
                 for image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data; \
                 for PDF files, extracts and returns the text content; use \"pages\" for a \
-                1-based page selection (e.g. \"3\", \"1-5\", \"1,4,7\"); \
+                1-based page selection (e.g. \"3\", \"1-5\", \"1,4,7\"); pages without a text \
+                layer (scans) return their page image, and \"question\" with a single page asks \
+                a vision model about that page; \
                 for Office files, .docx/.pptx return Markdown (headings, lists, tables, slide text) \
                 and .xlsx/.xlsm return a bounded TSV view with a sheet list; use \"sheet\" and \
                 \"range\" (A1 style) to page spreadsheets, and \"formulas\" to show formulas; \
@@ -549,7 +594,7 @@ impl Tool for ReadTool {
                 },
                 "question": {
                     "type": "string",
-                    "description": "Optional natural-language question about an image file or image URL. When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. Only supported for images; offset/limit are ignored."
+                    "description": "Optional natural-language question about an image file, an image URL, or one scanned PDF page (with pages set to a single page). When set, the image is analyzed by a vision model and the answer is returned as text instead of the image data. offset/limit are ignored."
                 },
                 "sheet": {
                     "type": "string",
@@ -656,6 +701,9 @@ impl Tool for ReadTool {
             .map(str::trim)
             .filter(|q| !q.is_empty());
         if let Some(question) = question {
+            if is_pdf_extension(&ext) {
+                return self.answer_pdf_page_question(path, &args, question).await;
+            }
             if !is_image_extension(&ext) {
                 return Err(ReadError(format!(
                     "The \"question\" argument only supports image files, not \
@@ -683,7 +731,11 @@ impl Tool for ReadTool {
             return read_image(self.fs.as_ref(), path, &ext);
         }
         if is_pdf_extension(&ext) {
-            return read_pdf(self.fs.as_ref(), path, &args);
+            let scans = PdfScanAccess {
+                inline: self.main_model_vision != Some(false),
+                question: self.image_question.is_some(),
+            };
+            return read_pdf(self.fs.as_ref(), path, &args, scans);
         }
         if crate::office::is_legacy_office_extension(&ext) {
             return Err(ReadError(crate::office::legacy_message(&ext)));
@@ -1083,7 +1135,35 @@ fn format_page_selection(pages: &[usize]) -> String {
 
 /// Read a PDF file by extracting its text content. When `args.pages` is set,
 /// only those pages are extracted and returned with page markers.
-fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<String, ReadError> {
+/// What the read tool can do with scanned PDF pages.
+#[derive(Clone, Copy)]
+struct PdfScanAccess {
+    /// The main model accepts images: return page scans inline.
+    inline: bool,
+    /// A vision responder answers `question` on a page.
+    question: bool,
+}
+
+/// Pages per read whose scans are returned inline.
+const MAX_SCAN_PAGES_PER_READ: usize = 5;
+
+fn unsupported_note(unsupported: &[String]) -> String {
+    if unsupported.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (its images use {}, which cannot be decoded)",
+            unsupported.join(", ")
+        )
+    }
+}
+
+fn read_pdf(
+    fs: &dyn Fs,
+    path: &std::path::Path,
+    args: &ReadArgs,
+    scans: PdfScanAccess,
+) -> Result<String, ReadError> {
     let bytes = fs
         .read(path)
         .map_err(|e| ReadError(format!("Failed to read PDF: {}", e)))?;
@@ -1129,10 +1209,16 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Stri
             if extracted.pages.len() == 1 { "" } else { "s" },
             shown
         );
+        let mut scans_shown = 0usize;
         for page in &extracted.pages {
             output.push_str(&format!("\n--- page {} ---\n", page.page));
             if page.text.trim().is_empty() {
-                output.push_str("[No extractable text on this page]\n");
+                output.push_str(&scanned_page_section(
+                    &bytes,
+                    page.page,
+                    scans,
+                    &mut scans_shown,
+                ));
             } else {
                 output.push_str(page.text.trim_end());
                 output.push('\n');
@@ -1153,9 +1239,25 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Stri
     let text = extracted.text;
 
     if text.trim().is_empty() {
+        let next = if scans.inline || scans.question {
+            format!(
+                " It is probably scanned: read it with \"pages\" (e.g. pages=\"1-{}\") to see \
+                 the page images{}.",
+                extracted.page_count.min(MAX_SCAN_PAGES_PER_READ),
+                if scans.inline {
+                    ""
+                } else {
+                    ", or add \"question\" with one page to ask a vision model about it"
+                }
+            )
+        } else {
+            " It is probably scanned, and no vision model is available to look at the \
+             page images."
+                .to_string()
+        };
         return Ok(format!(
-            "[PDF] No extractable text found ({} pages; the PDF may contain only images).",
-            extracted.page_count
+            "[PDF] No extractable text found ({} pages).{}",
+            extracted.page_count, next
         ));
     }
 
@@ -1172,6 +1274,61 @@ fn read_pdf(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Stri
         "[PDF: {} pages, {} lines extracted]\n\n{}",
         extracted.page_count, line_count, text
     ))
+}
+
+/// The body of a page without a text layer: its scan inline (for vision
+/// models, up to [`MAX_SCAN_PAGES_PER_READ`] per read) or guidance.
+fn scanned_page_section(
+    bytes: &[u8],
+    page: usize,
+    scans: PdfScanAccess,
+    shown: &mut usize,
+) -> String {
+    let extracted = match crate::pdf_images::extract_page_images(bytes, page) {
+        Ok(extracted) => extracted,
+        Err(e) => {
+            return format!("[No extractable text on this page; page images unreadable: {e}]\n");
+        }
+    };
+    let Some(scan) = extracted.images.into_iter().next() else {
+        return format!(
+            "[No extractable text or page image on this page{}]\n",
+            unsupported_note(&extracted.unsupported)
+        );
+    };
+    if !scans.inline {
+        return if scans.question {
+            format!(
+                "[No text layer: this page is a scanned image ({}x{}). Ask about it with \
+                 \"question\" and pages=\"{page}\".]\n",
+                scan.width, scan.height
+            )
+        } else {
+            "[No text layer: this page is a scanned image, and no vision model is \
+             available to look at it.]\n"
+                .to_string()
+        };
+    }
+    if *shown >= MAX_SCAN_PAGES_PER_READ {
+        return format!(
+            "[Scanned page; image not included (at most {MAX_SCAN_PAGES_PER_READ} page images \
+             per read). Read pages=\"{page}\" to see it.]\n"
+        );
+    }
+    *shown += 1;
+    let (bytes, mime, width, height) = match crate::image_fit::fit_image(&scan.bytes) {
+        Ok(fitted) => (fitted.bytes, fitted.mime_type, fitted.width, fitted.height),
+        Err(_) => (
+            scan.bytes,
+            scan.mime_type.to_string(),
+            scan.width,
+            scan.height,
+        ),
+    };
+    format!(
+        "[Scanned page image, {width}x{height}]\ndata:{mime};base64,{}\n",
+        BASE64.encode(&bytes)
+    )
 }
 
 /// Read an OOXML office document. Format-specific extraction lives in
@@ -1540,7 +1697,10 @@ mod tests {
             .unwrap();
 
         assert!(out.contains("--- page 2 ---"), "{out}");
-        assert!(out.contains("[No extractable text on this page]"), "{out}");
+        assert!(
+            out.contains("[No extractable text or page image on this page]"),
+            "{out}"
+        );
     }
 
     #[tokio::test]
@@ -2049,5 +2209,75 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("resized to 2000x500"), "{}", &out[..120]);
+    }
+
+    fn scan_args(path: &std::path::Path, pages: Option<&str>, question: Option<&str>) -> ReadArgs {
+        ReadArgs {
+            pages: pages.map(str::to_string),
+            ..image_args(path, question)
+        }
+    }
+
+    fn write_scanned_pdf(pages: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan.pdf");
+        let streams = (0..pages)
+            .map(|_| {
+                (
+                    crate::pdf_images::tests::jpeg_image_stream(400, 500),
+                    "jpeg",
+                )
+            })
+            .collect();
+        std::fs::write(&path, crate::pdf_images::tests::scanned_pdf(streams)).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_pages_return_their_images() {
+        let (_dir, path) = write_scanned_pdf(7);
+        let tool = ReadTool::new();
+
+        let overview = call_read(&tool, scan_args(&path, None, None))
+            .await
+            .unwrap();
+        assert!(overview.contains("probably scanned"), "{overview}");
+        assert!(overview.contains("pages=\"1-5\""), "{overview}");
+
+        let out = call_read(&tool, scan_args(&path, Some("1-7"), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.matches("data:image/jpeg;base64,").count(),
+            5,
+            "capped per read"
+        );
+        assert!(out.contains("Read pages=\"6\" to see it"), "{out}");
+        let (_, images) = crate::tool_images::split_image_lines(&out).unwrap();
+        assert_eq!(images.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn text_only_models_get_guidance_and_question_reads_one_page() {
+        let (_dir, path) = write_scanned_pdf(2);
+        let tool = ReadTool::new()
+            .with_main_model_vision(false)
+            .with_image_question(std::sync::Arc::new(MockVisionResponder { fail: false }));
+
+        let out = call_read(&tool, scan_args(&path, Some("2"), None))
+            .await
+            .unwrap();
+        assert!(!out.contains("base64,"), "{out}");
+        assert!(out.contains("pages=\"2\""), "{out}");
+
+        let answer = call_read(&tool, scan_args(&path, Some("2"), Some("what is it?")))
+            .await
+            .unwrap();
+        assert!(answer.contains("analyzed by a vision model"), "{answer}");
+
+        let err = call_read(&tool, scan_args(&path, Some("1-2"), Some("what?")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exactly one page"), "{err}");
     }
 }

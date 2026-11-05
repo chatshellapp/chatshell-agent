@@ -15,6 +15,7 @@ pub mod net_policy;
 pub mod office;
 pub mod openai_compat;
 pub mod path_policy;
+pub mod pdf_images;
 pub mod pdf_text;
 pub mod permission;
 pub mod permission_store;
