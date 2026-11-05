@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::image_question::{ImageInput, ImageQuestionResponder};
+use super::reference::{ReferenceResolver, reference_scheme};
 use crate::path_policy;
 use crate::tool_fs::{Fs, StdFs};
 use futures::future::BoxFuture;
@@ -103,6 +104,10 @@ pub struct ReadTool {
     /// gate: injected only when web_fetch is enabled for the conversation).
     #[serde(skip, default)]
     url_fetcher: Option<Arc<dyn UrlByteFetcher>>,
+    /// Host resolver for `attachment://`-style references; `None` makes
+    /// references fail with an explanation.
+    #[serde(skip, default)]
+    references: Option<Arc<dyn ReferenceResolver>>,
 }
 
 impl Default for ReadTool {
@@ -119,6 +124,7 @@ impl ReadTool {
             image_question: None,
             main_model_vision: None,
             url_fetcher: None,
+            references: None,
         }
     }
 
@@ -153,6 +159,13 @@ impl ReadTool {
     /// it, URL paths fail with a gate message pointing at web_fetch.
     pub fn with_url_fetcher(mut self, fetcher: Arc<dyn UrlByteFetcher>) -> Self {
         self.url_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Resolve host references (`attachment://…`) through the injected
+    /// resolver.
+    pub fn with_reference_resolver(mut self, resolver: Arc<dyn ReferenceResolver>) -> Self {
+        self.references = Some(resolver);
         self
     }
 
@@ -494,7 +507,9 @@ impl Tool for ReadTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Read the contents of a file from the filesystem or a remote URL. \
+        "Read the contents of a file from the filesystem, a remote URL, or a \
+                conversation reference (attachment://... for chat attachments, \
+                tool-output://... for saved tool output). \
                 Local paths: for text files, returns content with line numbers; \
                 for image files (PNG, JPEG, GIF, WebP, BMP), returns metadata and base64-encoded data; \
                 for PDF files, extracts and returns the text content; use \"pages\" for a \
@@ -518,7 +533,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to a local file, or an HTTP/HTTPS URL"
+                    "description": "Absolute path to a local file, an HTTP/HTTPS URL, or a reference given in the conversation (attachment://..., tool-output://...)"
                 },
                 "offset": {
                     "type": "number",
@@ -583,9 +598,27 @@ impl Tool for ReadTool {
             return self.read_url(&args).await;
         }
 
-        let path = std::path::Path::new(&args.path);
+        // Host references resolve to host-private storage the resolver
+        // vouches for (the current conversation's attachments and spilled
+        // tool output); that grant replaces the private-directory floor.
+        // Every other path goes through the read policy.
+        let resolved;
+        let path = if let Some(scheme) = reference_scheme(&args.path) {
+            let Some(resolver) = self.references.as_ref() else {
+                return Err(ReadError(format!(
+                    "\"{scheme}://\" references are not available in this \
+                     conversation: {}",
+                    args.path
+                )));
+            };
+            resolved = resolver.resolve(&args.path).await.map_err(ReadError)?;
+            resolved.as_path()
+        } else {
+            let path = std::path::Path::new(&args.path);
+            path_policy::check_read(path, self.project_root.as_deref()).map_err(ReadError)?;
+            path
+        };
 
-        path_policy::check_read(path, self.project_root.as_deref()).map_err(ReadError)?;
         if !path.exists() {
             return Err(ReadError(format!("File not found: {}", args.path)));
         }
@@ -1898,5 +1931,88 @@ mod tests {
         let other = tool.map_error(ReadError("no such anchor".into()));
         assert_eq!(other.kind().as_str(), "other");
         assert_eq!(other.message(), "no such anchor");
+    }
+
+    struct MapResolver(std::collections::HashMap<String, std::path::PathBuf>);
+
+    impl ReferenceResolver for MapResolver {
+        fn resolve(
+            &self,
+            reference: &str,
+        ) -> BoxFuture<'static, Result<std::path::PathBuf, String>> {
+            let found = self
+                .0
+                .get(reference)
+                .cloned()
+                .ok_or_else(|| format!("Not an attachment of this conversation: {reference}"));
+            Box::pin(async move { found })
+        }
+    }
+
+    fn reference_args(reference: &str) -> ReadArgs {
+        ReadArgs {
+            path: reference.to_string(),
+            ..image_args(std::path::Path::new(""), None)
+        }
+    }
+
+    #[tokio::test]
+    async fn references_resolve_through_the_host_resolver() {
+        let (_dir, path) = write_temp("first\nsecond\n");
+        let resolver = MapResolver(
+            [("attachment://abc.txt".to_string(), path.clone())]
+                .into_iter()
+                .collect(),
+        );
+        let tool = ReadTool::new().with_reference_resolver(std::sync::Arc::new(resolver));
+
+        let out = call_read(&tool, reference_args("attachment://abc.txt"))
+            .await
+            .unwrap();
+        assert!(out.contains("second"), "{out}");
+
+        let err = call_read(&tool, reference_args("attachment://other.txt"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not an attachment"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn references_without_a_resolver_explain_themselves() {
+        let err = call_read(&ReadTool::new(), reference_args("attachment://abc.txt"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("references are not available"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_references_bypass_the_private_directory_floor() {
+        // The resolver's grant is the authorization: a vouched file under a
+        // private directory stays readable, the same path spelled directly
+        // does not.
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private-app-data-for-reference-test");
+        std::fs::create_dir_all(&private).unwrap();
+        let file = private.join("hash.txt");
+        std::fs::write(&file, "secret but attached\n").unwrap();
+        crate::path_policy::register_private_dir(&private);
+
+        let resolver = MapResolver(
+            [("attachment://hash.txt".to_string(), file.clone())]
+                .into_iter()
+                .collect(),
+        );
+        let tool = ReadTool::new().with_reference_resolver(std::sync::Arc::new(resolver));
+
+        let out = call_read(&tool, reference_args("attachment://hash.txt"))
+            .await
+            .unwrap();
+        assert!(out.contains("secret but attached"), "{out}");
+
+        let err = call_read(&tool, image_args(&file, None)).await.unwrap_err();
+        assert!(err.to_string().contains("Read blocked"), "{err}");
     }
 }

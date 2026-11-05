@@ -14,6 +14,7 @@ pub mod grep;
 pub mod image_question;
 pub mod kill_shell;
 pub mod read;
+pub mod reference;
 pub mod write;
 
 pub use bash::{BashArgs, BashError, BashTool, SharedBashSession, TempFileList};
@@ -24,6 +25,7 @@ pub use grep::{GrepArgs, GrepError, GrepTool};
 pub use image_question::{ImageInput, ImageQuestionResponder};
 pub use kill_shell::{KillShellArgs, KillShellError, KillShellTool};
 pub use read::{ReadArgs, ReadError, ReadTool, UrlByteFetcher, UrlBytes};
+pub use reference::ReferenceResolver;
 pub use write::{WriteArgs, WriteError, WriteTool};
 
 /// Classify a tool's IO-facing error into a rig execution error whose
