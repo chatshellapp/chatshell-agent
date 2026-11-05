@@ -431,6 +431,73 @@ mod os_sandbox_integration {
     }
 
     #[tokio::test]
+    async fn git_dir_cannot_be_moved_aside_to_plant_hooks() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&f.root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        // Rename-around: move `.git` aside, plant a hook and a config
+        // through the new name, move it back. Each step is attempted even
+        // if an earlier one fails.
+        let out = run(
+            &f.tool,
+            "mv .git .git-bak; mkdir -p .git-bak/hooks; \
+             echo evil > .git-bak/hooks/pre-commit; \
+             printf '[core]\\n\\thooksPath = /tmp/evil\\n' >> .git-bak/config; \
+             mv .git-bak .git; echo done",
+        )
+        .await;
+        assert!(out.contains("done"), "{out}");
+        assert!(f.root.join(".git").is_dir(), "{out}");
+        assert!(!f.root.join(".git-bak").exists(), "{out}");
+        assert!(!f.root.join(".git/hooks/pre-commit").exists(), "{out}");
+        let config = std::fs::read_to_string(f.root.join(".git/config")).unwrap();
+        assert!(!config.contains("hooksPath"), "{config}");
+        // In-place git work still succeeds.
+        let out = run(
+            &f.tool,
+            "echo x > f.txt && git add f.txt && git -c user.name=t -c user.email=t@t \
+             commit -qm init && git log --oneline | wc -l",
+        )
+        .await;
+        assert!(out.trim().ends_with('1'), "{out}");
+        // Removing and recreating `.git` fails the same way (this
+        // deletes the unprotected repository contents, so it runs last).
+        let out = run(
+            &f.tool,
+            "rm -rf .git 2>/dev/null; mkdir -p .git/hooks && echo evil > .git/hooks/post-checkout; echo done",
+        )
+        .await;
+        assert!(!f.root.join(".git/hooks/post-checkout").exists(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn host_processes_are_not_visible() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let host_pid = std::process::id();
+        let out = run(
+            &f.tool,
+            &format!(
+                "test -e /proc/{host_pid}/environ && echo visible || echo hidden; \
+                 kill -0 {host_pid} 2>/dev/null && echo signalable || echo unsignalable"
+            ),
+        )
+        .await;
+        assert!(out.contains("hidden"), "{out}");
+        assert!(out.contains("unsignalable"), "{out}");
+    }
+
+    #[tokio::test]
     async fn network_is_blocked_and_escalates_as_network() {
         let Some(f) = fixture(EscalationDecision::Deny) else {
             return;

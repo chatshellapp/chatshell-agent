@@ -14,11 +14,19 @@
 //! macOS: `/usr/bin/sandbox-exec` is invoked by absolute path (a `PATH`
 //! entry can never substitute it) and every path travels as a `-D`
 //! parameter; the profile text contains only constants. Each writable root
-//! carries an anchor deny on unlinking/renaming the root itself, so the
-//! carveout cannot be relocated from inside the sandbox.
+//! carries an anchor deny on unlinking/renaming the root itself, and each
+//! root's `.git` entry is write-denied by name (no rename, removal,
+//! replacement, or creation), so the `.git` carveouts cannot be relocated
+//! from inside the sandbox: moving `.git` aside, planting a hook, and
+//! moving it back fails at the first step.
 //!
 //! Linux: bubblewrap from a fixed system location; read-only bind of `/`,
-//! writable binds of the roots, masks over blocked files.
+//! writable binds of the roots, masks over blocked files, and private pid
+//! and session namespaces. A `.git` directory is bound onto itself so it
+//! becomes a mount point, which the kernel refuses to rename or remove
+//! (`EBUSY`); a `.git` file (worktree pointer) is bound read-only. A
+//! symlinked or absent `.git` cannot be anchored by bubblewrap and is
+//! left to the in-tool write checks.
 
 use crate::grant_keys;
 use crate::path_policy;
@@ -38,8 +46,11 @@ const MASK_SCAN_LIMIT: usize = 20_000;
 /// Directories skipped by the mask scan (large, and not where secrets live).
 const MASK_SCAN_SKIP: &[&str] = &[".git", "node_modules", "target", ".venv", "venv", "dist"];
 
-/// Repository paths under each writable root that stay read-only.
-const ROOT_PROTECTED: &[&str] = &[".git/hooks", ".git/config"];
+/// Repository entry under each writable root whose name is anchored.
+const GIT_DIR: &str = ".git";
+
+/// Paths inside [`GIT_DIR`] that stay read-only (code-execution vectors).
+const GIT_PROTECTED: &[&str] = &["hooks", "config"];
 
 /// An available sandbox launcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,18 +62,63 @@ pub enum SandboxBackend {
 }
 
 /// The sandbox backend usable on this machine, if any.
+///
+/// On Linux, bubblewrap must also pass a one-time probe of the namespace
+/// setup the jail needs (user and pid namespaces plus a private procfs).
+/// It fails where unprivileged user namespaces are disabled, or inside
+/// containers whose `/proc` is partially masked (the kernel refuses a
+/// fresh procfs mount there). Such a machine reports no backend, so
+/// callers degrade exactly as when bubblewrap is not installed, instead
+/// of every bash session dying at startup.
 pub fn detect_backend() -> Option<SandboxBackend> {
     if cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).is_file() {
         return Some(SandboxBackend::Seatbelt);
     }
     if cfg!(target_os = "linux") {
-        return BWRAP_PATHS
-            .iter()
-            .map(Path::new)
-            .find(|path| path.is_file())
-            .map(|path| SandboxBackend::Bubblewrap(path.to_path_buf()));
+        static PROBED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        return PROBED
+            .get_or_init(|| {
+                BWRAP_PATHS
+                    .iter()
+                    .map(Path::new)
+                    .find(|path| path.is_file())
+                    .filter(|path| bubblewrap_works(path))
+                    .map(Path::to_path_buf)
+            })
+            .clone()
+            .map(SandboxBackend::Bubblewrap);
     }
     None
+}
+
+/// Fixed locations searched for the probe's no-op program.
+const TRUE_PATHS: &[&str] = &["/usr/bin/true", "/bin/true"];
+
+/// Whether bubblewrap can set up the namespaces [`bubblewrap_spec`] uses.
+fn bubblewrap_works(bwrap: &Path) -> bool {
+    let Some(true_bin) = TRUE_PATHS.iter().find(|p| Path::new(p).is_file()) else {
+        return false;
+    };
+    std::process::Command::new(bwrap)
+        .args([
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--unshare-pid",
+            "--proc",
+            "/proc",
+            "--unshare-net",
+            "--",
+            true_bin,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// What the sandboxed bash may do.
@@ -153,18 +209,15 @@ fn resolved(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn write_denied_paths(home: Option<&Path>, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Some(home) = home {
-        for entry in path_policy::WRITE_BLOCKED_HOME {
-            paths.push(resolved(&home.join(entry.trim_end_matches('/'))));
-        }
-    }
-    for root in roots {
-        for protected in ROOT_PROTECTED {
-            paths.push(root.join(protected));
-        }
-    }
+fn home_write_denied_paths(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = home
+        .map(|home| {
+            path_policy::WRITE_BLOCKED_HOME
+                .iter()
+                .map(|entry| resolved(&home.join(entry.trim_end_matches('/'))))
+                .collect()
+        })
+        .unwrap_or_default();
     paths.dedup();
     paths
 }
@@ -276,18 +329,33 @@ fn seatbelt_profile(policy: &SandboxPolicy, roots: &[PathBuf]) -> SeatbeltBuilde
     }
 
     // Denies come after the allows: the last matching rule wins.
-    for path in write_denied_paths(policy.home.as_deref(), roots) {
+    let git_protected = roots.iter().flat_map(|root| {
+        GIT_PROTECTED
+            .iter()
+            .map(move |entry| root.join(GIT_DIR).join(entry))
+    });
+    for path in home_write_denied_paths(policy.home.as_deref())
+        .into_iter()
+        .chain(git_protected)
+    {
         let name = b.param("WRITE_DENY", path);
         b.profile.push_str(&format!(
             "(deny file-write* (subpath (param \"{name}\")))\n"
         ));
     }
     // Anchor denies: the root directory itself cannot be removed or
-    // renamed, so the carveout always names the same directory.
+    // renamed, and its `.git` entry cannot be renamed, removed, created,
+    // or rewritten (a `.git` file is a gitdir pointer), so the carveouts
+    // above always name the repository git will use. Entries inside
+    // `.git` are separate paths, so ordinary git operations still work.
     for root in roots {
         let name = b.param("ANCHOR", root.clone());
         b.profile.push_str(&format!(
             "(deny file-write-unlink (literal (param \"{name}\")))\n"
+        ));
+        let name = b.param("GIT_ANCHOR", root.join(GIT_DIR));
+        b.profile.push_str(&format!(
+            "(deny file-write* (literal (param \"{name}\")))\n"
         ));
     }
 
@@ -360,6 +428,10 @@ fn bubblewrap_spec(
         "/".into(),
         "--dev".into(),
         "/dev".into(),
+        // A private pid namespace makes `--proc` mount a fresh procfs:
+        // host processes (and their environments) stay invisible and
+        // cannot be signaled or traced.
+        "--unshare-pid".into(),
         "--proc".into(),
         "/proc".into(),
     ];
@@ -371,10 +443,13 @@ fn bubblewrap_spec(
     for root in roots {
         push3(&mut args, "--bind", root, root);
     }
-    for path in write_denied_paths(policy.home.as_deref(), roots) {
+    for path in home_write_denied_paths(policy.home.as_deref()) {
         if path.exists() {
             push3(&mut args, "--ro-bind", &path, &path);
         }
+    }
+    for root in roots {
+        protect_git_dir(&mut args, &root.join(GIT_DIR));
     }
     for path in bubblewrap_read_masks(policy, roots) {
         if path.is_dir() {
@@ -397,6 +472,49 @@ fn bubblewrap_spec(
         args,
         cwd: inner.cwd,
         env: inner.env,
+    }
+}
+
+/// Anchor a root's `.git` and keep its code-execution paths read-only.
+///
+/// bubblewrap cannot deny by name, so the anchor is a mount: a `.git`
+/// directory is bound onto itself (a mount point cannot be renamed or
+/// removed from inside the namespace), then `hooks` and `config` are bound
+/// read-only on top. A missing `hooks` directory gets a read-only tmpfs
+/// (bubblewrap creates the empty directory, as `git init` would). A `.git`
+/// file is bound read-only. Symlinked or absent entries are skipped:
+/// bubblewrap refuses symlink destinations, and mounting on a missing
+/// `.git` would create one on the host.
+fn protect_git_dir(args: &mut Vec<String>, git: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(git) else {
+        return;
+    };
+    let git_s = git.display().to_string();
+    if meta.is_file() {
+        args.extend(["--ro-bind".into(), git_s.clone(), git_s]);
+        return;
+    }
+    if !meta.is_dir() {
+        return;
+    }
+    args.extend(["--bind".into(), git_s.clone(), git_s]);
+    for entry in GIT_PROTECTED {
+        let path = git.join(entry);
+        let path_s = path.display().to_string();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {
+                args.extend(["--ro-bind".into(), path_s.clone(), path_s]);
+            }
+            Err(_) if *entry == "hooks" => {
+                args.extend([
+                    "--tmpfs".into(),
+                    path_s.clone(),
+                    "--remount-ro".into(),
+                    path_s,
+                ]);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -569,6 +687,77 @@ mod tests {
         assert!(args.contains("--unshare-net"));
         let on = wrap(&backend, &policy(&root, true), inner(&root)).unwrap();
         assert!(!on.args.iter().any(|a| a == "--unshare-net"));
+    }
+
+    #[test]
+    fn seatbelt_anchors_git_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let spec = wrap(
+            &SandboxBackend::Seatbelt,
+            &policy(&root, false),
+            inner(&root),
+        )
+        .unwrap();
+        let profile = &spec.args[1];
+        let git = root.join(".git");
+        let param = spec
+            .args
+            .iter()
+            .find_map(|arg| {
+                arg.strip_suffix(&format!("={}", git.display()))
+                    .filter(|name| name.starts_with("GIT_ANCHOR_"))
+            })
+            .expect("git anchor parameter");
+        let rule = format!("(deny file-write* (literal (param \"{param}\")))");
+        let rule_at = profile.find(&rule).expect("git anchor rule");
+        let allow_at = profile.find("(allow file-write* (subpath").unwrap();
+        assert!(rule_at > allow_at, "anchor must follow the allows");
+        for protected in ["hooks", "config"] {
+            let path = format!("={}", git.join(protected).display());
+            assert!(spec.args.iter().any(|a| a.ends_with(&path)), "{protected}");
+        }
+    }
+
+    #[test]
+    fn bubblewrap_anchors_git_directory_and_isolates_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "").unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let spec = wrap(&backend, &policy(&root, false), inner(&root)).unwrap();
+        let args = spec.args.join(" ");
+        let git = root.join(".git").display().to_string();
+        let anchor = format!("--bind {git} {git}");
+        let hooks = format!("--tmpfs {git}/hooks --remount-ro {git}/hooks");
+        let config = format!("--ro-bind {git}/config {git}/config");
+        let root_bind = args
+            .find(&format!("--bind {0} {0} ", root.display()))
+            .unwrap();
+        let anchor_at = args.find(&anchor).expect("git self-bind");
+        let hooks_at = args.find(&hooks).expect("read-only hooks tmpfs");
+        let config_at = args.find(&config).expect("read-only config");
+        assert!(root_bind < anchor_at && anchor_at < hooks_at && anchor_at < config_at);
+        assert!(spec.args.iter().any(|a| a == "--unshare-pid"));
+        let pid = spec.args.iter().position(|a| a == "--unshare-pid").unwrap();
+        let proc = spec.args.iter().position(|a| a == "--proc").unwrap();
+        assert!(pid < proc);
+    }
+
+    #[test]
+    fn bubblewrap_binds_git_file_read_only_and_skips_missing_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let spec = wrap(&backend, &policy(&root, false), inner(&root)).unwrap();
+        assert!(!spec.args.join(" ").contains(".git"));
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let spec = wrap(&backend, &policy(&root, false), inner(&root)).unwrap();
+        let git = root.join(".git").display().to_string();
+        let args = spec.args.join(" ");
+        assert!(args.contains(&format!("--ro-bind {git} {git}")), "{args}");
+        assert!(!args.contains(&format!("{git}/hooks")), "{args}");
     }
 
     #[test]
