@@ -1540,9 +1540,31 @@ pub fn prepare_svg_figure(
     })
 }
 
-/// System-prompt fragment inviting SVG figures; `mermaid` when the client
-/// also renders ```mermaid fences.
+/// The visual formats a client renders inline. Mirrors
+/// `chatshell_agent_core::visual_output::VisualCapabilities`.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct VisualCapabilities {
+    /// ```svg fences render as figures (the user setting is on).
+    pub svg: bool,
+    /// ```mermaid fences render as diagrams.
+    pub mermaid: bool,
+    /// `$...$` and `$$...$$` render as math.
+    pub math: bool,
+}
+
+impl From<VisualCapabilities> for core::visual_output::VisualCapabilities {
+    fn from(value: VisualCapabilities) -> Self {
+        Self {
+            svg: value.svg,
+            mermaid: value.mermaid,
+            math: value.math,
+        }
+    }
+}
+
+/// System-prompt fragment routing content to the formats the client renders
+/// (Markdown tables, math, Mermaid, SVG figures).
 #[uniffi::export]
-pub fn svg_figure_prompt(mermaid: bool) -> String {
-    core::svg_figure::svg_figure_prompt(mermaid)
+pub fn visual_output_prompt(capabilities: VisualCapabilities) -> String {
+    core::visual_output::visual_output_prompt(&capabilities.into())
 }

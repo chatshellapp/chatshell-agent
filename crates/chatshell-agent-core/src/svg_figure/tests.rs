@@ -416,15 +416,13 @@ fn static_figures_report_not_animated() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn prompt_mentions_mermaid_only_when_rendered() {
-    let with = svg_figure_prompt(true);
-    let without = svg_figure_prompt(false);
-    assert!(with.contains("```mermaid"));
-    assert!(!without.contains("mermaid"));
-    for prompt in [&with, &without] {
-        assert!(prompt.contains("```svg"));
-        assert!(prompt.contains("var(--accent)"));
-        assert!(prompt.contains("@keyframes"));
-        assert!(prompt.is_ascii(), "prompt must stay ASCII");
-    }
+fn rules_cover_drawing_but_not_routing() {
+    let rules = svg_figure_rules();
+    assert!(rules.contains("```svg"));
+    assert!(rules.contains("var(--accent)"));
+    assert!(rules.contains("@keyframes"));
+    // Format choice (Mermaid, tables, charts) lives in `visual_output`.
+    assert!(!rules.contains("mermaid"));
+    assert!(!rules.contains("Markdown table"));
+    assert!(rules.is_ascii(), "prompt must stay ASCII");
 }

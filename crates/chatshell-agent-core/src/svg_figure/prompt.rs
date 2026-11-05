@@ -1,14 +1,12 @@
-//! System-prompt fragment inviting inline SVG figures.
+//! System-prompt section with the rules for inline SVG figures.
+//!
+//! When to draw an SVG at all is decided by the visual-output routing rules
+//! (`crate::visual_output`); this section only says how to draw one.
 
 const HEAD: &str = "\
-Visuals: when a diagram, flow, state machine, UI mockup, layout, or geometry \
-says more than prose, you SHOULD draw it in a ```svg fenced block; it renders \
-inline as an image. One visual per idea; never draw the same content twice, \
-and never announce or restate the figure in prose; add only what it does not show.";
-
-const MERMAID: &str = "\
-- Flow, sequence, or dependency graph that Mermaid draws well? Prefer a \
-```mermaid block; use SVG for what Mermaid cannot draw.";
+SVG figures: a ```svg fenced block renders inline as an image. One visual per \
+idea; never draw the same content twice, and never announce or restate the \
+figure in prose; add only what it does not show.";
 
 const RULES: &str = "\
 - Size with viewBox only (no width/height attributes). 1 unit is about 1 CSS px. \
@@ -21,19 +19,10 @@ series var(--c1) to var(--c6). They follow the reader's theme.
 or CSS @keyframes in a <style> element, for prototypes, transitions, and processes. \
 Keep loops calm (at least 1s per cycle) and make the first frame meaningful.
 - Self-contained: NEVER <script>, event attributes (onclick and similar), \
-<foreignObject>, <image>, external href or url(), or embedded fonts.
-- Numbers to compare: use a Markdown table instead of an SVG chart.";
+<foreignObject>, <image>, external href or url(), or embedded fonts.";
 
-/// The fragment appended to the system prompt when the client renders SVG
-/// figures. `mermaid`: the client also renders ```mermaid fences.
-pub fn svg_figure_prompt(mermaid: bool) -> String {
-    let mut prompt = String::with_capacity(HEAD.len() + MERMAID.len() + RULES.len() + 2);
-    prompt.push_str(HEAD);
-    prompt.push('\n');
-    if mermaid {
-        prompt.push_str(MERMAID);
-        prompt.push('\n');
-    }
-    prompt.push_str(RULES);
-    prompt
+/// How to draw a figure: appended after the routing rules when the client
+/// renders SVG figures.
+pub fn svg_figure_rules() -> String {
+    format!("{HEAD}\n{RULES}")
 }

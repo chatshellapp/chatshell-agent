@@ -4,7 +4,8 @@
 //! an isolated image (`<img src="data:image/svg+xml;...">`). This module is
 //! the shared, platform-independent part of that pipeline:
 //!
-//! - [`svg_figure_prompt`]: the system-prompt fragment inviting figures;
+//! - [`svg_figure_rules`]: the system-prompt section on how to draw a figure
+//!   (when to draw one is routed by `crate::visual_output`);
 //! - [`close_partial_svg`]: makes a still-streaming fence parseable;
 //! - [`prepare_svg_figure`]: repair → theme → sanitize → size, producing a
 //!   self-contained document safe to hand to a web engine.
@@ -24,7 +25,7 @@ mod theme;
 mod tree;
 
 pub use color::series_colors;
-pub use prompt::svg_figure_prompt;
+pub use prompt::svg_figure_rules;
 pub use repair::close_partial_svg;
 
 use std::fmt;
