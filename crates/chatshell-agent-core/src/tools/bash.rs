@@ -96,6 +96,18 @@ impl<P: ShellProcess> BashSession<P> {
 
     /// Merge stderr into stdout, disable prompts, wait for ready marker.
     async fn initialize(&mut self) -> Result<(), BashError> {
+        match self.handshake().await {
+            Ok(()) => Ok(()),
+            // Say why: a sandbox launcher that cannot set up its jail
+            // reports the reason on stderr and exits.
+            Err(BashError(message)) => Err(BashError(match self.proc.exit_report().await {
+                Some(report) => format!("{message} ({report})"),
+                None => message,
+            })),
+        }
+    }
+
+    async fn handshake(&mut self) -> Result<(), BashError> {
         let marker = Self::make_marker("READY");
         let init = format!(
             "exec 2>&1\nexport PS1=''\nexport PS2=''\nexport PROMPT_COMMAND=''\necho {marker}\n"
@@ -887,6 +899,60 @@ impl<S: ShellSpawner + Default> BashTool<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failing_launcher(script: &str) -> SpawnSpec {
+        SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: std::env::temp_dir(),
+            env: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_failure_reports_status_and_stderr() {
+        let err = BashSession::new(
+            &TokioSpawner,
+            failing_launcher("echo 'bwrap: Creating new namespace failed' >&2; exit 3"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exit status 3: bwrap: Creating new namespace failed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chatty_launcher_does_not_block_and_keeps_the_tail() {
+        let err = BashSession::new(
+            &TokioSpawner,
+            failing_launcher(
+                "i=0; while [ $i -lt 4000 ]; do echo noise-line-$i >&2; i=$((i+1)); done; \
+                 echo final-reason >&2; exit 1",
+            ),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("final-reason"), "{err}");
+        assert!(!err.contains("noise-line-0 "), "{err}");
+        assert!(err.len() < 1200, "report not bounded: {} bytes", err.len());
+    }
+
+    #[tokio::test]
+    async fn launcher_report_strips_terminal_escapes() {
+        let err = BashSession::new(
+            &TokioSpawner,
+            failing_launcher("printf 'bad\\033[2Jthing\\n' >&2; exit 2"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        assert!(err.contains("exit status 2: bad [2Jthing"), "{err:?}");
+    }
 
     #[test]
     fn test_bash_tool_creation() {

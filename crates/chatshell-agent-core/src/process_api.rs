@@ -12,16 +12,31 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 /// How long `kill` waits for the process to exit before giving up.
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A live shell process with piped stdin/stdout (stderr is the host's call:
-/// the bash engine merges it inside the shell via `exec 2>&1`).
+/// How long [`ShellProcess::exit_report`] waits for the process to exit
+/// and its stderr to drain.
+const EXIT_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bytes of launcher stderr kept for [`ShellProcess::exit_report`] (the
+/// tail; older output is dropped).
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// Characters of stderr included in an exit report.
+const REPORT_STDERR_CHARS: usize = 1000;
+
+/// A live shell process with piped stdin/stdout. The bash engine merges
+/// the shell's stderr into stdout via `exec 2>&1`, so the process's own
+/// stderr carries only what is written before that: the launcher's
+/// messages (a sandbox that fails to start) and early shell errors.
 pub trait ShellProcess: Send + 'static {
     /// Write bytes to the process's stdin.
     fn write_stdin(&mut self, data: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
@@ -47,6 +62,13 @@ pub trait ShellProcess: Send + 'static {
 
     /// Wait for exit (unbounded).
     fn wait_dead(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Why the process ended early, for errors during session startup:
+    /// its exit status and the tail of its stderr. Waits briefly for the
+    /// process to exit. `None` when nothing is known.
+    fn exit_report(&mut self) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
 }
 
 /// Everything needed to launch a shell process. The bash tool builds one
@@ -81,7 +103,8 @@ impl SpawnSpec {
 pub trait ShellSpawner: Send + Sync + Clone + 'static {
     type Shell: ShellProcess;
 
-    /// Spawn `spec` with piped stdin/stdout and null stderr.
+    /// Spawn `spec` with piped stdin/stdout. Stderr is captured for
+    /// [`ShellProcess::exit_report`] where the implementation supports it.
     fn spawn(&self, spec: &SpawnSpec) -> impl Future<Output = io::Result<Self::Shell>> + Send;
 }
 
@@ -90,6 +113,37 @@ pub struct TokioShell {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
+    stderr_drain: Option<JoinHandle<()>>,
+}
+
+/// Read `stderr` to EOF, keeping the last [`STDERR_TAIL_BYTES`] bytes.
+/// Draining continuously means a chatty process never blocks on a full
+/// pipe.
+async fn drain_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+    let mut chunk = [0u8; 1024];
+    while let Ok(n) = stderr.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+        tail.extend_from_slice(&chunk[..n]);
+        let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        tail.drain(..excess);
+    }
+}
+
+/// Render captured stderr for an error message: lossy UTF-8, control
+/// characters (terminal escapes) removed, whitespace collapsed, and
+/// bounded to the last [`REPORT_STDERR_CHARS`] characters.
+fn render_stderr(bytes: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let skip = text.chars().count().saturating_sub(REPORT_STDERR_CHARS);
+    text.chars().skip(skip).collect()
 }
 
 /// Default spawner: any Unix-ish host with a real `bash` on PATH.
@@ -108,8 +162,9 @@ impl ShellSpawner for TokioSpawner {
         cmd.current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // stderr is merged into stdout by the shell itself (`exec 2>&1`)
-            .stderr(Stdio::null())
+            // The shell merges its stderr into stdout itself (`exec 2>&1`);
+            // what arrives here before that is kept for `exit_report`.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
@@ -121,10 +176,17 @@ impl ShellSpawner for TokioSpawner {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("failed to open stdout"))?;
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let stderr_drain = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(drain_stderr(stderr, stderr_tail.clone())));
         Ok(TokioShell {
             child,
             stdin,
             reader: BufReader::new(stdout),
+            stderr_tail,
+            stderr_drain,
         })
     }
 }
@@ -156,5 +218,43 @@ impl ShellProcess for TokioShell {
 
     async fn wait_dead(&mut self) -> io::Result<()> {
         self.child.wait().await.map(|_| ())
+    }
+
+    async fn exit_report(&mut self) -> Option<String> {
+        let status = tokio::time::timeout(EXIT_REPORT_TIMEOUT, self.child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        // The process has exited (or is stuck): its stderr reaches EOF once
+        // every holder of the pipe is gone.
+        if let Some(drain) = self.stderr_drain.as_mut()
+            && tokio::time::timeout(EXIT_REPORT_TIMEOUT, drain)
+                .await
+                .is_ok()
+        {
+            self.stderr_drain = None;
+        }
+        let stderr = {
+            let tail = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+            render_stderr(&tail)
+        };
+        let status = status.map(|status| match status.code() {
+            Some(code) => format!("exit status {code}"),
+            None => format!("{status}"),
+        });
+        match (status, stderr.is_empty()) {
+            (None, true) => None,
+            (Some(status), true) => Some(status),
+            (None, false) => Some(stderr),
+            (Some(status), false) => Some(format!("{status}: {stderr}")),
+        }
+    }
+}
+
+impl Drop for TokioShell {
+    fn drop(&mut self) {
+        if let Some(drain) = self.stderr_drain.take() {
+            drain.abort();
+        }
     }
 }
