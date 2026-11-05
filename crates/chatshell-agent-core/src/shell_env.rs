@@ -19,6 +19,50 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TZ", "TMPDIR",
 ];
 
+/// Additional variables Windows processes need to start and find the user
+/// profile (the MXC process container rejects a child environment missing
+/// `SYSTEMROOT` or `LOCALAPPDATA`). Windows names are case-insensitive.
+pub const WINDOWS_ALLOWLIST: &[&str] = &[
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "USERNAME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Variables every bash session receives on this platform.
+pub fn allowlist() -> Vec<&'static str> {
+    allowlist_for(cfg!(windows))
+}
+
+fn allowlist_for(windows: bool) -> Vec<&'static str> {
+    let mut names = BASE_ALLOWLIST.to_vec();
+    if windows {
+        names.extend_from_slice(WINDOWS_ALLOWLIST);
+    }
+    names
+}
+
+fn is_allowlisted(name: &str) -> bool {
+    allowlist()
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
+
 /// Variables commonly needed by developer workflows; offered as
 /// suggestions when they are set in the app environment. Append-only.
 pub const SUGGESTED_PASSTHROUGH: &[&str] = &[
@@ -75,11 +119,16 @@ pub fn minimized_env(
     passthrough: &[String],
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
-    let names: BTreeSet<&str> = BASE_ALLOWLIST
-        .iter()
-        .copied()
-        .chain(passthrough.iter().map(String::as_str))
-        .filter(|name| is_valid_name(name))
+    // Allowlist names are trusted constants (Windows has names such as
+    // `PROGRAMFILES(X86)`); only user-supplied names are validated.
+    let names: BTreeSet<&str> = allowlist()
+        .into_iter()
+        .chain(
+            passthrough
+                .iter()
+                .map(String::as_str)
+                .filter(|name| is_valid_name(name)),
+        )
         .collect();
     names
         .into_iter()
@@ -92,7 +141,7 @@ pub fn minimized_env(
 pub fn suggestions(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
     SUGGESTED_PASSTHROUGH
         .iter()
-        .filter(|name| !BASE_ALLOWLIST.contains(name) && !is_secret_name(name))
+        .filter(|name| !is_allowlisted(name) && !is_secret_name(name))
         .filter(|name| lookup(name).is_some())
         .map(|name| name.to_string())
         .collect()
@@ -116,7 +165,7 @@ pub fn missing_variable_hint(
         if !screaming && !SUGGESTED_PASSTHROUGH.contains(&token) {
             continue;
         }
-        if BASE_ALLOWLIST.contains(&token)
+        if is_allowlisted(token)
             || passthrough.iter().any(|name| name == token)
             || is_secret_name(token)
         {
@@ -226,6 +275,16 @@ mod tests {
         assert_eq!(names, vec!["HOME", "JAVA_HOME", "PATH"]);
         assert!(!built.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
         assert!(!built.iter().any(|(k, _)| k == "CHATSHELL_SENTINEL"));
+    }
+
+    #[test]
+    fn windows_allowlist_adds_startup_variables() {
+        let windows = allowlist_for(true);
+        for name in ["SYSTEMROOT", "LOCALAPPDATA", "PATHEXT", "PATH"] {
+            assert!(windows.contains(&name), "{name}");
+        }
+        assert!(!allowlist_for(false).contains(&"SYSTEMROOT"));
+        assert!(WINDOWS_ALLOWLIST.iter().all(|name| !is_secret_name(name)));
     }
 
     #[test]

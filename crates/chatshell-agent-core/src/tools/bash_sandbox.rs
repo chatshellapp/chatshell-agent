@@ -189,9 +189,12 @@ mod tests {
     }
 }
 
-/// End-to-end tests against the real macOS Seatbelt sandbox.
-#[cfg(all(test, target_os = "macos"))]
-mod seatbelt_integration {
+/// End-to-end tests against the real OS sandbox: Seatbelt on macOS,
+/// bubblewrap on Linux. On Linux the tests skip when bubblewrap is
+/// missing unless `CHATSHELL_REQUIRE_BWRAP=1` (set in the Linux container
+/// run) turns a missing backend into a failure.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod os_sandbox_integration {
     use super::*;
     use crate::sandbox::{SandboxBackend, detect_backend};
     use crate::tools::bash::{BashArgs, BashTool};
@@ -223,7 +226,22 @@ mod seatbelt_integration {
         network: Arc<AtomicBool>,
     }
 
-    fn fixture(decision: EscalationDecision) -> Fixture {
+    /// The backend under test, or `None` to skip.
+    fn backend() -> Option<SandboxBackend> {
+        let detected = detect_backend();
+        if detected.is_none() {
+            assert!(
+                cfg!(target_os = "linux")
+                    && std::env::var("CHATSHELL_REQUIRE_BWRAP").as_deref() != Ok("1"),
+                "no sandbox backend detected"
+            );
+            eprintln!("skipping: bubblewrap not installed");
+        }
+        detected
+    }
+
+    fn fixture(decision: EscalationDecision) -> Option<Fixture> {
+        let backend = backend()?;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let root = base.join("work");
@@ -236,19 +254,19 @@ mod seatbelt_integration {
         let tool = BashTool::with_working_directory(root.display().to_string())
             .with_env_passthrough(Vec::new())
             .with_sandbox(BashSandbox {
-                backend: Some(SandboxBackend::Seatbelt),
+                backend: Some(backend),
                 scratch_dir: base.join("scratch"),
                 network_allowed: network.clone(),
                 escalator: Some(recorder.clone()),
             });
-        Fixture {
+        Some(Fixture {
             outside: base.join("outside.txt"),
             _dir: dir,
             root,
             tool,
             recorder,
             network,
-        }
+        })
     }
 
     async fn run(tool: &BashTool, command: &str) -> String {
@@ -271,12 +289,21 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn backend_is_detected() {
-        assert_eq!(detect_backend(), Some(SandboxBackend::Seatbelt));
+        if cfg!(target_os = "macos") {
+            assert_eq!(detect_backend(), Some(SandboxBackend::Seatbelt));
+        } else if std::env::var("CHATSHELL_REQUIRE_BWRAP").as_deref() == Ok("1") {
+            assert!(matches!(
+                detect_backend(),
+                Some(SandboxBackend::Bubblewrap(_))
+            ));
+        }
     }
 
     #[tokio::test]
     async fn writes_inside_root_and_scratch_succeed() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         let out = run(
             &f.tool,
             "echo hi > inside.txt && echo ok > \"$TMPDIR/t\" && cat inside.txt",
@@ -289,7 +316,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn ordinary_tools_work_inside_the_sandbox() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         let out = run(
             &f.tool,
             "mkdir -p src && printf 'a\\nb\\n' > src/x.txt && find . -name '*.txt' | sed 's/x/y/' \
@@ -302,7 +331,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn write_outside_root_is_denied_and_escalated() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         let out = run(&f.tool, &format!("echo hi > '{}'", f.outside.display())).await;
         assert!(!f.outside.exists(), "write escaped the sandbox: {out}");
         let reqs = requests(&f);
@@ -313,7 +344,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn approved_retry_runs_once_outside_the_sandbox() {
-        let f = fixture(EscalationDecision::RetryUnsandboxed);
+        let Some(f) = fixture(EscalationDecision::RetryUnsandboxed) else {
+            return;
+        };
         let out = run(&f.tool, &format!("echo hi > '{}'", f.outside.display())).await;
         assert!(f.outside.exists(), "{out}");
         assert!(out.contains("outside the sandbox"), "{out}");
@@ -327,13 +360,16 @@ mod seatbelt_integration {
     async fn workspace_root_cannot_be_renamed() {
         // Make the parent writable too (it is the scratch root), so only
         // the anchor deny on the workspace root can stop the rename.
+        let Some(backend) = backend() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let root = base.join("work");
         std::fs::create_dir_all(&root).unwrap();
         let tool = BashTool::with_working_directory(root.display().to_string()).with_sandbox(
             BashSandbox {
-                backend: Some(SandboxBackend::Seatbelt),
+                backend: Some(backend),
                 scratch_dir: base.clone(),
                 network_allowed: Arc::new(AtomicBool::new(false)),
                 escalator: None,
@@ -361,7 +397,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn blocked_file_names_are_unreadable() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         std::fs::write(f.root.join(".env"), "SECRET=1").unwrap();
         let out = run(&f.tool, "cat .env").await;
         assert!(!out.contains("SECRET=1"), "{out}");
@@ -369,7 +407,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn git_hooks_stay_read_only() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         // Initialize outside the sandbox: the hooks directory must exist
         // for the deny to be meaningful.
         let init = std::process::Command::new("git")
@@ -392,7 +432,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn network_is_blocked_and_escalates_as_network() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         let out = run(
             &f.tool,
             "curl -sS --max-time 5 https://example.com -o /dev/null",
@@ -406,7 +448,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn allowing_network_restarts_the_session_with_network() {
-        let f = fixture(EscalationDecision::AllowNetworkSession);
+        let Some(f) = fixture(EscalationDecision::AllowNetworkSession) else {
+            return;
+        };
         let out = run(
             &f.tool,
             "curl -sS --max-time 5 https://example.com -o /dev/null",
@@ -418,7 +462,9 @@ mod seatbelt_integration {
 
     #[tokio::test]
     async fn environment_is_minimized() {
-        let f = fixture(EscalationDecision::Deny);
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
         // Cargo sets this for the test process; bash must not inherit it.
         if std::env::var("CARGO_MANIFEST_DIR").is_err() {
             return;
