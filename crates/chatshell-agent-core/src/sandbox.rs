@@ -22,11 +22,36 @@
 //!
 //! Linux: bubblewrap from a fixed system location; read-only bind of `/`,
 //! writable binds of the roots, masks over blocked files, a private pid
-//! namespace, and a new session (no controlling terminal). A `.git` directory is bound onto itself so it
-//! becomes a mount point, which the kernel refuses to rename or remove
-//! (`EBUSY`); a `.git` file (worktree pointer) is bound read-only. A
-//! symlinked or absent `.git` cannot be anchored by bubblewrap and is
-//! left to the in-tool write checks.
+//! namespace, and a new session (no controlling terminal). A `.git`
+//! directory is bound onto itself so it becomes a mount point, which the
+//! kernel refuses to rename or remove (`EBUSY`); a `.git` file (worktree
+//! pointer) is bound read-only.
+//!
+//! # Known Linux limitations
+//!
+//! bubblewrap works with mounts, so it can only cover paths that exist
+//! when the session starts and cannot match by file name. Seatbelt has
+//! neither limit (it matches paths and name patterns at access time), so
+//! these gaps are Linux-only:
+//!
+//! - **Read blocklist by name.** Blocked file names (`.env`,
+//!   `credentials.json`, ...) are found by a scan of the writable roots at
+//!   spawn time, bounded by depth (`MASK_SCAN_MAX_DEPTH`), an entry
+//!   budget (`MASK_SCAN_LIMIT`), and the skipped directories
+//!   (`MASK_SCAN_SKIP`). Such a file beyond those bounds, or created
+//!   during the session, is readable by bash. Home entries (`~/.ssh/id_*`,
+//!   ...) are likewise masked only if they exist at spawn time.
+//! - **`.git` anchoring.** A symlinked `.git` cannot be anchored
+//!   (bubblewrap refuses symlink mount destinations), and a `.git` absent
+//!   at spawn time cannot be either (mounting would create one on the
+//!   host). In both cases bash can create or replace `.git` with hooks.
+//! - **Nested repositories** (a `.git` below a root, not at it) are not
+//!   anchored on either platform.
+//!
+//! The file tools' `path_policy` checks still apply to their own reads
+//! and writes. Bash gets only a textual check of direct write targets,
+//! which indirect targets (`h=.git/hooks; echo x > "$h/pre-commit"`)
+//! pass, so none of these gaps is closed for bash by in-tool checks.
 
 use crate::grant_keys;
 use crate::path_policy;
@@ -43,7 +68,13 @@ pub const BWRAP_PATHS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/b
 /// blocked file names (bubblewrap cannot mask by pattern).
 const MASK_SCAN_LIMIT: usize = 20_000;
 
-/// Directories skipped by the mask scan (large, and not where secrets live).
+/// Deepest directory level the mask scan descends to below a root.
+const MASK_SCAN_MAX_DEPTH: usize = 8;
+
+/// Directories skipped by the mask scan: large build and dependency
+/// trees, where scanning costs startup time and project secrets rarely
+/// live. A blocked name inside them stays readable on Linux (see the
+/// module docs).
 const MASK_SCAN_SKIP: &[&str] = &[".git", "node_modules", "target", ".venv", "venv", "dist"];
 
 /// Repository entry under each writable root whose name is anchored.
@@ -535,9 +566,10 @@ fn protect_git_dir(args: &mut Vec<String>, git: &Path) {
 }
 
 /// Existing paths bubblewrap must mask: home entries, absolute entries,
-/// and blocked file names found under the writable roots (bubblewrap
-/// cannot mask by pattern, so files created later are left to the
-/// in-tool `path_policy` check).
+/// and blocked file names found under the writable roots. bubblewrap
+/// cannot mask by pattern, so this is a spawn-time snapshot: files outside
+/// the scan bounds or created later stay readable by bash (see the module
+/// docs; the in-tool `path_policy` check covers only the file tools).
 fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut masks = Vec::new();
     if let Some(home) = &policy.home {
@@ -568,7 +600,7 @@ fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathB
 }
 
 fn scan_blocked_names(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<PathBuf>) {
-    if depth > 8 || *budget == 0 {
+    if depth > MASK_SCAN_MAX_DEPTH || *budget == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
