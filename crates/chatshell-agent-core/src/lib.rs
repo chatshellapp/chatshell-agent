@@ -9,6 +9,7 @@ pub mod edit_anchor;
 pub mod fuzzy_match;
 pub mod grant_keys;
 pub mod history;
+pub mod image_fit;
 pub mod mcp;
 pub mod net_policy;
 pub mod office;

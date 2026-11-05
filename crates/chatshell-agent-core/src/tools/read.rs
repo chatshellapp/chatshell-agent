@@ -705,13 +705,21 @@ fn read_text(fs: &dyn Fs, path: &std::path::Path, args: &ReadArgs) -> Result<Str
     let check_len = raw_bytes.len().min(BINARY_CHECK_SIZE);
     if raw_bytes[..check_len].contains(&0) {
         return Err(ReadError(format!(
-            "Binary file detected, cannot read as text: {}",
+            "Binary file detected, cannot read as text: {}. Inspect it with the \
+             bash tool instead (for example `file`, `strings | head`, `xxd | head`, \
+             or `unzip -l` / `tar -tf` for archives).",
             args.path
         )));
     }
 
-    let content = String::from_utf8(raw_bytes)
-        .map_err(|_| ReadError(format!("File is not valid UTF-8: {}", args.path)))?;
+    let content = String::from_utf8(raw_bytes).map_err(|_| {
+        ReadError(format!(
+            "File is not valid UTF-8: {}. It may use another text encoding \
+                 (try `iconv -f <encoding> -t utf-8` in bash) or be a binary format \
+                 (inspect it with `file` in bash).",
+            args.path
+        ))
+    })?;
 
     // Mint the content anchor for the edit tool ([path#TAG] protocol).
     let anchor_header = crate::anchor_store::record_anchor(path, &content)
@@ -871,12 +879,25 @@ fn read_image_inline(image: &LoadedImage, label: &str) -> String {
         label,
         image.header
     );
-    format!(
-        "{}\ndata:{};base64,{}",
-        image.header,
-        image.mime,
-        BASE64.encode(&image.bytes)
-    )
+    // Same provider ladder as attached images: oversized or provider-
+    // unsupported rasters (BMP, ICO) are scaled and re-encoded.
+    match crate::image_fit::fit_image(&image.bytes) {
+        Ok(fitted) if fitted.changed => format!(
+            "{} (resized to {}x{} {} for the model)\ndata:{};base64,{}",
+            image.header,
+            fitted.width,
+            fitted.height,
+            fitted.mime_type,
+            fitted.mime_type,
+            BASE64.encode(&fitted.bytes)
+        ),
+        _ => format!(
+            "{}\ndata:{};base64,{}",
+            image.header,
+            image.mime,
+            BASE64.encode(&image.bytes)
+        ),
+    }
 }
 
 /// Image read for a main model that cannot accept image input: metadata
@@ -2014,5 +2035,19 @@ mod tests {
 
         let err = call_read(&tool, image_args(&file, None)).await.unwrap_err();
         assert!(err.to_string().contains("Read blocked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_inline_images_go_through_the_provider_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2400, 600))
+            .save(&path)
+            .unwrap();
+
+        let out = call_read(&ReadTool::new(), image_args(&path, None))
+            .await
+            .unwrap();
+        assert!(out.contains("resized to 2000x500"), "{}", &out[..120]);
     }
 }
