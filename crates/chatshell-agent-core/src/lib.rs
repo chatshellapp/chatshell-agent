@@ -32,6 +32,7 @@ pub mod thinking;
 pub mod tokenizer;
 pub mod tool_definitions;
 pub mod tool_fs;
+pub mod tool_images;
 pub mod tools;
 pub mod types;
 pub mod web_fetch;
