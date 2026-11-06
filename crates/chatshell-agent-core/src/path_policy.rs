@@ -98,6 +98,8 @@ pub const READ_DENY_GROUPS: &[DenyGroup] = &[
             Home(".config/bun/bunfig.toml"),
             Home(".vault-token"),
             Home(".terraform.d"),
+            Home(".terraformrc"),
+            Home(".config/containers/auth.json"),
             Home(".config/op"),
             Home(".credentials"),
             Home(".secrets"),
@@ -354,6 +356,7 @@ impl ReadClassifier {
             .collect();
         let absolutes = active_read_groups()
             .flat_map(|group| group.entries)
+            .chain(active_write_ask_groups().flat_map(|group| group.entries))
             .filter_map(|entry| match entry {
                 Absolute(abs) => Some((*abs, std::fs::canonicalize(abs).ok())),
                 _ => None,
@@ -407,6 +410,32 @@ impl ReadClassifier {
             }
         }
         best
+    }
+
+    /// Classify a write of `path` and its symlink-resolved form against
+    /// the write ask-tier groups and the private directories.
+    pub fn classify_write(&self, path: &Path) -> Option<WriteBlock> {
+        let lexical = normalize_path(path);
+        let resolved = resolve_existing(&lexical).filter(|r| *r != lexical);
+        self.classify_write_lexical(&lexical)
+            .or_else(|| resolved.and_then(|r| self.classify_write_lexical(&r)))
+    }
+
+    fn classify_write_lexical(&self, path: &Path) -> Option<WriteBlock> {
+        if let Some(dir) = self.private.iter().find(|dir| path.starts_with(dir)) {
+            return Some(WriteBlock {
+                label: PRIVATE_DIR_LABEL,
+                matched: dir.display().to_string(),
+            });
+        }
+        active_write_ask_groups().find_map(|group| {
+            group.entries.iter().find_map(|entry| {
+                self.entry_matches(entry, path).map(|matched| WriteBlock {
+                    label: group.label,
+                    matched,
+                })
+            })
+        })
     }
 
     /// The matched form of `entry` if it covers `path`. Path entries match
@@ -505,6 +534,143 @@ const WRITE_BLOCKED_ABSOLUTE: &[&str] =
     &["/etc/", "/usr/", "/bin/", "/sbin/", "/System/", "/Library/"];
 
 // ---------------------------------------------------------------------------
+// Write ask tier
+// ---------------------------------------------------------------------------
+
+/// A named set of paths whose writes need the user's (or the auto-mode
+/// judge's) consent for the specific call. The file tools allow them —
+/// the gate has escalated already — and the gate denies them in `yolo`,
+/// which cannot ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteAskGroup {
+    /// Stable identifier (tests, logs).
+    pub id: &'static str,
+    /// Human-readable description, used in prompt and denial messages.
+    pub label: &'static str,
+    pub platform: Platform,
+    pub entries: &'static [DenyEntry],
+}
+
+/// Every write ask-tier group: credential stores (writing one plants or
+/// replaces a credential), persistence locations (code that runs at
+/// login or on a schedule), and agent settings (self-modification and
+/// instruction poisoning).
+pub const WRITE_ASK_GROUPS: &[WriteAskGroup] = &[
+    WriteAskGroup {
+        id: "credential_stores",
+        label: "credential store",
+        platform: Platform::Any,
+        entries: &[
+            Home(".aws"),
+            Home(".azure"),
+            Home(".config/gcloud"),
+            Home(".gcloud"),
+            Home(".kube"),
+            Home(".docker"),
+            Home(".git-credentials"),
+            Home(".netrc"),
+            Home(".npmrc"),
+            Home(".pypirc"),
+            Home(".vault-token"),
+            Home(".terraform.d"),
+            Home(".terraformrc"),
+            Home(".config/op"),
+            Home(".config/gh"),
+            Home(".config/containers/auth.json"),
+            Home(".cargo/credentials.toml"),
+            Home(".cargo/credentials"),
+            Home(".gem/credentials"),
+            Home(".pgpass"),
+            Home(".my.cnf"),
+            Home(".password-store"),
+            Home(".1password"),
+            Home(".codex/auth.json"),
+            Home(".claude/.credentials.json"),
+        ],
+    },
+    WriteAskGroup {
+        id: "credential_stores_macos",
+        label: "credential store",
+        platform: Platform::MacOs,
+        entries: &[Home("Library/Keychains")],
+    },
+    WriteAskGroup {
+        id: "credential_stores_linux",
+        label: "credential store",
+        platform: Platform::Linux,
+        entries: &[Home(".local/share/keyrings")],
+    },
+    WriteAskGroup {
+        id: "persistence",
+        label: "login or scheduled startup location",
+        platform: Platform::Any,
+        entries: &[
+            Home(".bash_logout"),
+            Home(".zlogout"),
+            Home(".config/fish"),
+            Absolute("/var/spool/cron"),
+        ],
+    },
+    WriteAskGroup {
+        id: "persistence_macos",
+        label: "login or scheduled startup location",
+        platform: Platform::MacOs,
+        entries: &[
+            Home("Library/LaunchAgents"),
+            Home("Library/LaunchDaemons"),
+            Absolute("/var/at/tabs"),
+            Absolute("/private/var/at/tabs"),
+        ],
+    },
+    WriteAskGroup {
+        id: "persistence_linux",
+        label: "login or scheduled startup location",
+        platform: Platform::Linux,
+        entries: &[
+            Home(".config/systemd"),
+            Home(".config/autostart"),
+            Home(".local/share/systemd"),
+            Home(".xprofile"),
+            Home(".xinitrc"),
+        ],
+    },
+    WriteAskGroup {
+        id: "agent_settings",
+        label: "AI agent settings",
+        platform: Platform::Any,
+        entries: &[
+            Home(".claude/settings.json"),
+            Home(".claude/settings.local.json"),
+            Home(".codex/config.toml"),
+            Home(".config/git"),
+        ],
+    },
+];
+
+/// The write ask-tier groups that apply on this platform.
+pub fn active_write_ask_groups() -> impl Iterator<Item = &'static WriteAskGroup> {
+    WRITE_ASK_GROUPS.iter().filter(|g| g.platform.current())
+}
+
+/// A write that hit an ask-tier group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteBlock {
+    /// The group label (or [`PRIVATE_DIR_LABEL`]).
+    pub label: &'static str,
+    /// The matched entry, for messages (`~/Library/LaunchAgents`, ...).
+    pub matched: String,
+}
+
+/// Classify a write of `path` against the write ask-tier groups and the
+/// registered private directories (the host's settings and permission
+/// store live there). Both the lexical path and its symlink-resolved form
+/// are checked. Hard-blocked paths are not reported here: see
+/// [`check_write`].
+pub fn classify_write(path: &Path) -> Option<WriteBlock> {
+    ReadClassifier::new().classify_write(path)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -522,13 +688,21 @@ pub fn check_read(path: &Path, _project_root: Option<&Path>) -> Result<(), Strin
     }
 }
 
-/// Check whether writing to `path` is allowed.
+/// Check whether a file tool may write `path`: the absolute blocklist
+/// (system directories, protected home files, repository internals).
 ///
-/// Two layers:
-/// 1. Absolute blocklist — certain paths are never writable.
-/// 2. Project boundary — when `project_root` is `Some`, writes must land
-///    inside that directory tree.
-pub fn check_write(path: &Path, project_root: Option<&Path>) -> Result<(), String> {
+/// No directory boundary is enforced here, mirroring [`check_read`]:
+/// the permission gate owns the workspace boundary (`ask` prompts,
+/// `auto` judges out-of-workspace writes; the bash jail confines bash).
+/// Ask-tier writes ([`classify_write`]) pass too: the gate escalated
+/// them before the tool runs. The gate runs this same check as a
+/// pre-check, so it denies before any prompt or judgment for a write
+/// the tool would refuse.
+pub fn check_write(path: &Path, _project_root: Option<&Path>) -> Result<(), String> {
+    check_write_blocklist(path)
+}
+
+fn check_write_blocklist(path: &Path) -> Result<(), String> {
     let normalized = normalize_path(path);
     let path_str = normalized.to_string_lossy();
 
@@ -560,18 +734,6 @@ pub fn check_write(path: &Path, project_root: Option<&Path>) -> Result<(), Strin
         if contains_component_prefix(&path_str, blocked) {
             return Err(format!(
                 "Write blocked: protected repository path ({blocked})"
-            ));
-        }
-    }
-
-    // Layer 2: project boundary
-    if let Some(root) = project_root {
-        let root_normalized = normalize_path(root);
-        if !normalized.starts_with(&root_normalized) {
-            return Err(format!(
-                "Write blocked: outside project directory ({} is not under {})",
-                path.display(),
-                root.display()
             ));
         }
     }
@@ -627,7 +789,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 /// Normalize a path by resolving `.` and `..` components lexically (without
 /// touching the filesystem).  This prevents `../../etc/shadow` bypasses
 /// while still working for paths that don't exist yet (write/create).
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -922,22 +1084,97 @@ mod tests {
     }
 
     #[test]
-    fn write_blocks_outside_project() {
-        let root = Path::new("/home/user/project");
-        assert!(check_write(Path::new("/home/user/other/file.txt"), Some(root)).is_err());
-        assert!(check_write(Path::new("/tmp/file.txt"), Some(root)).is_err());
-    }
-
-    #[test]
     fn write_traversal_blocked() {
         let root = Path::new("/home/user/project");
-        assert!(check_write(Path::new("/home/user/project/../../etc/passwd"), Some(root)).is_err());
+        assert!(
+            check_write(
+                Path::new("/home/user/project/../../../etc/passwd"),
+                Some(root)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn write_no_project_root_only_blocklist() {
         assert!(check_write(Path::new("/tmp/safe-file.txt"), None).is_ok());
         assert!(check_write(Path::new("/home/user/project/file.rs"), None).is_ok());
+    }
+
+    // ---- write ask tier ---------------------------------------------------
+
+    #[test]
+    fn credential_store_writes_are_ask_tier() {
+        let home = home_dir().unwrap();
+        for rel in [
+            ".aws/credentials",
+            ".kube/config",
+            ".docker/config.json",
+            ".config/gh/hosts.yml",
+            ".netrc",
+            ".npmrc",
+            ".codex/auth.json",
+        ] {
+            let block = classify_write(&home.join(rel)).unwrap_or_else(|| panic!("{rel}"));
+            assert_eq!(block.label, "credential store", "{rel}");
+            // The tool allows it: the gate escalated already.
+            assert!(check_write(&home.join(rel), None).is_ok(), "{rel}");
+        }
+        assert!(classify_write(&home.join(".aws-vault/notes")).is_none());
+    }
+
+    #[test]
+    fn persistence_and_agent_settings_writes_are_ask_tier() {
+        let home = home_dir().unwrap();
+        let mut paths = vec![
+            home.join(".config/fish/config.fish"),
+            home.join(".bash_logout"),
+            home.join(".claude/settings.json"),
+            home.join(".codex/config.toml"),
+            home.join(".config/git/config"),
+        ];
+        if cfg!(target_os = "macos") {
+            paths.push(home.join("Library/LaunchAgents/com.example.agent.plist"));
+        }
+        if cfg!(target_os = "linux") {
+            paths.push(home.join(".config/systemd/user/evil.service"));
+            paths.push(home.join(".config/autostart/evil.desktop"));
+        }
+        for path in paths {
+            assert!(classify_write(&path).is_some(), "{}", path.display());
+        }
+        assert!(classify_write(Path::new("/tmp/project/src/main.rs")).is_none());
+        assert!(classify_write(&home.join(".claude/projects/x.md")).is_none());
+    }
+
+    #[test]
+    fn private_dir_writes_are_ask_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("app-data");
+        let policy = ReadClassifier::with(None, vec![private.clone()]);
+        let block = policy
+            .classify_write(&private.join("permission_grants.db"))
+            .unwrap();
+        assert_eq!(block.label, PRIVATE_DIR_LABEL);
+        assert!(policy.classify_write(&dir.path().join("other")).is_none());
+    }
+
+    #[test]
+    fn the_gate_owns_the_workspace_boundary() {
+        let root = Path::new("/home/user/project");
+        assert!(check_write(Path::new("/home/user/other/file.txt"), Some(root)).is_ok());
+        assert!(check_write(Path::new("/etc/hosts"), Some(root)).is_err());
+        assert!(check_write(&home_dir().unwrap().join(".zshrc"), None).is_err());
+        assert!(check_write(Path::new("/p/.git/hooks/pre-push"), None).is_err());
+    }
+
+    #[test]
+    fn every_write_ask_group_has_entries_and_a_unique_id() {
+        let mut ids = std::collections::HashSet::new();
+        for group in WRITE_ASK_GROUPS {
+            assert!(!group.entries.is_empty(), "{}", group.id);
+            assert!(ids.insert(group.id), "duplicate id {}", group.id);
+        }
     }
 
     // ---- looks_like_path --------------------------------------------------

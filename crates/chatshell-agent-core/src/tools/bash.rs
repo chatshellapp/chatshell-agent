@@ -546,11 +546,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
         };
 
         // --- write-target boundary check (redirect targets + write commands) ---
-        if let Err(msg) = bash_security::check_write_targets(
-            command,
-            self.project_root.as_deref(),
-            self.default_cwd.as_deref(),
-        ) {
+        if let Err(msg) = bash_security::check_write_targets(command, self.default_cwd.as_deref()) {
             tracing::warn!("🛡️ [bash] Write target blocked: {} — {}", msg, command);
             return Err(BashError(msg));
         }
@@ -709,16 +705,11 @@ impl<S: ShellSpawner + Default> BashTool<S> {
                 sandbox.scratch_dir.display().to_string(),
             ));
         }
-        // Writable: the explicit working directory (never the home
-        // fallback) plus the scratch directory.
-        let mut writable_roots: Vec<PathBuf> = self.default_cwd.iter().map(PathBuf::from).collect();
-        writable_roots.push(sandbox.scratch_dir.clone());
-        let policy = SandboxPolicy {
-            writable_roots,
-            allow_network: sandbox.network_allowed.load(Ordering::SeqCst),
-            home: dirs::home_dir(),
-            private_dirs: crate::path_policy::private_dirs(),
-        };
+        let policy = SandboxPolicy::for_bash(
+            self.default_cwd.as_deref().map(std::path::Path::new),
+            &sandbox.scratch_dir,
+            sandbox.network_allowed.load(Ordering::SeqCst),
+        );
         let spec = sandbox::wrap(backend, &policy, spec)
             .map_err(|e| BashError(format!("Sandbox could not start: {e}")))?;
         Ok(Launch {

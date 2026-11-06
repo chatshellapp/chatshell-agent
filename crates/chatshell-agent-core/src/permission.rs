@@ -1,11 +1,19 @@
 //! Tool-permission decision layer for the approval gate.
 //!
 //! Pure logic: no I/O, no UI, no clock. The host supplies the permission
-//! mode and the session grants and receives a three-valued decision
-//! (allow / deny / prompt). Precedence: hard deny (classifier blocklist)
-//! -> `yolo` allow -> forced prompt (classifier warning, unparsed command,
-//! network egress, private-network fetch) -> session-grant lookup ->
+//! mode and the session grants and receives a decision (allow / deny /
+//! prompt / classify). Precedence: hard deny (bash blocklist, write
+//! blocklist) -> sensitive writes (denied in `yolo`) -> `yolo` allow ->
+//! deletion of existing paths outside the workspace ->
+//! forced prompt (classifier warning, unparsed command, network egress,
+//! private-network fetch, sensitive read) -> session-grant lookup ->
 //! mode/tier matrix -> prompt.
+//!
+//! In [`PermissionMode::Auto`] every prompt becomes
+//! [`GateDecision::Classify`]: the host routes it to the auto-mode judge
+//! with deterministic evidence (see [`crate::judgment`]). Human-minted
+//! grants still short-circuit where they apply in `ask`, before any
+//! judgment; forced sources ignore them in every mode.
 //!
 //! Forced prompts ignore session grants and never offer one: the signal
 //! that forced them is about this specific call, so an earlier approval
@@ -19,6 +27,7 @@
 
 use crate::bash_security::{self, SecurityVerdict};
 use crate::grant_keys::{self, FileTier};
+use crate::judgment::{Evidence, JudgmentRequest, JudgmentSource};
 use crate::net_policy;
 use crate::path_policy::{self, ReadTier};
 use serde::{Deserialize, Serialize};
@@ -37,10 +46,11 @@ pub enum PermissionMode {
     /// cache approvals.
     Ask,
     /// Bash runs inside the OS sandbox without prompting, and file writes
-    /// inside the workspace run silently. Prompts remain for escaping the
-    /// sandbox, out-of-workspace writes, MCP, `kill_shell`, unknown tools,
-    /// classifier warnings, egress, and private-network fetches. Without a
-    /// usable sandbox, bash falls back to per-command prompts.
+    /// inside the workspace run silently. Every call `ask` would prompt
+    /// for (escapes, out-of-workspace writes, MCP, `kill_shell`, unknown
+    /// tools, classifier warnings, egress, private-network fetches,
+    /// sensitive reads and writes, and bash without a sandbox) resolves to
+    /// [`GateDecision::Classify`] for the auto-mode judge.
     Auto,
     /// Run tool calls without prompts. Catastrophic operations are still
     /// hard-denied by the in-tool blocklist and path policy in every mode.
@@ -57,6 +67,8 @@ pub struct GateContext {
     pub sandbox_available: bool,
     /// "Allow network this session" was granted.
     pub network_allowed: bool,
+    /// The conversation scratch directory (a jail writable root).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// Risk tier of a tool call.
@@ -105,6 +117,13 @@ pub enum ForcedPromptKind {
     /// A file-tool read hits an ask-tier `path_policy` group (shell
     /// configuration files, which often hold exported API keys).
     SensitiveRead,
+    /// A write hits a write ask-tier `path_policy` group (credential
+    /// store, persistence location, agent settings, host data). `yolo`,
+    /// which cannot ask, denies these instead.
+    SensitiveWrite,
+    /// A bash command deletes a path that already exists outside the
+    /// workspace. `yolo` (full access) runs these without asking.
+    OutsideDeletion,
 }
 
 /// A prompt that session grants cannot satisfy, with the detail shown
@@ -129,6 +148,10 @@ pub enum GateDecision {
         subject: String,
         forced: Option<ForcedPrompt>,
     },
+    /// `auto` only: route the call to the auto-mode judge. Replaces every
+    /// `Prompt` the same call would get in `ask` (one call, at most one
+    /// judgment).
+    Classify(Box<JudgmentRequest>),
 }
 
 impl GateDecision {
@@ -358,7 +381,7 @@ fn bash_forced_prompt(
 }
 
 /// True when `path` (a file-tool argument) resolves inside `workspace`.
-fn inside_workspace(path: &str, workspace: &Path) -> bool {
+pub(crate) fn inside_workspace(path: &str, workspace: &Path) -> bool {
     let Some(target) = grant_keys::grant_path(path) else {
         return false;
     };
@@ -401,6 +424,81 @@ pub fn resolve(
     resolve_in(mode, &GateContext::default(), tool_name, args, grants)
 }
 
+/// Write targets of a file-tool path: the path itself, and for a
+/// relative path also its workspace-joined form (the tools resolve
+/// relative paths against the working directory).
+fn write_candidates(path: &str, workspace: Option<&Path>) -> Vec<PathBuf> {
+    let path = Path::new(path);
+    let mut candidates = vec![path.to_path_buf()];
+    if path.is_relative()
+        && let Some(workspace) = workspace
+    {
+        candidates.push(workspace.join(path));
+    }
+    candidates
+}
+
+/// Message for a sensitive write: shown on prompts and in `yolo` denials.
+fn sensitive_write_detail(block: &path_policy::WriteBlock) -> String {
+    format!("Writes to a {} ({})", block.label, block.matched)
+}
+
+/// Reason fed back to the model when `yolo` denies a sensitive write.
+fn sensitive_write_denial(block: &path_policy::WriteBlock) -> String {
+    format!(
+        "Write blocked: {} ({}). This location is protected in yolo mode; \
+         ask the user to make this change or switch to a mode that can ask.",
+        block.label, block.matched
+    )
+}
+
+/// Builds the non-allow outcomes for one call: a prompt in `ask`, a
+/// judgment request in `auto`.
+struct Escalation<'a> {
+    mode: PermissionMode,
+    ctx: &'a GateContext,
+    tool_name: &'a str,
+    args: &'a Value,
+}
+
+impl Escalation<'_> {
+    fn judge(
+        &self,
+        subject: String,
+        source: JudgmentSource,
+        forced: Option<ForcedPrompt>,
+    ) -> GateDecision {
+        GateDecision::Classify(Box::new(JudgmentRequest {
+            subject,
+            source,
+            forced,
+            evidence: Evidence::collect(self.tool_name, self.args, self.ctx),
+        }))
+    }
+
+    /// A forced source: past grants in every mode.
+    fn forced(&self, subject: &str, kind: ForcedPromptKind, detail: String) -> GateDecision {
+        if self.mode == PermissionMode::Auto {
+            self.judge(
+                subject.to_string(),
+                kind.into(),
+                Some(ForcedPrompt { kind, detail }),
+            )
+        } else {
+            GateDecision::forced(subject, kind, detail)
+        }
+    }
+
+    /// A mode/tier matrix arm (grants were checked already).
+    fn matrix(&self, subject: String, source: JudgmentSource) -> GateDecision {
+        if self.mode == PermissionMode::Auto {
+            self.judge(subject, source, None)
+        } else {
+            GateDecision::prompt(subject)
+        }
+    }
+}
+
 /// Resolve one tool call against the mode, the turn context, and the
 /// session grants.
 pub fn resolve_in(
@@ -411,10 +509,17 @@ pub fn resolve_in(
     grants: &SessionGrants,
 ) -> GateDecision {
     let sandboxed_auto = mode == PermissionMode::Auto && ctx.sandbox_available;
-    // Bash: hard-deny pre-check, then the mode, forced prompts, grants.
-    // The authoritative blocklist lives inside the bash tool; this
-    // pre-check denies before an approval prompt would be shown for a
-    // command the tool would refuse anyway. The classification is
+    let escalation = Escalation {
+        mode,
+        ctx,
+        tool_name,
+        args,
+    };
+    let workspace = ctx.workspace.as_deref();
+    // Bash: hard-deny pre-checks, the sensitive-write floor, then the
+    // mode, forced sources, grants. The authoritative checks live inside
+    // the bash tool; these pre-checks deny before a prompt or judgment
+    // for a command the tool would refuse anyway. The classification is
     // memoized, so the tool reuses it instead of re-running the pipeline.
     if tool_name == "bash" {
         // Bash without a command argument: let the tool itself surface
@@ -428,36 +533,99 @@ pub fn resolve_in(
                 reason: reason.clone(),
             };
         }
+        let cwd = args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .or_else(|| workspace.and_then(Path::to_str));
+        // Deleting existing paths outside the workspace escalates in the
+        // prompting modes; `yolo` is full access, so only the catastrophic
+        // blocklist above stops a deletion there.
+        let scratch: Vec<PathBuf> = ctx.scratch_dir.iter().cloned().collect();
+        if mode != PermissionMode::Yolo
+            && let Some(target) =
+                bash_security::outside_deletion_target(command, workspace, cwd, &scratch)
+        {
+            return escalation.forced(
+                command,
+                ForcedPromptKind::OutsideDeletion,
+                format!(
+                    "Permanently deletes an existing path outside the workspace: {}",
+                    target.display()
+                ),
+            );
+        }
+        if let Some(block) = bash_security::write_ask_target(command, cwd) {
+            if mode == PermissionMode::Yolo {
+                return GateDecision::Deny {
+                    reason: sensitive_write_denial(&block),
+                };
+            }
+            return escalation.forced(
+                command,
+                ForcedPromptKind::SensitiveWrite,
+                sensitive_write_detail(&block),
+            );
+        }
         if mode == PermissionMode::Yolo {
             return GateDecision::Allow;
         }
         // The network grant only means something when a sandbox enforces
-        // the alternative; without one, egress always prompts.
+        // the alternative; without one, egress always escalates.
         let network_allowed = sandboxed_auto && ctx.network_allowed;
         if let Some((kind, detail)) = bash_forced_prompt(command, &classification, network_allowed)
         {
-            return GateDecision::forced(command, kind, detail);
+            return escalation.forced(command, kind, detail);
         }
         // In sandboxed auto the OS sandbox absorbs everything else;
-        // escapes surface as sandbox escalations after execution.
+        // escapes surface as sandbox denials after execution.
         if sandboxed_auto || grants.bash_command_granted(command) {
             return GateDecision::Allow;
         }
-        return GateDecision::prompt(command);
+        return escalation.matrix(command.to_string(), JudgmentSource::UnsandboxedBash);
+    }
+
+    // File writes: the write blocklist denies in every mode (the tool
+    // would refuse), and the sensitive-write floor escalates (denies in
+    // `yolo`).
+    if matches!(tool_name, "edit" | "write")
+        && let Some(path) = args.get("path").and_then(Value::as_str)
+    {
+        let candidates = write_candidates(path, workspace);
+        for candidate in &candidates {
+            if let Err(reason) = path_policy::check_write(candidate, None) {
+                return GateDecision::Deny { reason };
+            }
+        }
+        if let Some(block) = candidates
+            .iter()
+            .find_map(|candidate| path_policy::classify_write(candidate))
+        {
+            if mode == PermissionMode::Yolo {
+                return GateDecision::Deny {
+                    reason: sensitive_write_denial(&block),
+                };
+            }
+            return escalation.forced(
+                path,
+                ForcedPromptKind::SensitiveWrite,
+                sensitive_write_detail(&block),
+            );
+        }
     }
 
     if mode == PermissionMode::Yolo {
         return GateDecision::Allow;
     }
 
-    // Read tier runs silently, except fetches into private networks.
+    // Read tier runs silently, except fetches into private networks and
+    // ask-tier reads.
     let tier = PermissionTier::for_tool(tool_name);
     if matches!(tier, PermissionTier::Read) {
         if tool_name == "web_fetch"
             && let Some(url) = args.get("url").and_then(Value::as_str)
             && net_policy::is_private_url(url)
         {
-            return GateDecision::forced(
+            return escalation.forced(
                 url,
                 ForcedPromptKind::PrivateNetwork,
                 format!("Fetch targets a private or local network address: {url}"),
@@ -465,9 +633,9 @@ pub fn resolve_in(
         }
         if matches!(tool_name, "read" | "grep" | "glob")
             && let Some(path) = args.get("path").and_then(Value::as_str)
-            && let Some(block) = ask_tier_read(path, ctx.workspace.as_deref())
+            && let Some(block) = ask_tier_read(path, workspace)
         {
-            return GateDecision::forced(
+            return escalation.forced(
                 path,
                 ForcedPromptKind::SensitiveRead,
                 format!(
@@ -483,16 +651,17 @@ pub fn resolve_in(
     // path policy still refuses protected paths in every mode.
     if mode == PermissionMode::Auto
         && matches!(tool_name, "edit" | "write")
-        && let (Some(path), Some(workspace)) =
-            (args.get("path").and_then(Value::as_str), &ctx.workspace)
+        && let (Some(path), Some(workspace)) = (args.get("path").and_then(Value::as_str), workspace)
         && inside_workspace(path, workspace)
     {
         return GateDecision::Allow;
     }
 
+    // Human-minted grants: the same fast paths in `ask` and `auto`.
+    let subject = subject_for(tool_name, args);
     if tool_name == "mcp_tool_use" {
         // MCP grants are per server/tool pair; a call missing either arg
-        // matches no grant and falls through to a prompt (fail-safe).
+        // matches no grant (fail-safe).
         if let (Some(server), Some(tool)) = (
             args.get("server").and_then(Value::as_str),
             args.get("tool").and_then(Value::as_str),
@@ -500,16 +669,24 @@ pub fn resolve_in(
         {
             return GateDecision::Allow;
         }
-    } else if grant_scope(tool_name, args).is_some() && grants.tool_granted(tool_name) {
+        return escalation.matrix(subject, JudgmentSource::McpCall);
+    }
+    if grant_scope(tool_name, args).is_some() && grants.tool_granted(tool_name) {
         return GateDecision::Allow;
-    } else if matches!(tool_name, "edit" | "write")
+    }
+    if matches!(tool_name, "edit" | "write")
         && let Some(path) = args.get("path").and_then(Value::as_str)
         && let Some(resolved) = grant_keys::grant_path(path)
         && grants.file_granted(FileTier::Write, &resolved)
     {
         return GateDecision::Allow;
     }
-    GateDecision::prompt(subject_for(tool_name, args))
+    let source = match tool_name {
+        "edit" | "write" => JudgmentSource::OutOfWorkspaceWrite,
+        "kill_shell" => JudgmentSource::KillShell,
+        _ => JudgmentSource::UnknownTool,
+    };
+    escalation.matrix(subject, source)
 }
 
 #[cfg(test)]
@@ -759,12 +936,23 @@ mod tests {
         );
     }
 
+    /// The forced kind of a prompt, or of the v2 prompt a judgment
+    /// request carries (the interim renderer shows exactly that prompt).
     fn forced_kind(decision: &GateDecision) -> Option<ForcedPromptKind> {
         match decision {
             GateDecision::Prompt {
                 forced: Some(forced),
                 ..
             } => Some(forced.kind),
+            GateDecision::Classify(request) => request.forced.as_ref().map(|f| f.kind),
+            _ => None,
+        }
+    }
+
+    /// The judgment source of a `Classify` decision.
+    fn judged(decision: &GateDecision) -> Option<JudgmentSource> {
+        match decision {
+            GateDecision::Classify(request) => Some(request.source),
             _ => None,
         }
     }
@@ -1076,6 +1264,7 @@ mod tests {
             workspace: Some(workspace.to_path_buf()),
             sandbox_available: sandbox,
             network_allowed: network,
+            scratch_dir: None,
         }
     }
 
@@ -1123,28 +1312,45 @@ mod tests {
     }
 
     #[test]
-    fn auto_prompts_out_of_workspace_writes_mcp_kill_shell_and_unknown_tools() {
+    fn auto_judges_out_of_workspace_writes_mcp_kill_shell_and_unknown_tools() {
         let ws = temp_workspace();
         let ctx = auto_ctx(&ws, true, false);
         let outside = ws.with_file_name("outside.txt");
         let traversal = format!("{}/../escape.txt", ws.display());
-        for (tool, args) in [
-            ("write", json!({ "path": outside.to_str().unwrap() })),
-            ("edit", json!({ "path": traversal })),
-            ("write", json!({ "path": "relative.txt" })),
-            ("mcp_tool_use", json!({ "server": "s", "tool": "t" })),
-            ("kill_shell", json!({})),
-            ("custom_exec", json!({})),
+        for (tool, args, source) in [
+            (
+                "write",
+                json!({ "path": outside.to_str().unwrap() }),
+                JudgmentSource::OutOfWorkspaceWrite,
+            ),
+            (
+                "edit",
+                json!({ "path": traversal }),
+                JudgmentSource::OutOfWorkspaceWrite,
+            ),
+            (
+                "write",
+                json!({ "path": "relative.txt" }),
+                JudgmentSource::OutOfWorkspaceWrite,
+            ),
+            (
+                "mcp_tool_use",
+                json!({ "server": "s", "tool": "t" }),
+                JudgmentSource::McpCall,
+            ),
+            ("kill_shell", json!({}), JudgmentSource::KillShell),
+            ("custom_exec", json!({}), JudgmentSource::UnknownTool),
         ] {
-            assert!(
-                matches!(auto(&ctx, tool, args.clone()), GateDecision::Prompt { .. }),
-                "{tool} {args}"
-            );
+            let decision = auto(&ctx, tool, args.clone());
+            assert_eq!(judged(&decision), Some(source), "{tool} {args}");
+            // Matrix arms carry no forced prompt: their v2 prompt offered
+            // grants, and the interim renderer keeps offering them.
+            assert_eq!(forced_kind(&decision), None, "{tool} {args}");
         }
     }
 
     #[test]
-    fn auto_keeps_forced_prompts() {
+    fn auto_judges_forced_sources() {
         let ws = temp_workspace();
         let ctx = auto_ctx(&ws, true, false);
         let kind = |decision: GateDecision| forced_kind(&decision);
@@ -1190,20 +1396,19 @@ mod tests {
             auto(&auto_ctx(&ws, true, true), "bash", curl.clone()),
             GateDecision::Allow
         );
-        assert!(matches!(
-            auto(&auto_ctx(&ws, false, true), "bash", curl),
-            GateDecision::Prompt { .. }
-        ));
+        assert_eq!(
+            judged(&auto(&auto_ctx(&ws, false, true), "bash", curl)),
+            Some(JudgmentSource::Network)
+        );
     }
 
     #[test]
-    fn auto_without_sandbox_prompts_bash_per_command() {
+    fn auto_without_sandbox_judges_bash_per_command() {
         let ws = temp_workspace();
         let ctx = auto_ctx(&ws, false, false);
-        assert_eq!(
-            auto(&ctx, "bash", json!({ "command": "ls" })),
-            GateDecision::prompt("ls")
-        );
+        let decision = auto(&ctx, "bash", json!({ "command": "ls" }));
+        assert_eq!(judged(&decision), Some(JudgmentSource::UnsandboxedBash));
+        assert_eq!(forced_kind(&decision), None);
         // Session grants still apply, exactly as in ask.
         let mut grants = SessionGrants::default();
         grants.grant_bash_commands(&["ls"]);
@@ -1243,5 +1448,343 @@ mod tests {
             ),
             GateDecision::Prompt { .. }
         ));
+    }
+
+    // ---- permission v3, Phase A -------------------------------------------
+
+    fn every_mode() -> [PermissionMode; 3] {
+        [
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+            PermissionMode::Yolo,
+        ]
+    }
+
+    #[test]
+    fn auto_routes_all_twelve_sources_to_a_judgment_with_evidence() {
+        let ws = temp_workspace();
+        let keep = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let sandboxed = auto_ctx(&ws, true, false);
+        let unsandboxed = auto_ctx(&ws, false, false);
+        let home = dirs::home_dir().unwrap();
+        let zshrc = home.join(".zshrc").display().to_string();
+        let outside = ws.with_file_name("outside-v3.txt");
+        let cases: Vec<(&GateContext, &str, Value, JudgmentSource)> = vec![
+            (
+                &sandboxed,
+                "bash",
+                json!({ "command": "echo $(whoami)" }),
+                JudgmentSource::Security,
+            ),
+            (
+                &sandboxed,
+                "bash",
+                json!({ "command": format!("echo {}", "a".repeat(12_000)) }),
+                JudgmentSource::Unparsed,
+            ),
+            (
+                &sandboxed,
+                "bash",
+                json!({ "command": "curl https://example.com" }),
+                JudgmentSource::Network,
+            ),
+            (
+                &sandboxed,
+                "web_fetch",
+                json!({ "url": "http://10.0.0.1/" }),
+                JudgmentSource::PrivateNetwork,
+            ),
+            (
+                &sandboxed,
+                "read",
+                json!({ "path": zshrc }),
+                JudgmentSource::SensitiveRead,
+            ),
+            (
+                &sandboxed,
+                "write",
+                json!({ "path": outside.to_str().unwrap() }),
+                JudgmentSource::OutOfWorkspaceWrite,
+            ),
+            (
+                &sandboxed,
+                "mcp_tool_use",
+                json!({ "server": "s", "tool": "t" }),
+                JudgmentSource::McpCall,
+            ),
+            (
+                &sandboxed,
+                "kill_shell",
+                json!({}),
+                JudgmentSource::KillShell,
+            ),
+            (
+                &sandboxed,
+                "custom_exec",
+                json!({}),
+                JudgmentSource::UnknownTool,
+            ),
+            (
+                &unsandboxed,
+                "bash",
+                json!({ "command": "ls -la" }),
+                JudgmentSource::UnsandboxedBash,
+            ),
+            (
+                &sandboxed,
+                "write",
+                json!({ "path": home.join(".claude/settings.json").to_str().unwrap() }),
+                JudgmentSource::SensitiveWrite,
+            ),
+            (
+                &sandboxed,
+                "bash",
+                json!({ "command": format!("rm -rf {}", keep.path().display()) }),
+                JudgmentSource::OutsideDeletion,
+            ),
+        ];
+        assert_eq!(cases.len(), 12);
+        for (ctx, tool, args, source) in cases {
+            let GateDecision::Classify(request) = auto(ctx, tool, args.clone()) else {
+                panic!("{tool} {args} should be judged");
+            };
+            assert_eq!(request.source, source, "{tool}");
+            assert_eq!(request.evidence.tool, tool);
+            assert_eq!(request.evidence.jail_applies, tool == "bash");
+            // Forced sources keep the v2 prompt for the interim renderer.
+            let forced = matches!(
+                source,
+                JudgmentSource::Security
+                    | JudgmentSource::Unparsed
+                    | JudgmentSource::Network
+                    | JudgmentSource::PrivateNetwork
+                    | JudgmentSource::SensitiveRead
+                    | JudgmentSource::SensitiveWrite
+                    | JudgmentSource::OutsideDeletion
+            );
+            assert_eq!(request.forced.is_some(), forced, "{tool}");
+            if let Some(forced) = &request.forced {
+                assert_eq!(JudgmentSource::from(forced.kind), source);
+            }
+        }
+    }
+
+    #[test]
+    fn ask_and_yolo_never_classify() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        for mode in [PermissionMode::Ask, PermissionMode::Yolo] {
+            for (tool, args) in [
+                ("bash", json!({ "command": "curl https://example.com" })),
+                ("bash", json!({ "command": "ls" })),
+                ("mcp_tool_use", json!({ "server": "s", "tool": "t" })),
+                ("kill_shell", json!({})),
+                ("web_fetch", json!({ "url": "http://10.0.0.1/" })),
+            ] {
+                let decision = resolve_in(mode, &ctx, tool, &args, &SessionGrants::default());
+                assert_eq!(judged(&decision), None, "{mode:?} {tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_egress_command_yields_one_network_judgment() {
+        let ws = temp_workspace();
+        // Without a sandbox the command is also plain unsandboxed bash;
+        // the forced source wins and is the only judgment.
+        for sandbox in [true, false] {
+            let decision = auto(
+                &auto_ctx(&ws, sandbox, false),
+                "bash",
+                json!({ "command": "curl https://example.com" }),
+            );
+            assert_eq!(judged(&decision), Some(JudgmentSource::Network));
+        }
+    }
+
+    #[test]
+    fn grants_short_circuit_matrix_arms_but_not_forced_sources_in_auto() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, false, false);
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["echo", "ls"]);
+        grants.grant_server_tool("s", "t");
+        grants.grant_tool("kill_shell");
+        let run =
+            |tool: &str, args: Value| resolve_in(PermissionMode::Auto, &ctx, tool, &args, &grants);
+        assert_eq!(run("bash", json!({ "command": "ls" })), GateDecision::Allow);
+        assert_eq!(
+            run("mcp_tool_use", json!({ "server": "s", "tool": "t" })),
+            GateDecision::Allow
+        );
+        assert_eq!(run("kill_shell", json!({})), GateDecision::Allow);
+        // A Warn verdict is judged even though `echo` is granted.
+        assert_eq!(
+            judged(&run("bash", json!({ "command": "echo $(whoami)" }))),
+            Some(JudgmentSource::Security)
+        );
+    }
+
+    #[test]
+    fn write_blocklist_denies_before_any_prompt_or_judgment() {
+        let home = dirs::home_dir().unwrap();
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        let mut grants = SessionGrants::default();
+        grants.grant_tool("write");
+        for path in [
+            home.join(".zshrc").display().to_string(),
+            "/etc/hosts".to_string(),
+            ws.join(".git/hooks/pre-commit").display().to_string(),
+            ".git/config".to_string(),
+        ] {
+            for mode in every_mode() {
+                for tool in ["write", "edit"] {
+                    assert!(
+                        matches!(
+                            resolve_in(mode, &ctx, tool, &json!({ "path": path }), &grants),
+                            GateDecision::Deny { .. }
+                        ),
+                        "{mode:?} {tool} {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_and_grant_store_writes_escalate_and_yolo_denies() {
+        let data = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("perm-v3-app-data-{}", std::process::id()));
+        path_policy::register_private_dir(&data);
+        let home = dirs::home_dir().unwrap();
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        // Even a whole-tool grant cannot silence the floor.
+        let mut grants = SessionGrants::default();
+        grants.grant_tool("write");
+        for path in [
+            data.join(crate::permission_store::STORE_FILE_NAME),
+            data.join("settings.json"),
+            home.join(".claude/settings.json"),
+            home.join(".aws/credentials"),
+        ] {
+            let args = json!({ "path": path.to_str().unwrap() });
+            assert_eq!(
+                forced_kind(&resolve_in(
+                    PermissionMode::Ask,
+                    &ctx,
+                    "write",
+                    &args,
+                    &grants
+                )),
+                Some(ForcedPromptKind::SensitiveWrite),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                judged(&resolve_in(
+                    PermissionMode::Auto,
+                    &ctx,
+                    "write",
+                    &args,
+                    &grants
+                )),
+                Some(JudgmentSource::SensitiveWrite)
+            );
+            assert!(matches!(
+                resolve_in(PermissionMode::Yolo, &ctx, "write", &args, &grants),
+                GateDecision::Deny { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn bash_writes_into_sensitive_locations_escalate_and_yolo_denies() {
+        let home = dirs::home_dir().unwrap();
+        let command = format!(
+            "cp hook.json {}",
+            home.join(".claude/settings.json").display()
+        );
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["cp"]);
+        let args = json!({ "command": command });
+        assert_eq!(
+            forced_kind(&resolve(PermissionMode::Ask, "bash", &args, &grants)),
+            Some(ForcedPromptKind::SensitiveWrite)
+        );
+        assert!(matches!(
+            resolve(PermissionMode::Yolo, "bash", &args, &grants),
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn outside_deletions_escalate_past_grants_and_yolo_allows() {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let ws = root.path().join("ws");
+        let keep = root.path().join("keep");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        let ctx = auto_ctx(&ws, true, false);
+        let args = json!({ "command": format!("rm -rf {}", keep.display()) });
+        // A granted `rm` cannot silence it.
+        let mut grants = SessionGrants::default();
+        grants.grant_bash_commands(&["rm"]);
+        let run = |mode| resolve_in(mode, &ctx, "bash", &args, &grants);
+        assert_eq!(
+            forced_kind(&run(PermissionMode::Ask)),
+            Some(ForcedPromptKind::OutsideDeletion)
+        );
+        assert_eq!(
+            judged(&run(PermissionMode::Auto)),
+            Some(JudgmentSource::OutsideDeletion)
+        );
+        // Yolo is full access: the deletion runs.
+        assert_eq!(run(PermissionMode::Yolo), GateDecision::Allow);
+        // The catastrophic blocklist still holds there.
+        assert!(matches!(
+            resolve_in(
+                PermissionMode::Yolo,
+                &ctx,
+                "bash",
+                &json!({ "command": "rm -rf /" }),
+                &grants
+            ),
+            GateDecision::Deny { .. }
+        ));
+        // Inside the workspace: ordinary auto bash.
+        assert_eq!(
+            auto(&ctx, "bash", json!({ "command": "rm -rf build" })),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn evidence_jail_reflects_the_context() {
+        let ws = temp_workspace();
+        let ctx = GateContext {
+            scratch_dir: Some(ws.join("scratch")),
+            ..auto_ctx(&ws, true, false)
+        };
+        let GateDecision::Classify(request) = auto(
+            &ctx,
+            "bash",
+            json!({ "command": "curl https://example.com" }),
+        ) else {
+            panic!("egress should be judged");
+        };
+        assert_eq!(
+            request.evidence.jail,
+            crate::judgment::JailProfile::Present {
+                network_enabled: false,
+                writable_roots: vec![
+                    ws.display().to_string(),
+                    ws.join("scratch").display().to_string()
+                ],
+            }
+        );
     }
 }

@@ -327,6 +327,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writes_outside_the_project_root_are_left_to_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside.txt");
+        // The gate prompted (ask) or judged (auto) this call already.
+        let tool = WriteTool::with_project_root(root);
+        let args = WriteArgs {
+            path: outside.to_string_lossy().to_string(),
+            content: "x".to_string(),
+        };
+        <WriteTool as Tool>::call(&tool, &mut rig_test_context(), args)
+            .await
+            .expect("an approved out-of-root write succeeds");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+    }
+
+    #[tokio::test]
     async fn shebang_write_marks_executable() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("run.sh");

@@ -1568,25 +1568,154 @@ pub fn check_with_context(value: &str, context: SecurityContext) -> SecurityVerd
 }
 
 // ---------------------------------------------------------------------------
-// Write-target extraction for project boundary enforcement
+// Write-target extraction for the write blocklist
 // ---------------------------------------------------------------------------
 
 /// Extract file paths that a bash command would write to (redirections + common
 /// write commands) and check each against `path_policy::check_write`.
 ///
-/// Returns `Err(reason)` on the first violation, or `Ok(())` if all targets
-/// are within the allowed boundary.
-pub fn check_write_targets(
-    command: &str,
-    project_root: Option<&std::path::Path>,
-    cwd: Option<&str>,
-) -> Result<(), String> {
+/// Returns `Err(reason)` on the first blocklisted target. The workspace
+/// boundary is not enforced here: the permission gate owns it, and the
+/// OS jail confines sandboxed bash to its writable roots.
+pub fn check_write_targets(command: &str, cwd: Option<&str>) -> Result<(), String> {
     let targets = extract_write_targets(command);
     for target in &targets {
         let resolved = resolve_target(target, cwd);
-        super::path_policy::check_write(&resolved, project_root)?;
+        super::path_policy::check_write(&resolved, None)?;
     }
     Ok(())
+}
+
+/// The first write target of `command` that hits a write ask-tier group
+/// (credential store, persistence location, agent settings, host data).
+/// The bash tool allows these (the gate escalated them); the gate uses
+/// this to escalate in prompting modes and to deny in `yolo`.
+pub fn write_ask_target(
+    command: &str,
+    cwd: Option<&str>,
+) -> Option<super::path_policy::WriteBlock> {
+    let targets = extract_write_targets(command);
+    if targets.is_empty() {
+        return None;
+    }
+    let classifier = super::path_policy::ReadClassifier::new();
+    targets
+        .iter()
+        .find_map(|target| classifier.classify_write(&resolve_target(target, cwd)))
+}
+
+/// Commands whose operands are deleted irreversibly.
+const DELETION_COMMANDS: &[&str] = &["rm", "unlink", "shred", "srm"];
+
+/// Operands of deletion commands (`rm`, `unlink`, `shred`, `srm`) in every
+/// segment of `command`, after stripping safe wrappers. Flags are skipped
+/// up to `--`; quotes are trimmed.
+pub fn extract_deletion_targets(command: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for sub in split_on_operators(command) {
+        let sub = strip_safe_wrappers(sub.trim());
+        let mut parts = sub.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        let base = first.rsplit('/').next().unwrap_or(first);
+        if !DELETION_COMMANDS.contains(&base) {
+            continue;
+        }
+        let mut flags_done = false;
+        for arg in parts {
+            if !flags_done && arg == "--" {
+                flags_done = true;
+                continue;
+            }
+            if !flags_done && arg.starts_with('-') {
+                continue;
+            }
+            targets.push(arg.trim_matches(|c| c == '\'' || c == '"').to_string());
+        }
+    }
+    targets
+}
+
+/// The existing path a deletion operand would remove, for the guard: the
+/// operand itself, or for a glob/expansion operand the directory before
+/// the first metacharacter (conservative: that directory's contents are
+/// at stake).
+fn deletion_subject(target: &str, cwd: Option<&str>) -> std::path::PathBuf {
+    let meta = target.find(['*', '?', '[', '$', '{', '`']);
+    let literal = match meta {
+        Some(index) => match target[..index].rfind('/') {
+            Some(slash) => &target[..=slash],
+            None => ".",
+        },
+        None => target,
+    };
+    resolve_target(literal, cwd)
+}
+
+/// Irreversible-deletion guard: the first operand of a deletion command
+/// that would remove a path that already exists outside the workspace.
+/// Paths inside the workspace, inside `extra_roots` (the conversation
+/// scratch directory), and inside the system temp directory are not
+/// reported; paths that do not exist yet have nothing to lose. Without a
+/// workspace there is no boundary, so nothing is reported.
+///
+/// The permission gate escalates a hit (prompt in `ask`, judgment in
+/// `auto`); `yolo` runs it. The bash tool itself does not refuse.
+pub fn outside_deletion_target(
+    command: &str,
+    workspace: Option<&std::path::Path>,
+    cwd: Option<&str>,
+    extra_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let workspace = workspace?;
+    let targets = extract_deletion_targets(command);
+    if targets.is_empty() {
+        return None;
+    }
+    let cwd = cwd.or_else(|| workspace.to_str());
+    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
+    let spellings = |roots: Vec<std::path::PathBuf>| -> Vec<std::path::PathBuf> {
+        roots
+            .iter()
+            .flat_map(|root| std::iter::once(root.clone()).chain(canonical(root)))
+            .collect()
+    };
+    // The workspace and scratch roots are the user's authorized scope,
+    // themselves included; the shared temp roots only below themselves.
+    let mut owned = vec![workspace.to_path_buf()];
+    owned.extend(extra_roots.iter().cloned());
+    let owned = spellings(owned);
+    let temp = spellings(vec![std::env::temp_dir(), std::path::PathBuf::from("/tmp")]);
+    let inside = |path: &std::path::Path| {
+        owned.iter().any(|root| path.starts_with(root))
+            || temp
+                .iter()
+                .any(|root| path.starts_with(root) && path != root.as_path())
+    };
+    for target in &targets {
+        let subject = deletion_subject(target, cwd);
+        // Only pre-existing paths are at stake (a dangling symlink counts).
+        if std::fs::symlink_metadata(&subject).is_err() {
+            continue;
+        }
+        let lexical = crate::path_policy::normalize_path(&subject);
+        // `rm` removes a final symlink itself, not its target: resolve the
+        // parent only.
+        let resolved =
+            lexical
+                .parent()
+                .and_then(canonical)
+                .map(|parent| match lexical.file_name() {
+                    Some(name) => parent.join(name),
+                    None => parent,
+                });
+        let contained = inside(&lexical) && resolved.as_deref().is_none_or(inside);
+        if !contained {
+            return Some(subject);
+        }
+    }
+    None
 }
 
 /// Resolve a target path: expand `~`, make relative paths absolute using cwd.
@@ -2641,47 +2770,99 @@ mod tests {
     }
 
     #[test]
-    fn write_target_blocks_outside_project() {
-        let root = std::path::Path::new("/home/user/project");
-        let result = check_write_targets(
-            "echo hello > /tmp/out.txt",
-            Some(root),
-            Some("/home/user/project"),
-        );
+    fn write_targets_leave_the_workspace_boundary_to_the_gate() {
         assert!(
-            result.is_err(),
-            "Should block write to /tmp when project root is set"
+            check_write_targets("echo hello > /tmp/out.txt", Some("/home/user/project")).is_ok()
         );
+        assert!(check_write_targets("echo hello > ./out.txt", Some("/home/user/project")).is_ok());
+        assert!(check_write_targets("echo x > ~/.zshrc", Some("/home/user/project")).is_err());
     }
 
     #[test]
-    fn write_target_allows_inside_project() {
-        let root = std::path::Path::new("/home/user/project");
-        let result = check_write_targets(
-            "echo hello > /home/user/project/out.txt",
-            Some(root),
-            Some("/home/user/project"),
+    fn deletion_targets_skip_flags_and_strip_wrappers() {
+        assert_eq!(
+            extract_deletion_targets("timeout 5 rm -rf -- a 'b c' && unlink d"),
+            vec!["a", "b", "c", "d"]
         );
-        assert!(result.is_ok(), "Should allow write inside project root");
+        assert!(extract_deletion_targets("echo rm -rf x").is_empty());
+        assert_eq!(extract_deletion_targets("/bin/rm x"), vec!["x"]);
     }
 
     #[test]
-    fn write_target_allows_relative_inside_project() {
-        let root = std::path::Path::new("/home/user/project");
-        let result = check_write_targets(
-            "echo hello > ./out.txt",
-            Some(root),
-            Some("/home/user/project"),
-        );
+    fn deletion_guard_reports_existing_paths_outside_the_workspace() {
+        let home = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let workspace = home.path().join("ws");
+        let outside = home.path().join("keep");
+        std::fs::create_dir_all(workspace.join("build")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("notes.txt"), "x").unwrap();
+        let ws = Some(workspace.as_path());
+        let check = |cmd: &str| outside_deletion_target(cmd, ws, None, &[]);
+
+        // Inside the workspace, the workspace itself, and missing paths: allowed.
+        assert!(check("rm -rf build").is_none());
+        assert!(check(&format!("rm -rf {}", workspace.display())).is_none());
+        assert!(check(&format!("rm {}/missing.txt", outside.display())).is_none());
+        // Existing paths outside: blocked, including traversal and globs.
+        assert!(check(&format!("rm {}/notes.txt", outside.display())).is_some());
+        assert!(check("rm -rf ../keep").is_some());
+        assert!(check(&format!("rm -rf {}/*", outside.display())).is_some());
+        assert!(check(&format!("shred -u {}/notes.txt", outside.display())).is_some());
+        // Temp files and extra roots (scratch) stay deletable.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(check(&format!("rm {}", tmp.path().display())).is_none());
         assert!(
-            result.is_ok(),
-            "Should allow relative write when cwd is inside project"
+            outside_deletion_target(
+                &format!("rm {}/notes.txt", outside.display()),
+                ws,
+                None,
+                std::slice::from_ref(&outside)
+            )
+            .is_none()
         );
+        // No workspace: no boundary.
+        assert!(
+            outside_deletion_target(
+                &format!("rm {}/notes.txt", outside.display()),
+                None,
+                None,
+                &[]
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_guard_treats_a_final_symlink_as_the_link() {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let workspace = root.path().join("ws");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+        let ws = Some(workspace.as_path());
+        assert!(outside_deletion_target("rm link", ws, None, &[]).is_none());
+        // Through the link, the deleted entries live outside.
+        std::fs::write(outside.join("f"), "x").unwrap();
+        assert!(outside_deletion_target("rm link/f", ws, None, &[]).is_some());
+    }
+
+    #[test]
+    fn write_ask_targets_are_reported() {
+        let home = dirs::home_dir().unwrap();
+        let cmd = format!(
+            "cp evil.json {}",
+            home.join(".claude/settings.json").display()
+        );
+        assert!(write_ask_target(&cmd, Some("/tmp")).is_some());
+        assert!(write_ask_target("echo hi > out.txt", Some("/tmp")).is_none());
+        assert!(write_ask_target("ls -la", None).is_none());
     }
 
     #[test]
     fn write_target_no_root_only_blocklist() {
-        let result = check_write_targets("echo hello > /tmp/out.txt", None, Some("/tmp"));
+        let result = check_write_targets("echo hello > /tmp/out.txt", Some("/tmp"));
         assert!(
             result.is_ok(),
             "Without project root, /tmp should be allowed"
@@ -2690,7 +2871,7 @@ mod tests {
 
     #[test]
     fn write_target_blocks_system_dir() {
-        let result = check_write_targets("echo evil > /etc/crontab", None, None);
+        let result = check_write_targets("echo evil > /etc/crontab", None);
         assert!(
             result.is_err(),
             "Should block writes to /etc/ regardless of project root"

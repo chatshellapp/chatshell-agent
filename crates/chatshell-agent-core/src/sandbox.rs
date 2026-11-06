@@ -171,6 +171,23 @@ pub struct SandboxPolicy {
     pub private_dirs: Vec<PathBuf>,
 }
 
+impl SandboxPolicy {
+    /// The bash session policy: writable roots are the explicit working
+    /// directory (never a home fallback) plus the scratch directory. The
+    /// bash tool launches with this, and the permission gate describes it
+    /// to the auto-mode judge, so both always agree.
+    pub fn for_bash(workspace: Option<&Path>, scratch_dir: &Path, allow_network: bool) -> Self {
+        let mut writable_roots: Vec<PathBuf> = workspace.iter().map(|w| w.to_path_buf()).collect();
+        writable_roots.push(scratch_dir.to_path_buf());
+        SandboxPolicy {
+            writable_roots,
+            allow_network,
+            home: dirs::home_dir(),
+            private_dirs: crate::path_policy::private_dirs(),
+        }
+    }
+}
+
 /// Why a policy cannot be sandboxed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SandboxError {
