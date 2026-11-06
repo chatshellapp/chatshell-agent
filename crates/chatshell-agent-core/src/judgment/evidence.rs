@@ -54,6 +54,9 @@ pub struct BashEvidence {
     /// Operands of deletion commands (`rm`, `unlink`, `shred`, `srm`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deletes: Vec<String>,
+    /// Write targets outside the workspace, scratch, and temp roots.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub writes_outside: Vec<String>,
 }
 
 /// Where a file-tool path lands.
@@ -165,7 +168,7 @@ impl Evidence {
         let bash = (tool_name == "bash")
             .then(|| arg("command"))
             .flatten()
-            .map(bash_evidence);
+            .map(|command| bash_evidence(command, arg("workdir"), ctx));
         let path = match tool_name {
             "edit" | "write" => arg("path").map(|p| path_evidence(p, ctx, true)),
             "read" | "grep" | "glob" => arg("path").map(|p| path_evidence(p, ctx, false)),
@@ -279,7 +282,7 @@ fn truncate(text: &str) -> String {
     format!("{kept}…[truncated {} chars]", total - MAX_FIELD_CHARS)
 }
 
-fn bash_evidence(command: &str) -> BashEvidence {
+fn bash_evidence(command: &str, workdir: Option<&str>, ctx: &GateContext) -> BashEvidence {
     let classification = bash_security::classify_command(command);
     let (verdict, warning) = match classification.verdict {
         SecurityVerdict::Warn(message) => ("warn", Some(message)),
@@ -293,6 +296,15 @@ fn bash_evidence(command: &str) -> BashEvidence {
             .into_iter()
             .map(|target| truncate(&target))
             .collect(),
+        writes_outside: bash_security::outside_write_targets(
+            command,
+            ctx.workspace.as_deref(),
+            workdir,
+            &ctx.scratch_dir.iter().cloned().collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|path| truncate(&path.display().to_string()))
+        .collect(),
     }
 }
 

@@ -29,6 +29,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS decisions (
     id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
     conversation_id TEXT NOT NULL,
+    tool_call_id TEXT,
     tool TEXT NOT NULL,
     action TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -57,6 +58,8 @@ pub enum OutcomeSource {
     Cancelled,
     /// The user ran a denied action anyway (set by [`DecisionLog::mark_override`]).
     HumanOverride,
+    /// The OS sandbox denied an allowed execution (no judgment involved).
+    Sandbox,
 }
 
 impl OutcomeSource {
@@ -67,6 +70,7 @@ impl OutcomeSource {
             OutcomeSource::ReviewFailure => "review_failure",
             OutcomeSource::Cancelled => "cancelled",
             OutcomeSource::HumanOverride => "human_override",
+            OutcomeSource::Sandbox => "sandbox",
         }
     }
 }
@@ -78,6 +82,8 @@ pub struct DecisionRecord {
     pub id: String,
     pub created_at: i64,
     pub conversation_id: String,
+    /// The tool call this decision gated (markers attach to it).
+    pub tool_call_id: Option<String>,
     pub tool: String,
     /// The rendered evidence (compact action and facts).
     pub action: String,
@@ -113,6 +119,7 @@ impl DecisionRecord {
     /// The record for a completed review.
     pub fn from_review(
         conversation_id: &str,
+        tool_call_id: Option<&str>,
         request: &JudgmentRequest,
         review: &Review,
         jail_delta: Option<String>,
@@ -142,6 +149,7 @@ impl DecisionRecord {
             id: uuid::Uuid::now_v7().to_string(),
             created_at: now_millis(),
             conversation_id: conversation_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
             tool: request.evidence.tool.clone(),
             action: request.evidence.render(),
             source: wire(&request.source).unwrap_or_default(),
@@ -154,6 +162,40 @@ impl DecisionRecord {
             model: review.model.clone(),
             ruleset_version: super::ruleset::RULESET_VERSION.to_string(),
             jail_delta,
+            overridden_at: None,
+        }
+    }
+}
+
+impl DecisionRecord {
+    /// The record for a sandbox denial of an execution auto mode let run
+    /// (`jail-denied` marker): no verdict, outcome `jail_denied`.
+    pub fn jail_denied(
+        conversation_id: &str,
+        tool_call_id: Option<&str>,
+        command: &str,
+        detail: &str,
+        model: &str,
+    ) -> Self {
+        DecisionRecord {
+            id: uuid::Uuid::now_v7().to_string(),
+            created_at: now_millis(),
+            conversation_id: conversation_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
+            tool: "bash".to_string(),
+            action: super::ruleset::escape_markup(
+                &serde_json::json!({ "command": command }).to_string(),
+            ),
+            source: "sandbox".to_string(),
+            risk_level: None,
+            user_authorization: None,
+            outcome: "jail_denied".to_string(),
+            outcome_source: OutcomeSource::Sandbox.as_str().to_string(),
+            rationale: Some(detail.to_string()),
+            duration_ms: 0,
+            model: model.to_string(),
+            ruleset_version: super::ruleset::RULESET_VERSION.to_string(),
+            jail_delta: None,
             overridden_at: None,
         }
     }
@@ -180,14 +222,15 @@ impl DecisionLog {
         let mut conn = self.open_read_write()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO decisions (id, created_at, conversation_id, tool, action, source,
-                 risk_level, user_authorization, outcome, outcome_source, rationale,
+            "INSERT INTO decisions (id, created_at, conversation_id, tool_call_id, tool, action,
+                 source, risk_level, user_authorization, outcome, outcome_source, rationale,
                  duration_ms, model, ruleset_version, jail_delta, overridden_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 record.id,
                 record.created_at,
                 record.conversation_id,
+                record.tool_call_id,
                 record.tool,
                 record.action,
                 record.source,
@@ -245,35 +288,47 @@ impl DecisionLog {
             return Ok(None);
         };
         conn.query_row(
-            "SELECT id, created_at, conversation_id, tool, action, source, risk_level,
-                    user_authorization, outcome, outcome_source, rationale, duration_ms,
-                    model, ruleset_version, jail_delta, overridden_at
-             FROM decisions WHERE id = ?1",
+            &format!("SELECT {COLUMNS} FROM decisions WHERE id = ?1"),
             params![id],
-            |row| {
-                Ok(DecisionRecord {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    conversation_id: row.get(2)?,
-                    tool: row.get(3)?,
-                    action: row.get(4)?,
-                    source: row.get(5)?,
-                    risk_level: row.get(6)?,
-                    user_authorization: row.get(7)?,
-                    outcome: row.get(8)?,
-                    outcome_source: row.get(9)?,
-                    rationale: row.get(10)?,
-                    duration_ms: row.get(11)?,
-                    model: row.get(12)?,
-                    ruleset_version: row.get(13)?,
-                    jail_delta: row.get(14)?,
-                    overridden_at: row.get(15)?,
-                })
-            },
+            row_to_record,
         )
         .optional()
         .or_else(|err| no_table(err).map(|()| None))
         .context("query decision")
+    }
+
+    /// Every row of a conversation, oldest first (markers on reload).
+    pub fn list_for_conversation(&self, conversation_id: &str) -> Result<Vec<DecisionRecord>> {
+        let Some(conn) = self.open_read_only()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM decisions WHERE conversation_id = ?1
+             ORDER BY created_at, id"
+        )) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                return no_table(err)
+                    .map(|()| Vec::new())
+                    .context("query decisions");
+            }
+        };
+        let rows = stmt
+            .query_map(params![conversation_id], row_to_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete a conversation's rows (conversation deleted).
+    pub fn forget_conversation(&self, conversation_id: &str) -> Result<usize> {
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        let conn = self.open_read_write()?;
+        Ok(conn.execute(
+            "DELETE FROM decisions WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?)
     }
 
     /// Forget every decision. Returns how many were removed.
@@ -306,6 +361,32 @@ impl DecisionLog {
         conn.execute(SCHEMA, [])?;
         Ok(conn)
     }
+}
+
+const COLUMNS: &str = "id, created_at, conversation_id, tool_call_id, tool, action, source,
+    risk_level, user_authorization, outcome, outcome_source, rationale, duration_ms, model,
+    ruleset_version, jail_delta, overridden_at";
+
+fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRecord> {
+    Ok(DecisionRecord {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        conversation_id: row.get(2)?,
+        tool_call_id: row.get(3)?,
+        tool: row.get(4)?,
+        action: row.get(5)?,
+        source: row.get(6)?,
+        risk_level: row.get(7)?,
+        user_authorization: row.get(8)?,
+        outcome: row.get(9)?,
+        outcome_source: row.get(10)?,
+        rationale: row.get(11)?,
+        duration_ms: row.get(12)?,
+        model: row.get(13)?,
+        ruleset_version: row.get(14)?,
+        jail_delta: row.get(15)?,
+        overridden_at: row.get(16)?,
+    })
 }
 
 /// A missing table reads as empty, not as an error.
@@ -364,6 +445,7 @@ mod tests {
         let log = DecisionLog::new(dir.path().join(LOG_FILE_NAME));
         let record = DecisionRecord::from_review(
             "conv-1",
+            Some("call-1"),
             &request(),
             &review(deny(), 1),
             Some("network for one execution".into()),
@@ -372,6 +454,15 @@ mod tests {
         let stored = log.get(&record.id).unwrap().unwrap();
         assert_eq!(stored, record);
         assert_eq!(stored.tool, "bash");
+        assert_eq!(stored.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            log.list_for_conversation("conv-1").unwrap(),
+            vec![stored.clone()]
+        );
+        assert!(log.list_for_conversation("other").unwrap().is_empty());
+        assert_eq!(log.forget_conversation("conv-1").unwrap(), 1);
+        assert!(log.get(&record.id).unwrap().is_none());
+        log.record(&record).unwrap();
         assert_eq!(stored.source, "network");
         assert_eq!(stored.risk_level.as_deref(), Some("high"));
         assert_eq!(stored.user_authorization.as_deref(), Some("low"));
@@ -389,10 +480,11 @@ mod tests {
     #[test]
     fn outcome_sources() {
         let r = request();
-        let retry = DecisionRecord::from_review("c", &r, &review(deny(), 2), None);
+        let retry = DecisionRecord::from_review("c", None, &r, &review(deny(), 2), None);
         assert_eq!(retry.outcome_source, "retry");
         let failed = DecisionRecord::from_review(
             "c",
+            None,
             &r,
             &review(
                 ReviewOutcome::Failed {
@@ -412,7 +504,7 @@ mod tests {
     fn run_anyway_marks_the_correlated_row() {
         let dir = tempfile::tempdir().unwrap();
         let log = DecisionLog::new(dir.path().join(LOG_FILE_NAME));
-        let record = DecisionRecord::from_review("c", &request(), &review(deny(), 1), None);
+        let record = DecisionRecord::from_review("c", None, &request(), &review(deny(), 1), None);
         log.record(&record).unwrap();
         assert!(log.mark_override(&record.id).unwrap());
         let stored = log.get(&record.id).unwrap().unwrap();
@@ -428,7 +520,7 @@ mod tests {
     fn the_row_beyond_the_cap_evicts_the_oldest() {
         let dir = tempfile::tempdir().unwrap();
         let log = DecisionLog::new(dir.path().join(LOG_FILE_NAME));
-        let base = DecisionRecord::from_review("c", &request(), &review(deny(), 1), None);
+        let base = DecisionRecord::from_review("c", None, &request(), &review(deny(), 1), None);
         // Seed MAX rows in one transaction for speed.
         {
             let mut conn = log.open_read_write().unwrap();

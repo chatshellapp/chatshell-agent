@@ -20,8 +20,9 @@ use crate::shell_env;
 use crate::tool_fs::{Fs, StdFs};
 use crate::tools::bash_output::{Captured, OutputCapture, SpillTarget, spill_notice};
 use crate::tools::bash_sandbox::{
-    BashSandbox, EscalationDecision, EscalationRequest, NOTE_NETWORK_ALLOWED,
-    NOTE_RETRIED_UNSANDBOXED, NOTE_SANDBOX_UNAVAILABLE, detect_denial, note_denied,
+    BashSandbox, EscalationDecision, EscalationRequest, ExecutionDelta, NOTE_NETWORK_ALLOWED,
+    NOTE_RETRIED_UNSANDBOXED, NOTE_RUN_ANYWAY_UNSANDBOXED, NOTE_SANDBOX_UNAVAILABLE, detect_denial,
+    note_delta, note_denied, note_reported,
 };
 use std::sync::atomic::Ordering;
 
@@ -565,12 +566,54 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             .map(|w| format!("{}\n", w))
             .unwrap_or_default();
 
+        // --- per-execution delta authorized by the gate (auto mode) ---
+        let delta = self
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.deltas.take(command));
+        if delta.as_ref().is_some_and(|delta| delta.unsandboxed) {
+            // Run-anyway on a sandbox denial: once, outside the sandbox,
+            // in a throwaway session (the persistent one stays jailed).
+            let spec = self.launch_spec(None, None)?.spec;
+            let mut once: Option<BashSession<S::Shell>> =
+                Some(BashSession::new(&self.spawner, spec).await?);
+            let rerun = self.run_in(&mut once, &effective_command, timeout).await;
+            if let Some(mut session) = once.take() {
+                session.kill().await;
+            }
+            let notes = vec![NOTE_RUN_ANYWAY_UNSANDBOXED.to_string()];
+            return Ok(self.render(rerun?, timeout_secs, &warn_prefix, &notes));
+        }
+        let delta = delta.filter(|_| {
+            self.sandbox
+                .as_ref()
+                .is_some_and(|sandbox| sandbox.backend.is_some())
+        });
+
         // --- ensure session (respawned when the launch config changed) ---
-        let launch = self.launch()?;
+        let launch = self.launch_spec(self.sandbox.as_ref(), delta.as_ref())?;
         self.ensure_session(&mut guard, &launch.spec).await?;
         let mut notes: Vec<String> = launch.note.into_iter().collect();
+        if let Some(delta) = &delta {
+            notes.push(note_delta(delta));
+        }
 
         let result = self.run_in(&mut guard, &effective_command, timeout).await;
+        // A delta covers this one execution: respawn the session with its
+        // normal profile right away, so nothing started under the delta
+        // (background jobs included) keeps the wider access.
+        if delta.is_some() {
+            let restored = match self.launch() {
+                Ok(normal) => self.ensure_session(&mut guard, &normal.spec).await.is_ok(),
+                Err(_) => false,
+            };
+            if !restored {
+                if let Some(mut session) = guard.take() {
+                    session.kill().await;
+                }
+                tracing::warn!("🛡️ [bash] Could not restore the sandbox profile; session dropped");
+            }
+        }
         let mut cmd = match result {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -592,7 +635,8 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             && let Some(sandbox) = &self.sandbox
             && let Some((kind, detail)) = detect_denial(
                 &cmd.captured.scan_text,
-                sandbox.network_allowed.load(Ordering::SeqCst),
+                sandbox.network_allowed.load(Ordering::SeqCst)
+                    || delta.as_ref().is_some_and(|delta| delta.network),
             )
         {
             tracing::info!("🛡️ [bash] Sandbox denial ({kind:?}): {detail}");
@@ -610,7 +654,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             };
             match decision {
                 Some(EscalationDecision::RetryUnsandboxed) => {
-                    let spec = self.launch_spec(None)?.spec;
+                    let spec = self.launch_spec(None, None)?.spec;
                     let mut once: Option<BashSession<S::Shell>> =
                         Some(BashSession::new(&self.spawner, spec).await?);
                     let rerun = self.run_in(&mut once, &effective_command, timeout).await;
@@ -634,6 +678,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
                     notes.push(NOTE_NETWORK_ALLOWED.to_string());
                 }
                 Some(EscalationDecision::Deny) => notes.push(note_denied(kind, true)),
+                Some(EscalationDecision::Reported) => notes.push(note_reported(kind)),
                 None => notes.push(note_denied(kind, false)),
             }
         }
@@ -665,12 +710,16 @@ struct Launch {
 impl<S: ShellSpawner + Default> BashTool<S> {
     /// Launch spec for the session under the current settings.
     fn launch(&self) -> Result<Launch, BashError> {
-        self.launch_spec(self.sandbox.as_ref())
+        self.launch_spec(self.sandbox.as_ref(), None)
     }
 
     /// Launch spec with `sandbox` applied (`None`: unconfined, still with
-    /// the minimized environment).
-    fn launch_spec(&self, sandbox: Option<&BashSandbox>) -> Result<Launch, BashError> {
+    /// the minimized environment), widened by a per-execution `delta`.
+    fn launch_spec(
+        &self,
+        sandbox: Option<&BashSandbox>,
+        delta: Option<&ExecutionDelta>,
+    ) -> Result<Launch, BashError> {
         let cwd = self.resolve_cwd();
         let mut spec = SpawnSpec::new("bash", &cwd);
         if let Some(passthrough) = &self.env_passthrough {
@@ -705,11 +754,17 @@ impl<S: ShellSpawner + Default> BashTool<S> {
                 sandbox.scratch_dir.display().to_string(),
             ));
         }
-        let policy = SandboxPolicy::for_bash(
+        let mut policy = SandboxPolicy::for_bash(
             self.default_cwd.as_deref().map(std::path::Path::new),
             &sandbox.scratch_dir,
             sandbox.network_allowed.load(Ordering::SeqCst),
         );
+        if let Some(delta) = delta {
+            policy.allow_network |= delta.network;
+            policy
+                .writable_roots
+                .extend(delta.writable_roots.iter().cloned());
+        }
         let spec = sandbox::wrap(backend, &policy, spec)
             .map_err(|e| BashError(format!("Sandbox could not start: {e}")))?;
         Ok(Launch {

@@ -13,8 +13,8 @@ use crate::sandbox::SandboxBackend;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 /// What the sandbox appears to have blocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,95 @@ pub enum EscalationDecision {
     AllowNetworkSession,
     /// Keep the sandboxed result.
     Deny,
+    /// Keep the sandboxed result; the host reported the denial to the
+    /// user without asking (auto mode), who can still run the command
+    /// outside the sandbox once.
+    Reported,
+}
+
+/// A per-execution change to the jail, authorized by an auto-mode allow
+/// or a run-anyway tap. Never a grant: exactly one execution of the
+/// command consumes it, and the session returns to its normal profile
+/// right after.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionDelta {
+    /// Allow non-loopback network for this execution.
+    pub network: bool,
+    /// Extra writable roots for this execution (existing directories).
+    pub writable_roots: Vec<PathBuf>,
+    /// Run this execution outside the sandbox (run-anyway on a sandbox
+    /// denial; FR-18's retry-outside-the-sandbox-once).
+    pub unsandboxed: bool,
+}
+
+impl ExecutionDelta {
+    pub fn is_empty(&self) -> bool {
+        !self.network && self.writable_roots.is_empty() && !self.unsandboxed
+    }
+
+    /// Human-readable summary (result notes, the decision log).
+    pub fn describe(&self) -> String {
+        if self.unsandboxed {
+            return "outside the sandbox".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.network {
+            parts.push("network access".to_string());
+        }
+        if !self.writable_roots.is_empty() {
+            let roots: Vec<String> = self
+                .writable_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect();
+            parts.push(format!("write access to {}", roots.join(", ")));
+        }
+        parts.join(" and ")
+    }
+}
+
+/// Pending per-execution deltas, keyed by the exact command text. Shared
+/// by the permission gate (which authorizes) and the bash tool (which
+/// consumes); the model has no way to add entries.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionDeltas {
+    entries: Arc<Mutex<Vec<(String, ExecutionDelta)>>>,
+}
+
+impl ExecutionDeltas {
+    /// Authorize `delta` for the next execution of `command`.
+    pub fn authorize(&self, command: &str, delta: ExecutionDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((command.to_string(), delta));
+    }
+
+    /// Consume the delta authorized for `command`, if any.
+    pub fn take(&self, command: &str) -> Option<ExecutionDelta> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let index = entries.iter().position(|(key, _)| key == command)?;
+        Some(entries.remove(index).1)
+    }
+
+    /// Drop every pending delta (turn ended).
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Host hook answering escalation requests (an approval prompt on
@@ -73,6 +162,8 @@ pub struct BashSandbox {
     pub network_allowed: Arc<AtomicBool>,
     /// Escalation hook; `None` means sandbox denials are reported only.
     pub escalator: Option<Arc<dyn SandboxEscalator>>,
+    /// Per-execution deltas authorized by the permission gate.
+    pub deltas: ExecutionDeltas,
 }
 
 impl std::fmt::Debug for BashSandbox {
@@ -82,6 +173,7 @@ impl std::fmt::Debug for BashSandbox {
             .field("scratch_dir", &self.scratch_dir)
             .field("network_allowed", &self.network_allowed)
             .field("escalator", &self.escalator.is_some())
+            .field("deltas", &self.deltas.len())
             .finish()
     }
 }
@@ -169,14 +261,32 @@ fn names_blocked_path(line: &str, policy: &ReadClassifier) -> bool {
 pub const NOTE_RETRIED_UNSANDBOXED: &str = "[sandbox escalation: the OS sandbox blocked this command; \
 the user approved running it once outside the sandbox. Result below is from that run.]";
 
-/// Result annotation: the user allowed network for the session.
-pub const NOTE_NETWORK_ALLOWED: &str = "[sandbox escalation: the user allowed network access for \
-the rest of this session. The shell was restarted, so earlier cd/export state is gone.]";
+/// Result annotation: run once outside the sandbox after the user tapped
+/// run-anyway on an auto-mode sandbox denial.
+pub const NOTE_RUN_ANYWAY_UNSANDBOXED: &str = "[auto mode: the user chose to run this command \
+once outside the sandbox after the sandbox blocked it. Result below is from that run.]";
 
-/// Result annotation: the sandbox blocked the command and nobody approved
-/// an escape.
-pub fn note_denied(kind: EscalationKind, answered: bool) -> String {
-    let what = match kind {
+/// Result annotation: the command ran with a per-execution delta.
+pub fn note_delta(delta: &ExecutionDelta) -> String {
+    format!(
+        "[auto mode: this command ran with {} for this one execution. The shell was restarted \
+         for it and again after, so earlier cd/export state is gone.]",
+        delta.describe()
+    )
+}
+
+/// Result annotation: auto mode reported a sandbox denial to the user.
+pub fn note_reported(kind: EscalationKind) -> String {
+    format!(
+        "[sandbox: the OS sandbox blocked {}. Auto mode reported this to the user, who can run \
+         the command outside the sandbox once. Do not work around the sandbox; use a different \
+         approach or ask the user.]",
+        blocked_what(kind)
+    )
+}
+
+fn blocked_what(kind: EscalationKind) -> &'static str {
+    match kind {
         EscalationKind::Network => "network access",
         EscalationKind::Filesystem => {
             "a filesystem operation (a write outside the workspace, or a protected path)"
@@ -184,7 +294,17 @@ pub fn note_denied(kind: EscalationKind, answered: bool) -> String {
         EscalationKind::Credentials => {
             "access to stored credentials (keychain or credential helper)"
         }
-    };
+    }
+}
+
+/// Result annotation: the user allowed network for the session.
+pub const NOTE_NETWORK_ALLOWED: &str = "[sandbox escalation: the user allowed network access for \
+the rest of this session. The shell was restarted, so earlier cd/export state is gone.]";
+
+/// Result annotation: the sandbox blocked the command and nobody approved
+/// an escape.
+pub fn note_denied(kind: EscalationKind, answered: bool) -> String {
+    let what = blocked_what(kind);
     if answered {
         format!(
             "[sandbox: the OS sandbox blocked {what}, and the user declined to run it outside the \
@@ -202,6 +322,30 @@ without OS confinement after the user approved it.]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deltas_are_consumed_by_exactly_one_matching_execution() {
+        let deltas = ExecutionDeltas::default();
+        deltas.authorize("ls", ExecutionDelta::default());
+        assert!(deltas.is_empty(), "empty deltas are not stored");
+        let network = ExecutionDelta {
+            network: true,
+            ..ExecutionDelta::default()
+        };
+        deltas.authorize("curl https://example.com", network.clone());
+        assert_eq!(deltas.take("curl https://example.org"), None);
+        assert_eq!(deltas.take("curl https://example.com"), Some(network));
+        assert_eq!(deltas.take("curl https://example.com"), None);
+        assert_eq!(
+            ExecutionDelta {
+                network: true,
+                writable_roots: vec![PathBuf::from("/a")],
+                unsandboxed: false
+            }
+            .describe(),
+            "network access and write access to /a"
+        );
+    }
 
     #[test]
     fn network_denial_is_detected_until_network_is_allowed() {
@@ -306,6 +450,7 @@ mod os_sandbox_integration {
         tool: BashTool,
         recorder: Arc<Recorder>,
         network: Arc<AtomicBool>,
+        deltas: ExecutionDeltas,
     }
 
     /// The backend under test, or `None` to skip.
@@ -333,6 +478,7 @@ mod os_sandbox_integration {
             requests: Mutex::new(Vec::new()),
         });
         let network = Arc::new(AtomicBool::new(false));
+        let deltas = ExecutionDeltas::default();
         let tool = BashTool::with_working_directory(root.display().to_string())
             .with_env_passthrough(Vec::new())
             .with_sandbox(BashSandbox {
@@ -340,6 +486,7 @@ mod os_sandbox_integration {
                 scratch_dir: base.join("scratch"),
                 network_allowed: network.clone(),
                 escalator: Some(recorder.clone()),
+                deltas: deltas.clone(),
             });
         Some(Fixture {
             outside: base.join("outside.txt"),
@@ -348,6 +495,7 @@ mod os_sandbox_integration {
             tool,
             recorder,
             network,
+            deltas,
         })
     }
 
@@ -425,6 +573,68 @@ mod os_sandbox_integration {
     }
 
     #[tokio::test]
+    async fn a_writable_root_delta_applies_to_one_execution_only() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let outside_dir = f.outside.parent().unwrap().join("granted");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let target = outside_dir.join("a.txt");
+        let command = format!("echo hi > '{}'", target.display());
+        f.deltas.authorize(
+            &command,
+            ExecutionDelta {
+                writable_roots: vec![outside_dir.clone()],
+                ..ExecutionDelta::default()
+            },
+        );
+        let out = run(&f.tool, &command).await;
+        assert!(target.exists(), "{out}");
+        assert!(out.contains("for this one execution"), "{out}");
+        assert!(requests(&f).is_empty(), "{out}");
+        assert!(f.deltas.is_empty(), "consumed");
+        // The same command again: the session is back to its profile.
+        std::fs::remove_file(&target).unwrap();
+        let out = run(&f.tool, &command).await;
+        assert!(!target.exists(), "{out}");
+        assert_eq!(requests(&f).len(), 1);
+        assert!(!f.network.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_unsandboxed_delta_runs_once_outside_the_sandbox() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let command = format!("echo hi > '{}'", f.outside.display());
+        f.deltas.authorize(
+            &command,
+            ExecutionDelta {
+                unsandboxed: true,
+                ..ExecutionDelta::default()
+            },
+        );
+        let out = run(&f.tool, &command).await;
+        assert!(f.outside.exists(), "{out}");
+        assert!(out.contains("once outside the sandbox"), "{out}");
+        assert!(requests(&f).is_empty());
+        std::fs::remove_file(&f.outside).unwrap();
+        run(&f.tool, &command).await;
+        assert!(!f.outside.exists());
+    }
+
+    #[tokio::test]
+    async fn a_reported_denial_keeps_the_sandboxed_result() {
+        let Some(f) = fixture(EscalationDecision::Reported) else {
+            return;
+        };
+        let out = run(&f.tool, &format!("echo hi > '{}'", f.outside.display())).await;
+        assert!(!f.outside.exists());
+        assert_eq!(requests(&f).len(), 1);
+        assert!(out.contains("Auto mode reported this to the user"), "{out}");
+    }
+
+    #[tokio::test]
     async fn approved_retry_runs_once_outside_the_sandbox() {
         let Some(f) = fixture(EscalationDecision::RetryUnsandboxed) else {
             return;
@@ -455,6 +665,7 @@ mod os_sandbox_integration {
                 scratch_dir: base.clone(),
                 network_allowed: Arc::new(AtomicBool::new(false)),
                 escalator: None,
+                deltas: ExecutionDeltas::default(),
             },
         );
         // Control: a sibling directory under the writable parent can move.
@@ -738,6 +949,7 @@ else:
                 scratch_dir: base.join("scratch"),
                 network_allowed: Arc::new(AtomicBool::new(false)),
                 escalator: None,
+                deltas: ExecutionDeltas::default(),
             },
         );
         let out = run(&tool, "echo ran").await;

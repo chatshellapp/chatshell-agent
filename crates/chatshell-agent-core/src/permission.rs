@@ -576,6 +576,14 @@ pub fn resolve_in(
         {
             return escalation.forced(command, kind, detail);
         }
+        // Sandboxed auto: a write the jail would refuse (outside the
+        // workspace, scratch, and temp roots) is judged before execution;
+        // an allow widens the jail for that one execution.
+        if sandboxed_auto
+            && !bash_security::outside_write_targets(command, workspace, cwd, &scratch).is_empty()
+        {
+            return escalation.matrix(command.to_string(), JudgmentSource::OutOfWorkspaceWrite);
+        }
         // In sandboxed auto the OS sandbox absorbs everything else;
         // escapes surface as sandbox denials after execution.
         if sandboxed_auto || grants.bash_command_granted(command) {
@@ -1758,6 +1766,30 @@ mod tests {
         // Inside the workspace: ordinary auto bash.
         assert_eq!(
             auto(&ctx, "bash", json!({ "command": "rm -rf build" })),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn sandboxed_auto_judges_bash_writes_outside_the_jail() {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let ctx = auto_ctx(&ws, true, false);
+        let outside = root.path().join("notes.txt");
+        let decision = auto(
+            &ctx,
+            "bash",
+            json!({ "command": format!("touch {}", outside.display()) }),
+        );
+        assert_eq!(judged(&decision), Some(JudgmentSource::OutOfWorkspaceWrite));
+        let GateDecision::Classify(request) = decision else {
+            unreachable!()
+        };
+        assert_eq!(request.evidence.bash.unwrap().writes_outside.len(), 1);
+        // Inside the workspace: the jail absorbs it.
+        assert_eq!(
+            auto(&ctx, "bash", json!({ "command": "touch out.txt" })),
             GateDecision::Allow
         );
     }

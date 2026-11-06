@@ -1674,48 +1674,104 @@ pub fn outside_deletion_target(
         return None;
     }
     let cwd = cwd.or_else(|| workspace.to_str());
-    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
-    let spellings = |roots: Vec<std::path::PathBuf>| -> Vec<std::path::PathBuf> {
-        roots
-            .iter()
-            .flat_map(|root| std::iter::once(root.clone()).chain(canonical(root)))
-            .collect()
-    };
-    // The workspace and scratch roots are the user's authorized scope,
-    // themselves included; the shared temp roots only below themselves.
-    let mut owned = vec![workspace.to_path_buf()];
-    owned.extend(extra_roots.iter().cloned());
-    let owned = spellings(owned);
-    let temp = spellings(vec![std::env::temp_dir(), std::path::PathBuf::from("/tmp")]);
-    let inside = |path: &std::path::Path| {
-        owned.iter().any(|root| path.starts_with(root))
-            || temp
-                .iter()
-                .any(|root| path.starts_with(root) && path != root.as_path())
-    };
+    let scope = WriteScope::new(workspace, extra_roots);
     for target in &targets {
         let subject = deletion_subject(target, cwd);
         // Only pre-existing paths are at stake (a dangling symlink counts).
         if std::fs::symlink_metadata(&subject).is_err() {
             continue;
         }
-        let lexical = crate::path_policy::normalize_path(&subject);
-        // `rm` removes a final symlink itself, not its target: resolve the
-        // parent only.
-        let resolved =
-            lexical
-                .parent()
-                .and_then(canonical)
-                .map(|parent| match lexical.file_name() {
-                    Some(name) => parent.join(name),
-                    None => parent,
-                });
-        let contained = inside(&lexical) && resolved.as_deref().is_none_or(inside);
-        if !contained {
+        if !scope.contains(&subject) {
             return Some(subject);
         }
     }
     None
+}
+
+/// Write targets of `command` (redirects, `tee`, `cp`/`mv` destinations,
+/// `touch`) that land outside the workspace, `extra_roots` (the scratch
+/// directory), and the system temp directory. Device files (`/dev/null`)
+/// are ignored. In sandboxed auto these are what the jail would refuse,
+/// so the gate judges them before execution instead.
+pub fn outside_write_targets(
+    command: &str,
+    workspace: Option<&std::path::Path>,
+    cwd: Option<&str>,
+    extra_roots: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let Some(workspace) = workspace else {
+        return Vec::new();
+    };
+    let targets = extract_write_targets(command);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let cwd = cwd.or_else(|| workspace.to_str());
+    let scope = WriteScope::new(workspace, extra_roots);
+    let mut outside = Vec::new();
+    for target in &targets {
+        // `$VAR`, globs, and substitutions cannot be placed statically.
+        if target.contains(['$', '*', '?', '`']) {
+            continue;
+        }
+        let resolved = crate::path_policy::normalize_path(&resolve_target(target, cwd));
+        if resolved.starts_with("/dev") || scope.contains(&resolved) {
+            continue;
+        }
+        if !outside.contains(&resolved) {
+            outside.push(resolved);
+        }
+    }
+    outside
+}
+
+/// The directories a command may write without leaving the user's scope:
+/// the workspace and extra roots (themselves included) and the shared
+/// temp roots (strictly below themselves). Paths match lexically and
+/// with their parent resolved through symlinks (a final symlink is the
+/// entry itself, as `rm` and redirect creation treat it).
+struct WriteScope {
+    owned: Vec<std::path::PathBuf>,
+    temp: Vec<std::path::PathBuf>,
+}
+
+impl WriteScope {
+    fn new(workspace: &std::path::Path, extra_roots: &[std::path::PathBuf]) -> Self {
+        let spellings = |roots: Vec<std::path::PathBuf>| -> Vec<std::path::PathBuf> {
+            roots
+                .iter()
+                .flat_map(|root| {
+                    std::iter::once(root.clone()).chain(std::fs::canonicalize(root).ok())
+                })
+                .collect()
+        };
+        let mut owned = vec![workspace.to_path_buf()];
+        owned.extend(extra_roots.iter().cloned());
+        Self {
+            owned: spellings(owned),
+            temp: spellings(vec![std::env::temp_dir(), std::path::PathBuf::from("/tmp")]),
+        }
+    }
+
+    fn inside(&self, path: &std::path::Path) -> bool {
+        self.owned.iter().any(|root| path.starts_with(root))
+            || self
+                .temp
+                .iter()
+                .any(|root| path.starts_with(root) && path != root.as_path())
+    }
+
+    fn contains(&self, path: &std::path::Path) -> bool {
+        let lexical = crate::path_policy::normalize_path(path);
+        let resolved = lexical
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .map(|parent| match lexical.file_name() {
+                Some(name) => parent.join(name),
+                None => parent,
+            });
+        self.inside(&lexical) && resolved.as_deref().is_none_or(|r| self.inside(r))
+    }
 }
 
 /// Resolve a target path: expand `~`, make relative paths absolute using cwd.
@@ -2846,6 +2902,25 @@ mod tests {
         // Through the link, the deleted entries live outside.
         std::fs::write(outside.join("f"), "x").unwrap();
         assert!(outside_deletion_target("rm link/f", ws, None, &[]).is_some());
+    }
+
+    #[test]
+    fn outside_write_targets_are_found() {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = root.path().join("out.txt");
+        let find = |cmd: &str| outside_write_targets(cmd, Some(&ws), None, &[]);
+        assert_eq!(
+            find(&format!("echo hi > {}", outside.display())),
+            vec![outside.clone()]
+        );
+        assert_eq!(find("echo hi > ../out.txt"), vec![outside.clone()]);
+        assert!(find("echo hi > build/log.txt && cat x > /dev/null").is_empty());
+        assert!(find("echo hi > \"$HOME/x\"").is_empty());
+        let tmp = std::env::temp_dir().join("chatshell-t.txt");
+        assert!(find(&format!("touch {}", tmp.display())).is_empty());
+        assert!(outside_write_targets("echo > /etc/x", None, None, &[]).is_empty());
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! fields, so free-text fields such as bash `description` never reach the
 //! judge.
 
+pub mod delta;
 pub mod engine;
 pub mod evidence;
 pub mod log;
