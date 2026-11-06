@@ -197,9 +197,12 @@ impl Evidence {
         }
     }
 
-    /// Compact single-line JSON for the judge prompt.
+    /// Compact single-line JSON for the judge prompt, with `<`/`>`
+    /// escaped so no field can open or close a prompt section.
     pub fn render(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        super::ruleset::escape_markup(
+            &serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string()),
+        )
     }
 }
 

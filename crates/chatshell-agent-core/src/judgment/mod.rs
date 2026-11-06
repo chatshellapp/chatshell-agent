@@ -14,8 +14,12 @@
 //! fields, so free-text fields such as bash `description` never reach the
 //! judge.
 
+pub mod engine;
 pub mod evidence;
+pub mod log;
+pub mod ruleset;
 pub mod transcript;
+pub mod verdict;
 
 pub use evidence::{
     BashEvidence, Evidence, JailProfile, NetworkClass, PathBoundary, PathEvidence, PathTier,

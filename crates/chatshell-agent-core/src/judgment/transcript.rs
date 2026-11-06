@@ -73,6 +73,10 @@ fn truncation_marker(omitted: usize) -> String {
 /// One entry as a role-labeled line; `number` is its 1-based position in
 /// the full conversation, so numbering is stable under truncation.
 fn line(number: usize, entry: &TranscriptEntry) -> String {
+    super::ruleset::escape_markup(&raw_line(number, entry))
+}
+
+fn raw_line(number: usize, entry: &TranscriptEntry) -> String {
     match entry {
         TranscriptEntry::User { text } => {
             let total = text.chars().count();
