@@ -48,7 +48,7 @@ pub fn execution_delta(
     }
     if let Some(target) = bash_security::outside_deletion_target(command, workspace, cwd, &scratch)
     {
-        let root = if target.is_dir() {
+        let root = if target.is_dir() && DIRECTORY_ROOT_DELETABLE {
             existing_dir(&target)
         } else {
             target.parent().and_then(existing_dir)
@@ -64,6 +64,13 @@ pub fn execution_delta(
     };
     (!delta.is_empty()).then_some(delta)
 }
+
+/// Whether a directory opened as a writable root can itself be removed.
+/// Seatbelt's `subpath` rule covers the directory entry, so on macOS the
+/// deleted directory is the root. bubblewrap bind-mounts each root onto
+/// itself, and a mount point cannot be removed (`EBUSY`), so on Linux the
+/// root is the directory's parent.
+const DIRECTORY_ROOT_DELETABLE: bool = !cfg!(target_os = "linux");
 
 fn existing_dir(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
@@ -153,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn deletions_get_the_deleted_directory() {
+    fn deletions_get_a_root_that_can_remove_the_directory() {
         let (_dir, ctx, outside) = fixture();
         let args = json!({ "command": format!("rm -rf {}", outside.display()) });
         let delta = execution_delta(
@@ -162,7 +169,14 @@ mod tests {
             &ctx,
         )
         .unwrap();
-        assert_eq!(delta.writable_roots, vec![outside]);
+        // Linux mounts the root onto itself, so only its parent lets the
+        // directory entry go.
+        let expected = if cfg!(target_os = "linux") {
+            outside.parent().unwrap().to_path_buf()
+        } else {
+            outside
+        };
+        assert_eq!(delta.writable_roots, vec![expected]);
     }
 
     #[test]

@@ -95,30 +95,37 @@ impl ExecutionDelta {
     }
 }
 
-/// Pending per-execution deltas, keyed by the exact command text. Shared
-/// by the permission gate (which authorizes) and the bash tool (which
-/// consumes); the model has no way to add entries.
+/// The bash call a delta belongs to: the exact command text and its
+/// working directory (the same command elsewhere is a different action).
+type DeltaKey = (String, Option<String>);
+
+/// Pending per-execution deltas, keyed by the exact command text and
+/// working directory. Shared by the permission gate (which authorizes)
+/// and the bash tool (which consumes); the model has no way to add
+/// entries.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionDeltas {
-    entries: Arc<Mutex<Vec<(String, ExecutionDelta)>>>,
+    entries: Arc<Mutex<Vec<(DeltaKey, ExecutionDelta)>>>,
 }
 
 impl ExecutionDeltas {
-    /// Authorize `delta` for the next execution of `command`.
-    pub fn authorize(&self, command: &str, delta: ExecutionDelta) {
+    /// Authorize `delta` for the next execution of `command` in `workdir`.
+    pub fn authorize(&self, command: &str, workdir: Option<&str>, delta: ExecutionDelta) {
         if delta.is_empty() {
             return;
         }
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((command.to_string(), delta));
+            .push(((command.to_string(), workdir.map(str::to_string)), delta));
     }
 
-    /// Consume the delta authorized for `command`, if any.
-    pub fn take(&self, command: &str) -> Option<ExecutionDelta> {
+    /// Consume the delta authorized for `command` in `workdir`, if any.
+    pub fn take(&self, command: &str, workdir: Option<&str>) -> Option<ExecutionDelta> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let index = entries.iter().position(|(key, _)| key == command)?;
+        let index = entries
+            .iter()
+            .position(|((key, dir), _)| key == command && dir.as_deref() == workdir)?;
         Some(entries.remove(index).1)
     }
 
@@ -326,16 +333,28 @@ mod tests {
     #[test]
     fn deltas_are_consumed_by_exactly_one_matching_execution() {
         let deltas = ExecutionDeltas::default();
-        deltas.authorize("ls", ExecutionDelta::default());
+        deltas.authorize("ls", None, ExecutionDelta::default());
         assert!(deltas.is_empty(), "empty deltas are not stored");
         let network = ExecutionDelta {
             network: true,
             ..ExecutionDelta::default()
         };
-        deltas.authorize("curl https://example.com", network.clone());
-        assert_eq!(deltas.take("curl https://example.org"), None);
-        assert_eq!(deltas.take("curl https://example.com"), Some(network));
-        assert_eq!(deltas.take("curl https://example.com"), None);
+        deltas.authorize("curl https://example.com", None, network.clone());
+        assert_eq!(deltas.take("curl https://example.org", None), None);
+        assert_eq!(
+            deltas.take("curl https://example.com", Some("/elsewhere")),
+            None
+        );
+        assert_eq!(
+            deltas.take("curl https://example.com", None),
+            Some(network.clone())
+        );
+        assert_eq!(deltas.take("curl https://example.com", None), None);
+        // The working directory is part of the action.
+        deltas.authorize("make", Some("/a"), network.clone());
+        assert_eq!(deltas.take("make", None), None);
+        assert_eq!(deltas.take("make", Some("/b")), None);
+        assert_eq!(deltas.take("make", Some("/a")), Some(network));
         assert_eq!(
             ExecutionDelta {
                 network: true,
@@ -583,6 +602,7 @@ mod os_sandbox_integration {
         let command = format!("echo hi > '{}'", target.display());
         f.deltas.authorize(
             &command,
+            None,
             ExecutionDelta {
                 writable_roots: vec![outside_dir.clone()],
                 ..ExecutionDelta::default()
@@ -609,6 +629,7 @@ mod os_sandbox_integration {
         let command = format!("echo hi > '{}'", f.outside.display());
         f.deltas.authorize(
             &command,
+            None,
             ExecutionDelta {
                 unsandboxed: true,
                 ..ExecutionDelta::default()

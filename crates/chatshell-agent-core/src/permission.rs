@@ -353,9 +353,6 @@ pub fn remember_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
     }
 }
 
-/// Classifier signal that forces a bash prompt in prompting modes, most
-/// specific first: network egress, classifier warning, then an AST layer
-/// that could not run (fail closed: its validators were skipped).
 /// Classifier signal that forces a bash prompt in prompting modes: a
 /// classifier warning first (the most serious), then an AST layer that
 /// could not run (fail closed: its validators were skipped), then network
@@ -381,8 +378,19 @@ fn bash_forced_prompt(
 }
 
 /// True when `path` (a file-tool argument) resolves inside `workspace`.
-pub(crate) fn inside_workspace(path: &str, workspace: &Path) -> bool {
-    let Some(target) = grant_keys::grant_path(path) else {
+///
+/// Relative paths are joined onto the workspace first, as the file tools
+/// resolve them. The verdict depends on where the path lands, not on how
+/// it is spelled: `..` components are normalized and symlinks resolved
+/// through the deepest existing ancestor, so `../x` and a link pointing
+/// out of the workspace land outside while `src/../x` stays inside.
+pub fn inside_workspace(path: &str, workspace: &Path) -> bool {
+    let joined = if Path::new(path).is_relative() {
+        workspace.join(path)
+    } else {
+        PathBuf::from(path)
+    };
+    let Some(target) = joined.to_str().and_then(grant_keys::grant_path) else {
         return false;
     };
     let root = workspace
@@ -1313,9 +1321,50 @@ mod tests {
                 GateDecision::Allow
             );
         }
+        // Relative paths land where the tools resolve them: inside the
+        // workspace, however they are spelled.
+        for path in ["notes.md", "./notes.md", "src/main.rs", "src/../notes.md"] {
+            for tool in ["edit", "write"] {
+                assert_eq!(
+                    auto(&ctx, tool, json!({ "path": path })),
+                    GateDecision::Allow,
+                    "{tool} {path}"
+                );
+            }
+        }
         assert_eq!(
             auto(&ctx, "read", json!({ "path": "/etc/hosts" })),
             GateDecision::Allow
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_judges_relative_writes_through_a_symlink_out_of_the_workspace() {
+        let base = tempfile::tempdir().unwrap();
+        let ws = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
+        let ctx = auto_ctx(&ws, true, false);
+        assert_eq!(
+            judged(&auto(&ctx, "write", json!({ "path": "link/x.txt" }))),
+            Some(JudgmentSource::OutOfWorkspaceWrite)
+        );
+    }
+
+    #[test]
+    fn relative_writes_without_a_workspace_are_judged() {
+        let ctx = GateContext {
+            workspace: None,
+            sandbox_available: true,
+            network_allowed: false,
+            scratch_dir: None,
+        };
+        assert_eq!(
+            judged(&auto(&ctx, "write", json!({ "path": "notes.md" }))),
+            Some(JudgmentSource::OutOfWorkspaceWrite)
         );
     }
 
@@ -1338,7 +1387,12 @@ mod tests {
             ),
             (
                 "write",
-                json!({ "path": "relative.txt" }),
+                json!({ "path": "../escape.txt" }),
+                JudgmentSource::OutOfWorkspaceWrite,
+            ),
+            (
+                "edit",
+                json!({ "path": "src/../../escape.txt" }),
                 JudgmentSource::OutOfWorkspaceWrite,
             ),
             (

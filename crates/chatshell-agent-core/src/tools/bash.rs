@@ -570,7 +570,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
         let delta = self
             .sandbox
             .as_ref()
-            .and_then(|sandbox| sandbox.deltas.take(command));
+            .and_then(|sandbox| sandbox.deltas.take(command, args.workdir.as_deref()));
         if delta.as_ref().is_some_and(|delta| delta.unsandboxed) {
             // Run-anyway on a sandbox denial: once, outside the sandbox,
             // in a throwaway session (the persistent one stays jailed).
