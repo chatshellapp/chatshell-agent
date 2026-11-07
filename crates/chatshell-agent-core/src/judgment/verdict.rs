@@ -131,6 +131,24 @@ fn find_object(text: &str) -> Option<serde_json::Map<String, Value>> {
     None
 }
 
+/// Whether an unparseable reply looks cut off by the output bound: no
+/// answer at all (reasoning, sent apart from the answer, used the whole
+/// bound), a `<think>` block that never closes, or a JSON object that
+/// opens and never closes. Providers do not reliably report running out
+/// of budget: a verdict cut off mid-object arrives as ordinary text.
+pub fn looks_cut_off(raw: &str) -> bool {
+    if raw.contains("<think>") && !raw.contains("</think>") {
+        return true;
+    }
+    let answer = crate::thinking::parse_thinking_content(raw).content;
+    if answer.trim().is_empty() {
+        return true;
+    }
+    answer
+        .find('{')
+        .is_some_and(|open| balanced_end(answer.as_bytes(), open).is_none())
+}
+
 /// Index of the `}` closing the `{` at `open`, honoring JSON strings.
 fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -164,6 +182,25 @@ fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_off_replies_are_told_apart_from_bad_ones() {
+        // Verdict cut off mid-object (2026-11-06 eval: MiniMax M3).
+        assert!(looks_cut_off(
+            r#"{"risk_level":"high","user_authorization":"low","outcome":"den"#
+        ));
+        // Reasoning that never reached the answer.
+        assert!(looks_cut_off(
+            "<think>The user wants the folder deleted, so"
+        ));
+        // No answer text at all.
+        assert!(looks_cut_off(""));
+        assert!(looks_cut_off("<think>still deciding</think>  "));
+        // Complete but wrong replies are not cut off.
+        assert!(!looks_cut_off("Sure! The command lists files."));
+        assert!(!looks_cut_off(r#"{"verdict":"maybe"}"#));
+        assert!(!looks_cut_off("<think>ok</think>No JSON here."));
+    }
 
     #[test]
     fn valid() {

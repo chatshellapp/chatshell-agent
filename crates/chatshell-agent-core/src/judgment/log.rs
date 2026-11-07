@@ -427,6 +427,7 @@ mod tests {
             attempts,
             duration: Duration::from_millis(420),
             model: "mock-model".into(),
+            max_tokens: crate::judgment::engine::MAX_OUTPUT_TOKENS,
         }
     }
 
