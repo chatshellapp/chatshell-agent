@@ -173,8 +173,17 @@ impl<P: ShellProcess> BashSession<P> {
 
                 let line = String::from_utf8_lossy(&buf);
 
-                if let Some(rest) = line.strip_prefix(marker.as_str()) {
-                    return Ok(rest.trim().parse::<i32>().unwrap_or(-1));
+                // Output without a trailing newline (`head -c`, raw JSON)
+                // puts the marker at the end of its last line, not at the
+                // start of one: split there. The marker is unique per
+                // command, so it cannot match real output.
+                if let Some(index) = line.find(marker.as_str()) {
+                    let (output, rest) = line.split_at(index);
+                    if !output.is_empty() {
+                        capture.push(output);
+                    }
+                    let code = &rest[marker.len()..];
+                    return Ok(code.trim().parse::<i32>().unwrap_or(-1));
                 }
 
                 capture.push(&line);
@@ -1037,5 +1046,40 @@ mod tests {
         assert!(content.ends_with("200000\n"));
         // Durable spills are not registered for per-generation cleanup.
         assert!(tool.temp_files_handle().lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_without_a_trailing_newline_completes_at_once() {
+        use rig::agent::tool::Tool as _;
+        let dir = tempfile::tempdir().unwrap();
+        let tool: BashTool = BashTool::with_working_directory(dir.path().display().to_string());
+        let started = std::time::Instant::now();
+        for (command, expected, code) in [
+            ("printf 'abc'", "abc", 0),
+            (
+                "printf '{\"t\":1}'; exit_code_probe() { return 3; }; exit_code_probe",
+                "{\"t\":1}",
+                3,
+            ),
+            ("printf 'x\ny'", "x\ny", 0),
+        ] {
+            let args: BashArgs = serde_json::from_value(json!({
+                "command": command,
+                "timeout": 5
+            }))
+            .unwrap();
+            let out = tool
+                .call(&mut rig::agent::tool::ToolContext::default(), args)
+                .await
+                .unwrap();
+            assert!(out.contains(expected), "{command}: {out}");
+            assert!(!out.contains("__CHATSHELL_"), "marker leaked: {out}");
+            assert!(!out.contains("timed out"), "{command}: {out}");
+            if code != 0 {
+                assert!(out.contains(&format!("{code}")), "{command}: {out}");
+            }
+        }
+        // The session survived: no respawn, and all three were quick.
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 }
