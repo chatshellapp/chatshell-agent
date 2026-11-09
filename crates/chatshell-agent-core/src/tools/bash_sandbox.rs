@@ -1085,4 +1085,47 @@ else:
         let out = run(&f.tool, "echo x >> notes.txt && echo ok").await;
         assert!(out.contains("ok"), "{out}");
     }
+
+    #[tokio::test]
+    async fn an_authorized_delta_lets_cp_overwrite_into_an_existing_directory() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let dest = f.root.with_file_name("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("notes.txt"), "old\n").unwrap();
+        std::fs::write(f.root.join("notes.txt"), "new\n").unwrap();
+        let dest = dest.canonicalize().unwrap();
+        // Without a delta the jail refuses the write.
+        let denied = run(&f.tool, &format!("cp notes.txt {}/", dest.display())).await;
+        assert!(denied.contains("[exit code: 1]"), "{denied}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("notes.txt")).unwrap(),
+            "old\n"
+        );
+        // The delta the gate computes for this command (the destination
+        // directory itself) lets it overwrite the existing file in place.
+        for command in [
+            format!("cp notes.txt {}/", dest.display()),
+            format!("cp notes.txt {}/notes.txt", dest.display()),
+            format!("cat notes.txt > {}/notes.txt", dest.display()),
+        ] {
+            std::fs::write(dest.join("notes.txt"), "old\n").unwrap();
+            f.deltas.authorize(
+                &command,
+                None,
+                ExecutionDelta {
+                    writable_roots: vec![dest.clone()],
+                    ..ExecutionDelta::default()
+                },
+            );
+            let out = run(&f.tool, &command).await;
+            assert!(!out.contains("[exit code"), "{command}: {out}");
+            assert_eq!(
+                std::fs::read_to_string(dest.join("notes.txt")).unwrap(),
+                "new\n",
+                "{command}"
+            );
+        }
+    }
 }
