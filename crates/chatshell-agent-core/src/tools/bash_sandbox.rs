@@ -171,6 +171,11 @@ pub struct BashSandbox {
     pub escalator: Option<Arc<dyn SandboxEscalator>>,
     /// Per-execution deltas authorized by the permission gate.
     pub deltas: ExecutionDeltas,
+    /// Whether the persistent shell has left its launch directory (from
+    /// the directory the shell reports after each command). Written by the
+    /// tool, read by the permission gate: relative write targets are only
+    /// placed against a provable directory.
+    pub cwd_drifted: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for BashSandbox {
@@ -181,6 +186,7 @@ impl std::fmt::Debug for BashSandbox {
             .field("network_allowed", &self.network_allowed)
             .field("escalator", &self.escalator.is_some())
             .field("deltas", &self.deltas.len())
+            .field("cwd_drifted", &self.cwd_drifted)
             .finish()
     }
 }
@@ -470,6 +476,7 @@ mod os_sandbox_integration {
         recorder: Arc<Recorder>,
         network: Arc<AtomicBool>,
         deltas: ExecutionDeltas,
+        drifted: Arc<AtomicBool>,
     }
 
     /// The backend under test, or `None` to skip.
@@ -498,6 +505,7 @@ mod os_sandbox_integration {
         });
         let network = Arc::new(AtomicBool::new(false));
         let deltas = ExecutionDeltas::default();
+        let drifted = Arc::new(AtomicBool::new(false));
         let tool = BashTool::with_working_directory(root.display().to_string())
             .with_env_passthrough(Vec::new())
             .with_sandbox(BashSandbox {
@@ -506,8 +514,10 @@ mod os_sandbox_integration {
                 network_allowed: network.clone(),
                 escalator: Some(recorder.clone()),
                 deltas: deltas.clone(),
+                cwd_drifted: drifted.clone(),
             });
         Some(Fixture {
+            drifted,
             outside: base.join("outside.txt"),
             _dir: dir,
             root,
@@ -687,6 +697,7 @@ mod os_sandbox_integration {
                 network_allowed: Arc::new(AtomicBool::new(false)),
                 escalator: None,
                 deltas: ExecutionDeltas::default(),
+                cwd_drifted: Default::default(),
             },
         );
         // Control: a sibling directory under the writable parent can move.
@@ -971,10 +982,107 @@ else:
                 network_allowed: Arc::new(AtomicBool::new(false)),
                 escalator: None,
                 deltas: ExecutionDeltas::default(),
+                cwd_drifted: Default::default(),
             },
         );
         let out = run(&tool, "echo ran").await;
         assert!(out.contains("ran"));
         assert!(out.contains("sandbox unavailable"), "{out}");
+    }
+
+    // ---- ADR 09 at the tool --------------------------------------------
+
+    async fn run_in_dir(tool: &BashTool, command: &str, workdir: Option<&str>) -> String {
+        tool.call(
+            &mut ToolContext::new(),
+            BashArgs {
+                command: Some(command.to_string()),
+                timeout: Some(30),
+                description: None,
+                workdir: workdir.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| format!("ERR {e}"))
+    }
+
+    #[tokio::test]
+    async fn absorbed_redirects_carry_no_security_notice() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let out = run(&f.tool, "echo hi > out.txt && cat out.txt").await;
+        assert!(!out.contains("[security notice]"), "{out}");
+        assert!(out.contains("hi"), "{out}");
+        let out = run(&f.tool, "cat > note.txt <<'EOF'\nit's here\nEOF").await;
+        assert!(!out.contains("[security notice]"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("note.txt")).unwrap(),
+            "it's here\n"
+        );
+        // A co-occurring warning keeps its notice.
+        let out = run(&f.tool, "eval \"echo hi\" > out.txt").await;
+        assert!(out.contains("[security notice]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn drift_follows_the_directory_the_shell_reports() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let drifted = f.drifted.clone();
+        run(&f.tool, "true").await;
+        assert!(!drifted.load(Ordering::SeqCst));
+        // An obfuscated directory change still drifts: the shell says so.
+        run(&f.tool, "\"c\"\"d\" /").await;
+        assert!(drifted.load(Ordering::SeqCst));
+        // Relative redirects keep their notice while drifted.
+        let out = run(&f.tool, "echo hi > /dev/null; echo x > rel.txt").await;
+        assert!(out.contains("[security notice]"), "{out}");
+        // Back in the launch directory, trust returns.
+        run(&f.tool, &format!("cd '{}'", f.root.display())).await;
+        assert!(!drifted.load(Ordering::SeqCst));
+        // A workdir call runs in a subshell and never drifts the session.
+        run_in_dir(&f.tool, "cd /", Some("/")).await;
+        assert!(!drifted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn literal_tmp_is_writable_in_the_jail() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let name = format!("chatshell-fa3-{}", std::process::id());
+        let out = run(&f.tool, &format!("touch /tmp/{name} && echo made")).await;
+        assert!(out.contains("made"), "{out}");
+        assert!(f.recorder.requests.lock().unwrap().is_empty());
+        if cfg!(target_os = "linux") {
+            // `/tmp` is the scratch.
+            assert!(f.root.with_file_name("scratch").join(&name).exists());
+        } else {
+            let _ = std::fs::remove_file(std::path::Path::new("/tmp").join(&name));
+        }
+    }
+
+    #[tokio::test]
+    async fn blocklist_follows_the_directory_the_command_runs_in() {
+        // Jailed, so even a regression could not touch the real file.
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let out = run_in_dir(&f.tool, "echo x >> .zshrc", Some(&home)).await;
+        assert!(
+            out.starts_with("ERR") && out.contains("protected user file"),
+            "{out}"
+        );
+        let out = run(&f.tool, "cd ~ && echo x >> .zshrc").await;
+        assert!(
+            out.starts_with("ERR") && out.contains("protected user file"),
+            "{out}"
+        );
+        // In-workspace relative writes are unaffected.
+        let out = run(&f.tool, "echo x >> notes.txt && echo ok").await;
+        assert!(out.contains("ok"), "{out}");
     }
 }

@@ -169,6 +169,49 @@ pub struct SandboxPolicy {
     /// Extra directories that must not be read (the host's own data
     /// directory; see `path_policy::register_private_dir`).
     pub private_dirs: Vec<PathBuf>,
+    /// The temp channel: the conversation scratch directory when literal
+    /// `/tmp` is writable inside the jail. Linux binds the scratch over
+    /// `/tmp` (`/tmp` *is* the scratch); macOS cannot mount, so it allows
+    /// writes to the OS temporary directory (`/private/tmp`) instead.
+    /// `None` when the channel is off (see [`temp_channel_available`]).
+    pub temp_scratch: Option<PathBuf>,
+}
+
+/// The literal temporary directory and its resolved spelling.
+pub const TMP_SPELLINGS: &[&str] = &["/tmp", "/private/tmp"];
+
+/// Whether the jail can make literal `/tmp` writable for `roots`.
+///
+/// macOS allows the OS temporary directory directly. Linux binds the
+/// scratch over `/tmp`, which would hide any writable root living under
+/// `/tmp` (the desktop's scratch fallback does), so the channel is off
+/// then. Other platforms have no jail. The launch spec, the jail-profile
+/// evidence, and the analysis temp roots all use this one predicate.
+pub fn temp_channel_available(roots: &[PathBuf]) -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    !roots.iter().any(|root| under_tmp(root))
+}
+
+fn under_tmp(path: &Path) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    TMP_SPELLINGS
+        .iter()
+        .any(|tmp| canonical.starts_with(tmp) || path.starts_with(tmp))
+}
+
+/// How the temp channel appears to bash, for the jail-profile evidence.
+pub fn describe_temp_channel(policy: &SandboxPolicy) -> Option<String> {
+    policy.temp_scratch.as_ref()?;
+    Some(if cfg!(target_os = "linux") {
+        "/tmp is an alias of the conversation scratch directory".to_string()
+    } else {
+        "/tmp (/private/tmp, the shared OS temporary directory) is writable".to_string()
+    })
 }
 
 impl SandboxPolicy {
@@ -179,11 +222,14 @@ impl SandboxPolicy {
     pub fn for_bash(workspace: Option<&Path>, scratch_dir: &Path, allow_network: bool) -> Self {
         let mut writable_roots: Vec<PathBuf> = workspace.iter().map(|w| w.to_path_buf()).collect();
         writable_roots.push(scratch_dir.to_path_buf());
+        let temp_scratch =
+            temp_channel_available(&writable_roots).then(|| scratch_dir.to_path_buf());
         SandboxPolicy {
             writable_roots,
             allow_network,
             home: dirs::home_dir(),
             private_dirs: crate::path_policy::private_dirs(),
+            temp_scratch,
         }
     }
 }
@@ -424,6 +470,15 @@ fn seatbelt_profile(policy: &SandboxPolicy, roots: &[PathBuf]) -> SeatbeltBuilde
         ));
     }
 
+    // The temp channel: literal `/tmp` writes, by the resolved spelling
+    // (Seatbelt matches the kernel path).
+    if policy.temp_scratch.is_some() {
+        let name = b.param("TEMP_ROOT", resolved(Path::new("/tmp")));
+        b.profile.push_str(&format!(
+            "(allow file-write* (subpath (param \"{name}\")))\n"
+        ));
+    }
+
     // Denies come after the allows: the last matching rule wins.
     let git_protected = roots.iter().flat_map(|root| {
         GIT_PROTECTED
@@ -536,6 +591,15 @@ fn bubblewrap_spec(
         args.push(a.display().to_string());
         args.push(b.display().to_string());
     };
+    // The temp channel: the scratch is bound over `/tmp`, so `/tmp` is the
+    // scratch. Never when a writable root lives under `/tmp` (the overlay
+    // would hide it).
+    if let Some(scratch) = &policy.temp_scratch
+        && let Ok(scratch) = scratch.canonicalize()
+        && !roots.iter().any(|root| under_tmp(root))
+    {
+        push3(&mut args, "--bind", &scratch, Path::new("/tmp"));
+    }
     for root in roots {
         push3(&mut args, "--bind", root, root);
     }
@@ -746,6 +810,7 @@ mod tests {
             allow_network: network,
             home: Some(PathBuf::from("/Users/tester")),
             private_dirs: Vec::new(),
+            temp_scratch: None,
         }
     }
 
@@ -1048,5 +1113,75 @@ mod tests {
     fn regex_escape_covers_metacharacters() {
         assert_eq!(sbpl_regex_escape(".env.local"), r"\.env\.local");
         assert_eq!(sbpl_regex_escape("a+b"), r"a\+b");
+    }
+
+    #[test]
+    fn bubblewrap_binds_the_scratch_over_tmp() {
+        let dir = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let mut p = policy(&root, false);
+        p.writable_roots.push(scratch.clone());
+        p.temp_scratch = Some(scratch.clone());
+        let args = wrap(&backend, &p, inner(&root)).unwrap().args.join(" ");
+        assert!(args.contains(&format!("--bind {} /tmp", scratch.display())));
+        // An alias, never a writable-root bind of /tmp itself.
+        assert!(!args.contains("--bind /tmp /tmp"));
+        // Without the channel, /tmp stays as the read-only base shows it.
+        p.temp_scratch = None;
+        let args = wrap(&backend, &p, inner(&root)).unwrap().args.join(" ");
+        assert!(!args.contains(" /tmp "));
+    }
+
+    #[test]
+    fn the_tmp_overlay_never_hides_a_root_under_tmp() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backend = SandboxBackend::Bubblewrap(PathBuf::from("/usr/bin/bwrap"));
+        let mut p = policy(&root, false);
+        p.temp_scratch = Some(root.clone());
+        let args = wrap(&backend, &p, inner(&root)).unwrap().args.join(" ");
+        assert!(!args.contains(&format!("--bind {} /tmp", root.display())));
+        if cfg!(target_os = "linux") {
+            assert!(!temp_channel_available(std::slice::from_ref(&root)));
+            let policy = SandboxPolicy::for_bash(None, &root, false);
+            assert_eq!(policy.temp_scratch, None);
+            assert_eq!(describe_temp_channel(&policy), None);
+        }
+    }
+
+    #[test]
+    fn seatbelt_allows_the_resolved_tmp_with_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut p = policy(&root, false);
+        p.temp_scratch = Some(root.clone());
+        let spec = wrap(&SandboxBackend::Seatbelt, &p, inner(&root)).unwrap();
+        let tmp = resolved(Path::new("/tmp")).display().to_string();
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a.starts_with("TEMP_ROOT_") && a.ends_with(&format!("={tmp}")))
+        );
+        assert!(spec.args[1].contains("(allow file-write* (subpath (param \"TEMP_ROOT_"));
+        p.temp_scratch = None;
+        let spec = wrap(&SandboxBackend::Seatbelt, &p, inner(&root)).unwrap();
+        assert!(!spec.args[1].contains("TEMP_ROOT"));
+    }
+
+    #[test]
+    fn the_temp_channel_follows_the_platform() {
+        let home = dirs::home_dir().unwrap();
+        let policy = SandboxPolicy::for_bash(None, &home.join("scratch"), false);
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(policy.temp_scratch, Some(home.join("scratch")));
+            assert!(describe_temp_channel(&policy).is_some());
+        } else {
+            assert_eq!(policy.temp_scratch, None);
+        }
+        // The channel is never a writable root.
+        assert!(!policy.writable_roots.iter().any(|r| r.starts_with("/tmp")));
     }
 }

@@ -19,6 +19,9 @@ struct SessionEntry {
     abort_handle: BashAbortHandle,
     /// "Allow network this session" sandbox escalation flag.
     network_allowed: Arc<AtomicBool>,
+    /// The shell has left its launch directory (written by the bash tool
+    /// from the directory the shell reports; read by the permission gate).
+    cwd_drifted: Arc<AtomicBool>,
     last_used_at: Instant,
 }
 
@@ -28,6 +31,7 @@ impl SessionEntry {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             abort_handle: Arc::new(tokio::sync::Notify::new()),
             network_allowed: Arc::new(AtomicBool::new(false)),
+            cwd_drifted: Arc::new(AtomicBool::new(false)),
             last_used_at: Instant::now(),
         }
     }
@@ -76,6 +80,16 @@ impl BashSessionManager {
             .clone()
     }
 
+    /// The conversation's "shell left its launch directory" flag (created
+    /// with the session entry, dropped with it).
+    pub fn cwd_drift_flag(&self, conversation_id: &str) -> Arc<AtomicBool> {
+        let mut map = self.sessions.lock().unwrap();
+        map.entry(conversation_id.to_string())
+            .or_insert_with(SessionEntry::new)
+            .cwd_drifted
+            .clone()
+    }
+
     /// Withdraw a network escalation (permission mode switched). The next
     /// command respawns the session without network.
     pub fn reset_network(&self, conversation_id: &str) {
@@ -94,6 +108,39 @@ impl BashSessionManager {
                 conversation_id
             );
             entry.abort_handle.notify_waiters();
+        }
+    }
+
+    /// Kill the conversation's shell and remove its entry, waiting (up to
+    /// `grace`) for a running command to release the session: a running
+    /// command is aborted first. Callers that delete the conversation's
+    /// files afterwards rely on this ordering — no shell outlives them.
+    pub async fn shutdown(&self, conversation_id: &str, grace: Duration) {
+        let entry = self.sessions.lock().unwrap().remove(conversation_id);
+        let Some(entry) = entry else {
+            return;
+        };
+        let deadline = Instant::now() + grace;
+        loop {
+            // A command between awaits misses one notification; repeat it.
+            entry.abort_handle.notify_waiters();
+            match tokio::time::timeout(Duration::from_millis(100), entry.session.lock()).await {
+                Ok(mut guard) => {
+                    if let Some(mut session) = guard.take() {
+                        session.kill().await;
+                    }
+                    return;
+                }
+                Err(_) if Instant::now() < deadline => continue,
+                Err(_) => {
+                    tracing::warn!(
+                        "🖥️ [bash] Session for conversation {} still busy after {:?}; it dies with its last handle",
+                        conversation_id,
+                        grace
+                    );
+                    return;
+                }
+            }
         }
     }
 

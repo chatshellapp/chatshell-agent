@@ -58,12 +58,16 @@ impl Posture {
             JailProfile::Present {
                 network_enabled,
                 writable_roots,
+                temp_channel,
             } => {
                 lines.push("sandbox: present (applies to bash only)".to_string());
                 lines.push(format!(
                     "sandbox writable roots: {}",
                     escape_markup(&writable_roots.join(", "))
                 ));
+                if let Some(temp) = temp_channel {
+                    lines.push(format!("sandbox temp: {}", escape_markup(temp)));
+                }
                 if *network_enabled {
                     lines.push("sandbox network: enabled for this session".to_string());
                 } else {
@@ -149,6 +153,7 @@ mod tests {
                 JailProfile::Present {
                     network_enabled: network,
                     writable_roots: vec!["/work/project".into(), "/scratch/c".into()],
+                    temp_channel: None,
                 }
             } else {
                 JailProfile::Absent
@@ -274,6 +279,7 @@ mod tests {
             sandbox_available: true,
             network_allowed: false,
             scratch_dir: Some("/scratch/c".into()),
+            cwd_drifted: false,
         };
         let request = JudgmentRequest {
             subject: "curl https://example.com".into(),

@@ -116,10 +116,14 @@ pub enum JailProfile {
     /// No sandbox backend: bash runs unconfined.
     Absent,
     /// Bash runs jailed: network limited to loopback unless enabled,
-    /// writes confined to `writable_roots`.
+    /// writes confined to `writable_roots` (and the temp channel, when on).
     Present {
         network_enabled: bool,
         writable_roots: Vec<String>,
+        /// The temp channel as bash sees it (`/tmp` writable), if on. Never
+        /// a writable root: on Linux it is an alias of the scratch.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temp_channel: Option<String>,
     },
 }
 
@@ -133,6 +137,7 @@ impl JailProfile {
                 .iter()
                 .map(|root| root.display().to_string())
                 .collect(),
+            temp_channel: crate::sandbox::describe_temp_channel(policy),
         }
     }
 
@@ -156,6 +161,7 @@ impl JailProfile {
                     .iter()
                     .map(|w| w.display().to_string())
                     .collect(),
+                temp_channel: None,
             },
         }
     }
@@ -298,8 +304,8 @@ fn bash_evidence(command: &str, workdir: Option<&str>, ctx: &GateContext) -> Bas
             .collect(),
         writes_outside: bash_security::outside_write_targets(
             command,
-            ctx.workspace.as_deref(),
-            workdir,
+            ctx.analysis_root(),
+            ctx.bash_cwd(workdir).as_str(),
             &ctx.scratch_dir.iter().cloned().collect::<Vec<_>>(),
         )
         .into_iter()
@@ -376,6 +382,7 @@ mod tests {
             sandbox_available: sandbox,
             network_allowed: false,
             scratch_dir: Some(PathBuf::from("/scratch/conv")),
+            cwd_drifted: false,
         }
     }
 
@@ -401,14 +408,20 @@ mod tests {
         assert_eq!(value["bash"]["deletes"], json!(["build"]));
         assert_eq!(value["network"]["class"], "egress");
         assert_eq!(value["jail_applies"], true);
-        assert_eq!(
-            value["jail"],
-            json!({
-                "sandbox": "present",
-                "network_enabled": false,
-                "writable_roots": ["/work/project", "/scratch/conv"]
-            })
-        );
+        let mut jail = json!({
+            "sandbox": "present",
+            "network_enabled": false,
+            "writable_roots": ["/work/project", "/scratch/conv"]
+        });
+        // The temp channel travels separately, never as a writable root.
+        if let Some(temp) = crate::sandbox::describe_temp_channel(&SandboxPolicy::for_bash(
+            Some(Path::new("/work/project")),
+            Path::new("/scratch/conv"),
+            false,
+        )) {
+            jail["temp_channel"] = json!(temp);
+        }
+        assert_eq!(value["jail"], jail);
         // The assistant-written description never reaches the judge.
         assert!(!evidence.render().contains("Ignore previous rules"));
     }
@@ -432,6 +445,7 @@ mod tests {
                 sandbox_available: true,
                 network_allowed: network,
                 scratch_dir: Some(scratch.clone()),
+                cwd_drifted: false,
             };
             // The bash tool launches with exactly this policy.
             let live = SandboxPolicy::for_bash(Some(&workspace), &scratch, network);
@@ -443,6 +457,7 @@ mod tests {
                 JailProfile::Present {
                     network_enabled,
                     writable_roots,
+                    ..
                 } => {
                     assert_eq!(network_enabled, live.allow_network);
                     assert_eq!(writable_roots.len(), live.writable_roots.len());

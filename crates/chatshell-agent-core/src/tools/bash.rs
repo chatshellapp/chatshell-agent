@@ -41,11 +41,19 @@ struct CommandOutput {
     timed_out: bool,
 }
 
+/// Directory spelling for comparisons (symlinks resolved when possible).
+fn canonical_dir(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub struct BashSession<P: ShellProcess> {
     proc: P,
     /// How this session was launched; a different desired launch (sandbox
     /// toggled, network granted, env changed) respawns the session.
     launch: SpawnSpec,
+    /// The shell's working directory after its last command, as the shell
+    /// reported it in the completion marker (`None` before the first).
+    reported_pwd: Option<PathBuf>,
 }
 
 /// Shared session handle for a spawner `S`, used by `BashTool`,
@@ -77,6 +85,7 @@ impl<P: ShellProcess> BashSession<P> {
                 .await
                 .map_err(|e| BashError(format!("Failed to spawn bash: {}", e)))?,
             launch,
+            reported_pwd: None,
         };
         session.initialize().await?;
         Ok(session)
@@ -142,8 +151,11 @@ impl<P: ShellProcess> BashSession<P> {
         let marker = Self::make_marker("DONE");
 
         // The marker echo must be a separate command so $? captures the
-        // exit code of the user's command, not something internal.
-        let script = format!("{command}\necho {marker}$?\n");
+        // exit code of the user's command, not something internal. It also
+        // reports the shell's directory (newlines replaced, so a hostile
+        // directory name cannot break the line protocol): the gate trusts
+        // relative write targets only while the shell is where it started.
+        let script = format!("{command}\necho \"{marker}$?|${{PWD//$'\\n'/?}}\"\n");
 
         self.proc
             .write_stdin(script.as_bytes())
@@ -158,45 +170,51 @@ impl<P: ShellProcess> BashSession<P> {
         // borrows it, so a timeout keeps the partial capture.
         let mut capture = OutputCapture::new(spill);
 
-        let result: Result<Result<i32, BashError>, _> = tokio::time::timeout(timeout, async {
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                let n = self
-                    .proc
-                    .read_line(&mut buf)
-                    .await
-                    .map_err(|e| BashError(format!("Read failed: {}", e)))?;
-                if n == 0 {
-                    return Err(BashError("Session ended unexpectedly".into()));
-                }
-
-                let line = String::from_utf8_lossy(&buf);
-
-                // Output without a trailing newline (`head -c`, raw JSON)
-                // puts the marker at the end of its last line, not at the
-                // start of one: split there. The marker is unique per
-                // command, so it cannot match real output.
-                if let Some(index) = line.find(marker.as_str()) {
-                    let (output, rest) = line.split_at(index);
-                    if !output.is_empty() {
-                        capture.push(output);
+        let result: Result<Result<(i32, Option<PathBuf>), BashError>, _> =
+            tokio::time::timeout(timeout, async {
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    let n = self
+                        .proc
+                        .read_line(&mut buf)
+                        .await
+                        .map_err(|e| BashError(format!("Read failed: {}", e)))?;
+                    if n == 0 {
+                        return Err(BashError("Session ended unexpectedly".into()));
                     }
-                    let code = &rest[marker.len()..];
-                    return Ok(code.trim().parse::<i32>().unwrap_or(-1));
-                }
 
-                capture.push(&line);
-            }
-        })
-        .await;
+                    let line = String::from_utf8_lossy(&buf);
+
+                    // Output without a trailing newline (`head -c`, raw JSON)
+                    // puts the marker at the end of its last line, not at the
+                    // start of one: split there. The marker is unique per
+                    // command, so it cannot match real output.
+                    if let Some(index) = line.find(marker.as_str()) {
+                        let (output, rest) = line.split_at(index);
+                        if !output.is_empty() {
+                            capture.push(output);
+                        }
+                        let report = rest[marker.len()..].trim_end_matches(['\n', '\r']);
+                        let (code, pwd) = report.split_once('|').unwrap_or((report, ""));
+                        let pwd = (!pwd.is_empty()).then(|| PathBuf::from(pwd));
+                        return Ok((code.trim().parse::<i32>().unwrap_or(-1), pwd));
+                    }
+
+                    capture.push(&line);
+                }
+            })
+            .await;
 
         match result {
-            Ok(Ok(exit_code)) => Ok(CommandOutput {
-                captured: capture.finish(),
-                exit_code,
-                timed_out: false,
-            }),
+            Ok(Ok((exit_code, pwd))) => {
+                self.reported_pwd = pwd;
+                Ok(CommandOutput {
+                    captured: capture.finish(),
+                    exit_code,
+                    timed_out: false,
+                })
+            }
             Ok(Err(e)) => {
                 // Close (and drop) any partial spill file.
                 if let Some(spill) = capture.finish().spill
@@ -222,6 +240,14 @@ impl<P: ShellProcess> BashSession<P> {
 
     fn is_alive(&mut self) -> bool {
         self.proc.is_alive()
+    }
+
+    /// Whether the shell has left the directory it was launched in. Unknown
+    /// (no report yet) counts as not drifted: a fresh shell starts there.
+    fn drifted(&self) -> bool {
+        self.reported_pwd
+            .as_deref()
+            .is_some_and(|pwd| canonical_dir(pwd) != canonical_dir(&self.launch.cwd))
     }
 
     pub async fn kill(&mut self) {
@@ -416,11 +442,80 @@ impl<S: ShellSpawner + Default> BashTool<S> {
         self.temp_files.clone()
     }
 
+    /// The session's launch directory: the host's working directory (the
+    /// desktop passes the workspace, else the conversation scratch), else
+    /// the sandbox scratch. Home is a last resort for hosts that give
+    /// neither; it is never a writable root.
     pub(crate) fn resolve_cwd(&self) -> String {
         self.default_cwd
             .clone()
+            .or_else(|| {
+                self.sandbox
+                    .as_ref()
+                    .map(|sandbox| sandbox.scratch_dir.to_string_lossy().to_string())
+            })
             .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| ".".to_string())
+    }
+
+    /// Directories a relative write target of this call may resolve
+    /// against (ADR 09 FA-5): the call's cwd from the launch directory and
+    /// from the shell-reported directory, and `$HOME` when the command
+    /// itself changes directory.
+    fn write_check_dirs(
+        &self,
+        command: &str,
+        workdir: Option<&str>,
+        reported: Option<&std::path::Path>,
+    ) -> Vec<PathBuf> {
+        let launch = PathBuf::from(self.resolve_cwd());
+        let mut bases = vec![launch];
+        if let Some(reported) = reported {
+            bases.push(reported.to_path_buf());
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for base in bases {
+            let dir = match workdir {
+                Some(w) if std::path::Path::new(w).is_absolute() => PathBuf::from(w),
+                Some(w) => base.join(w),
+                None => base,
+            };
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        if bash_security::changes_directory(command)
+            && let Some(home) = dirs::home_dir()
+            && !dirs.contains(&home)
+        {
+            dirs.push(home);
+        }
+        dirs
+    }
+
+    /// The classifier warning to prefix the output with: in a jail, the
+    /// contained redirects the gate absorbed carry none (ADR 09 §1, the
+    /// same predicate the gate evaluates).
+    fn output_warning(
+        &self,
+        command: &str,
+        classification: &bash_security::CommandClassification,
+        workdir: Option<&str>,
+        drifted: bool,
+    ) -> Option<String> {
+        let SecurityVerdict::Warn(message) = &classification.verdict else {
+            return None;
+        };
+        let Some(sandbox) = self.sandbox.as_ref().filter(|s| s.backend.is_some()) else {
+            return Some(message.clone());
+        };
+        let launch = PathBuf::from(self.resolve_cwd());
+        let scope = bash_security::AbsorbScope {
+            sandboxed: true,
+            roots: vec![launch.clone(), sandbox.scratch_dir.clone()],
+            cwd: bash_security::BashCwd::new(workdir, Some(&launch), drifted),
+        };
+        bash_security::effective_warning(command, classification, &scope)
     }
 
     /// Ensure `*guard` contains a live session, creating one if needed.
@@ -448,7 +543,20 @@ impl<S: ShellSpawner + Default> BashTool<S> {
             launch.program
         );
         *slot = Some(BashSession::new(&self.spawner, launch.clone()).await?);
+        // A fresh shell starts in its launch directory.
+        self.publish_drift(slot.as_ref());
         Ok(())
+    }
+
+    /// Share the session's drift state with the permission gate (ADR 09:
+    /// relative write targets are placed only while the shell is in its
+    /// launch directory). No session means a fresh one will start there.
+    fn publish_drift(&self, session: Option<&BashSession<S::Shell>>) {
+        if let Some(sandbox) = &self.sandbox {
+            sandbox
+                .cwd_drifted
+                .store(session.is_some_and(BashSession::drifted), Ordering::SeqCst);
+        }
     }
 
     #[cfg(test)]
@@ -543,20 +651,24 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
         // --- security checks (dangerous patterns + compound analysis + injection) ---
         // Memoized: the approval gate classified this exact command a moment
         // ago, so the pipeline does not run twice per call.
-        let security_warning = match bash_security::classify_command(command).verdict {
-            SecurityVerdict::Block(msg) => {
-                tracing::warn!("🛡️ [bash] Command blocked: {}", command);
-                return Err(BashError(msg));
-            }
-            SecurityVerdict::Warn(msg) => {
-                tracing::warn!("🛡️ [bash] Security warning: {} — {}", msg, command);
-                Some(msg)
-            }
-            SecurityVerdict::Allow => None,
-        };
+        let classification = bash_security::classify_command(command);
+        if let SecurityVerdict::Block(msg) = &classification.verdict {
+            tracing::warn!("🛡️ [bash] Command blocked: {}", command);
+            return Err(BashError(msg.clone()));
+        }
+        let reported_pwd = guard.as_ref().and_then(|s| s.reported_pwd.clone());
+        let drifted = guard.as_ref().is_some_and(|s| s.drifted());
+        let security_warning =
+            self.output_warning(command, &classification, args.workdir.as_deref(), drifted);
+        if let Some(msg) = &security_warning {
+            tracing::warn!("🛡️ [bash] Security warning: {} — {}", msg, command);
+        }
 
-        // --- write-target boundary check (redirect targets + write commands) ---
-        if let Err(msg) = bash_security::check_write_targets(command, self.default_cwd.as_deref()) {
+        // --- write-target blocklist (redirect targets + write commands),
+        // against every directory the command may run in ---
+        let check_dirs =
+            self.write_check_dirs(command, args.workdir.as_deref(), reported_pwd.as_deref());
+        if let Err(msg) = bash_security::check_write_targets(command, &check_dirs) {
             tracing::warn!("🛡️ [bash] Write target blocked: {} — {}", msg, command);
             return Err(BashError(msg));
         }
@@ -608,6 +720,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
         }
 
         let result = self.run_in(&mut guard, &effective_command, timeout).await;
+        self.publish_drift(guard.as_ref());
         // A delta covers this one execution: respawn the session with its
         // normal profile right away, so nothing started under the delta
         // (background jobs included) keeps the wider access.
@@ -677,7 +790,9 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
                     sandbox.network_allowed.store(true, Ordering::SeqCst);
                     let relaunch = self.launch()?;
                     self.ensure_session(&mut guard, &relaunch.spec).await?;
-                    match self.run_in(&mut guard, &effective_command, timeout).await {
+                    let rerun = self.run_in(&mut guard, &effective_command, timeout).await;
+                    self.publish_drift(guard.as_ref());
+                    match rerun {
                         Ok(rerun) => cmd = rerun,
                         Err(e) => {
                             *guard = None;

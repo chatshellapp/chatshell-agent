@@ -9,6 +9,11 @@
 //! private-network fetch, sensitive read) -> session-grant lookup ->
 //! mode/tier matrix -> prompt.
 //!
+//! Bash is jailed in `ask` and `auto` wherever a sandbox backend exists
+//! (ADR 08): in-profile commands run silently in both, and the residual —
+//! forced sources, escapes, MCP, `kill_shell`, unknown tools, file-tool
+//! writes in `ask` — prompts in `ask` and is judged in `auto`.
+//!
 //! In [`PermissionMode::Auto`] every prompt becomes
 //! [`GateDecision::Classify`]: the host routes it to the auto-mode judge
 //! with deterministic evidence (see [`crate::judgment`]). Human-minted
@@ -42,8 +47,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
-    /// Prompt before write- and exec-tier tool calls; session grants
-    /// cache approvals.
+    /// The human decides the residual. Where a sandbox backend exists,
+    /// bash runs jailed and in-profile commands run silently; escapes,
+    /// forced sources, file-tool writes, MCP calls, `kill_shell`, and
+    /// unknown tools prompt. Without a backend, every bash command
+    /// prompts. Session grants cache approvals.
     Ask,
     /// Bash runs inside the OS sandbox without prompting, and file writes
     /// inside the workspace run silently. Every call `ask` would prompt
@@ -67,8 +75,37 @@ pub struct GateContext {
     pub sandbox_available: bool,
     /// "Allow network this session" was granted.
     pub network_allowed: bool,
-    /// The conversation scratch directory (a jail writable root).
+    /// The conversation scratch directory (a jail writable root, and the
+    /// bash working directory when no workspace is selected).
     pub scratch_dir: Option<PathBuf>,
+    /// The bash shell has left its launch directory (reported by the
+    /// shell after each command): relative write targets are unprovable.
+    pub cwd_drifted: bool,
+}
+
+impl GateContext {
+    /// The directory bash write and deletion analysis treats as the
+    /// workspace: the workspace, else the scratch directory (bash runs
+    /// there when no workspace is selected).
+    pub fn analysis_root(&self) -> Option<&Path> {
+        self.workspace.as_deref().or(self.scratch_dir.as_deref())
+    }
+
+    /// The working directory of a bash call with `workdir`, and whether it
+    /// is provable (ADR 09 §1 condition 6).
+    pub fn bash_cwd(&self, workdir: Option<&str>) -> bash_security::BashCwd {
+        bash_security::BashCwd::new(workdir, self.analysis_root(), self.cwd_drifted)
+    }
+
+    /// The jail's writable roots as the analysis sees them: the analysis
+    /// root first, then the scratch directory.
+    pub fn jail_roots(&self) -> Vec<PathBuf> {
+        self.analysis_root()
+            .iter()
+            .map(|root| root.to_path_buf())
+            .chain(self.scratch_dir.iter().cloned())
+            .collect()
+    }
 }
 
 /// Risk tier of a tool call.
@@ -357,13 +394,19 @@ pub fn remember_scope(tool_name: &str, args: &Value) -> Option<GrantScope> {
 /// classifier warning first (the most serious), then an AST layer that
 /// could not run (fail closed: its validators were skipped), then network
 /// egress (skipped when the session already holds a network grant).
+///
+/// In a jail, contained redirect and heredoc warnings are absorbed (ADR 09
+/// §1): the arm keeps its position, so an absorbed command still passes
+/// the unparsed and egress checks, and the out-of-roots write check after
+/// this function catches a resolvable target outside the roots.
 fn bash_forced_prompt(
     command: &str,
     classification: &bash_security::CommandClassification,
     network_allowed: bool,
+    scope: &bash_security::AbsorbScope,
 ) -> Option<(ForcedPromptKind, String)> {
-    if let SecurityVerdict::Warn(message) = &classification.verdict {
-        return Some((ForcedPromptKind::Security, message.clone()));
+    if let Some(message) = bash_security::effective_warning(command, classification, scope) {
+        return Some((ForcedPromptKind::Security, message));
     }
     if !classification.ast_available {
         return Some((
@@ -516,7 +559,8 @@ pub fn resolve_in(
     args: &Value,
     grants: &SessionGrants,
 ) -> GateDecision {
-    let sandboxed_auto = mode == PermissionMode::Auto && ctx.sandbox_available;
+    // Bash is jailed in both prompting modes wherever a backend exists.
+    let sandboxed = mode != PermissionMode::Yolo && ctx.sandbox_available;
     let escalation = Escalation {
         mode,
         ctx,
@@ -541,17 +585,21 @@ pub fn resolve_in(
                 reason: reason.clone(),
             };
         }
-        let cwd = args
-            .get("workdir")
-            .and_then(Value::as_str)
-            .or_else(|| workspace.and_then(Path::to_str));
+        // The call's cwd: `workdir` (joined onto the launch directory when
+        // relative) -> workspace -> scratch. Without a workspace the scratch
+        // directory is the analysis root, so the write and deletion guards
+        // still have a boundary (ADR 09 §2).
+        let workdir = args.get("workdir").and_then(Value::as_str);
+        let bash_cwd = ctx.bash_cwd(workdir);
+        let cwd = bash_cwd.as_str();
+        let analysis_root = ctx.analysis_root();
         // Deleting existing paths outside the workspace escalates in the
         // prompting modes; `yolo` is full access, so only the catastrophic
         // blocklist above stops a deletion there.
         let scratch: Vec<PathBuf> = ctx.scratch_dir.iter().cloned().collect();
         if mode != PermissionMode::Yolo
             && let Some(target) =
-                bash_security::outside_deletion_target(command, workspace, cwd, &scratch)
+                bash_security::outside_deletion_target(command, analysis_root, cwd, &scratch)
         {
             return escalation.forced(
                 command,
@@ -579,22 +627,29 @@ pub fn resolve_in(
         }
         // The network grant only means something when a sandbox enforces
         // the alternative; without one, egress always escalates.
-        let network_allowed = sandboxed_auto && ctx.network_allowed;
-        if let Some((kind, detail)) = bash_forced_prompt(command, &classification, network_allowed)
+        let network_allowed = sandboxed && ctx.network_allowed;
+        let scope = bash_security::AbsorbScope {
+            sandboxed,
+            roots: ctx.jail_roots(),
+            cwd: bash_cwd.clone(),
+        };
+        if let Some((kind, detail)) =
+            bash_forced_prompt(command, &classification, network_allowed, &scope)
         {
             return escalation.forced(command, kind, detail);
         }
-        // Sandboxed auto: a write the jail would refuse (outside the
-        // workspace, scratch, and temp roots) is judged before execution;
-        // an allow widens the jail for that one execution.
-        if sandboxed_auto
-            && !bash_security::outside_write_targets(command, workspace, cwd, &scratch).is_empty()
+        // Jailed bash: a write the jail would refuse (outside the
+        // workspace, scratch, and temp channel) escalates before execution;
+        // an approval widens the jail for that one execution.
+        if sandboxed
+            && !bash_security::outside_write_targets(command, analysis_root, cwd, &scratch)
+                .is_empty()
         {
             return escalation.matrix(command.to_string(), JudgmentSource::OutOfWorkspaceWrite);
         }
-        // In sandboxed auto the OS sandbox absorbs everything else;
-        // escapes surface as sandbox denials after execution.
-        if sandboxed_auto || grants.bash_command_granted(command) {
+        // In a jail the OS sandbox absorbs everything else; escapes the
+        // static pass cannot see surface as sandbox denials after execution.
+        if sandboxed || grants.bash_command_granted(command) {
             return GateDecision::Allow;
         }
         return escalation.matrix(command.to_string(), JudgmentSource::UnsandboxedBash);
@@ -1281,6 +1336,7 @@ mod tests {
             sandbox_available: sandbox,
             network_allowed: network,
             scratch_dir: None,
+            cwd_drifted: false,
         }
     }
 
@@ -1361,6 +1417,7 @@ mod tests {
             sandbox_available: true,
             network_allowed: false,
             scratch_dir: None,
+            cwd_drifted: false,
         };
         assert_eq!(
             judged(&auto(&ctx, "write", json!({ "path": "notes.md" }))),
@@ -1487,23 +1544,37 @@ mod tests {
     }
 
     #[test]
-    fn ask_ignores_network_grant_and_workspace() {
+    fn jailed_ask_honors_the_network_flag_but_still_prompts_file_writes() {
         let ws = temp_workspace();
-        let ctx = auto_ctx(&ws, true, true);
+        // ADR 08 SA-2: in jailed `ask` the session flag silences egress...
+        let jailed = auto_ctx(&ws, true, true);
+        assert_eq!(
+            resolve_in(
+                PermissionMode::Ask,
+                &jailed,
+                "bash",
+                &json!({ "command": "curl https://example.com" }),
+                &SessionGrants::default()
+            ),
+            GateDecision::Allow
+        );
+        // ...without a backend the flag is meaningless and egress prompts.
+        let bare = auto_ctx(&ws, false, true);
         assert!(matches!(
             resolve_in(
                 PermissionMode::Ask,
-                &ctx,
+                &bare,
                 "bash",
                 &json!({ "command": "curl https://example.com" }),
                 &SessionGrants::default()
             ),
             GateDecision::Prompt { .. }
         ));
+        // File tools are not jailed and keep prompting in `ask` (SA-7).
         assert!(matches!(
             resolve_in(
                 PermissionMode::Ask,
-                &ctx,
+                &jailed,
                 "write",
                 &json!({ "path": ws.join("a.txt").to_str().unwrap() }),
                 &SessionGrants::default()
@@ -1870,7 +1941,262 @@ mod tests {
                     ws.display().to_string(),
                     ws.join("scratch").display().to_string()
                 ],
+                temp_channel: crate::sandbox::describe_temp_channel(
+                    &crate::sandbox::SandboxPolicy::for_bash(Some(&ws), &ws.join("scratch"), false)
+                ),
             }
         );
+    }
+
+    // ---- ADR 08 (jailed ask) and ADR 09 (fast-path alignment) ----------
+
+    /// The resolver outcome, reduced to what the matrix asserts.
+    fn outcome(decision: &GateDecision) -> String {
+        match decision {
+            GateDecision::Allow => "allow".into(),
+            GateDecision::Deny { .. } => "deny".into(),
+            GateDecision::Prompt {
+                forced: Some(f), ..
+            } => format!("{:?}", f.kind),
+            GateDecision::Prompt { forced: None, .. } => "prompt".into(),
+            GateDecision::Classify(request) => format!("{:?}", request.source),
+        }
+    }
+
+    struct Jail {
+        _root: tempfile::TempDir,
+        ws: PathBuf,
+        outside: PathBuf,
+        ctx: GateContext,
+    }
+
+    fn jail() -> Jail {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(base.join("scratch")).unwrap();
+        let ctx = GateContext {
+            workspace: Some(ws.clone()),
+            sandbox_available: true,
+            network_allowed: false,
+            scratch_dir: Some(base.join("scratch")),
+            cwd_drifted: false,
+        };
+        Jail {
+            _root: root,
+            ws,
+            outside,
+            ctx,
+        }
+    }
+
+    fn resolve_args(mode: PermissionMode, ctx: &GateContext, args: Value) -> String {
+        outcome(&resolve_in(
+            mode,
+            ctx,
+            "bash",
+            &args,
+            &SessionGrants::default(),
+        ))
+    }
+
+    #[test]
+    fn contained_redirects_absorb_in_both_jailed_modes() {
+        let j = jail();
+        let out = j.outside.display();
+        let cases: Vec<(String, &str)> = vec![
+            ("echo hi > src/x.ts".into(), "allow"),
+            ("cat > src/f <<'EOF'\nhello\nEOF".into(), "allow"),
+            ("cat > src/f <<'EOF'\nlog > ~/log\nEOF".into(), "allow"),
+            ("cat > src/f <<-'EOF'\n\tx\n\tEOF".into(), "allow"),
+            ("cat <<'EOF'\necho hi > out.txt\nEOF".into(), "Security"),
+            ("cat > src/f <<'EOF'\nx\nEOF\nls".into(), "Security"),
+            (
+                "cat > src/f <<'EOF'\nit's\nEOF\necho x > ~/f".into(),
+                "Security",
+            ),
+            ("echo hi > out.txt; diff < secret".into(), "Security"),
+            ("echo hi > out.txt; cat <<< x".into(), "Security"),
+            (
+                "echo hi > out.txt; bash <<'EOF'\nls\nEOF".into(),
+                "Security",
+            ),
+            ("bash > /dev/null <<'EOF'\nls\nEOF".into(), "Security"),
+            ("ls 2>&1 | grep x".into(), "allow"),
+            ("ls 2>/dev/null".into(), "allow"),
+            ("ls &> src/log".into(), "allow"),
+            ("echo hi >& src/f".into(), "allow"),
+            ("ls >&2".into(), "allow"),
+            (format!("ls &> {out}/log"), "OutOfWorkspaceWrite"),
+            (format!("echo hi >& {out}/f"), "OutOfWorkspaceWrite"),
+            (format!("echo hi >| {out}/f"), "OutOfWorkspaceWrite"),
+            (format!("echo hi > {out}/x"), "OutOfWorkspaceWrite"),
+            ("eval \"$cmd\" > src/f".into(), "Security"),
+            ("echo hi > $out".into(), "Security"),
+            ("echo hi > *.log".into(), "Security"),
+            ("echo $x > f".into(), "Security"),
+            ("curl http://x.example > $out".into(), "Security"),
+            ("echo x > .git/hooks/pre-commit".into(), "Security"),
+            ("echo hi > /dev/sdb1".into(), "Security"),
+            ("cd ~ && echo hi > out.txt".into(), "Security"),
+            (
+                "while true; do cd ~; break; done; echo hi > out.txt".into(),
+                "Security",
+            ),
+            ("[[ a > b ]] && echo hi > out.txt".into(), "Security"),
+            (format!("echo hi > {}/x", j.ws.display()), "allow"),
+        ];
+        for mode in [PermissionMode::Ask, PermissionMode::Auto] {
+            for (command, expected) in &cases {
+                // `ask` renders the out-of-roots arm as a matrix prompt.
+                let expected = match (mode, *expected) {
+                    (PermissionMode::Ask, "OutOfWorkspaceWrite") => "prompt",
+                    (_, expected) => expected,
+                };
+                assert_eq!(
+                    resolve_args(mode, &j.ctx, json!({ "command": command })),
+                    expected,
+                    "{mode:?}: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_absorption_needs_a_provable_cwd() {
+        let j = jail();
+        let drifted = GateContext {
+            cwd_drifted: true,
+            ..j.ctx.clone()
+        };
+        let ask = |ctx: &GateContext, args: Value| resolve_args(PermissionMode::Ask, ctx, args);
+        assert_eq!(
+            ask(&drifted, json!({ "command": "echo hi > out.txt" })),
+            "Security"
+        );
+        // Absolute targets are cwd-independent.
+        let abs = format!("echo hi > {}/out.txt", j.ws.display());
+        assert_eq!(ask(&drifted, json!({ "command": abs })), "allow");
+        // An absolute workdir proves its own call; a relative one does not
+        // after drift.
+        let ws = j.ws.display().to_string();
+        assert_eq!(
+            ask(
+                &drifted,
+                json!({ "command": "echo hi > out.txt", "workdir": ws })
+            ),
+            "allow"
+        );
+        assert_eq!(
+            ask(
+                &drifted,
+                json!({ "command": "echo hi > out.txt", "workdir": "src" })
+            ),
+            "Security"
+        );
+        assert_eq!(
+            ask(
+                &j.ctx,
+                json!({ "command": "echo hi > out.txt", "workdir": "src" })
+            ),
+            "allow"
+        );
+        // An out-of-roots workdir places the target outside.
+        let outside = j.outside.display().to_string();
+        assert_eq!(
+            ask(
+                &j.ctx,
+                json!({ "command": "echo hi > x", "workdir": outside })
+            ),
+            "prompt"
+        );
+    }
+
+    #[test]
+    fn redirects_still_warn_without_a_jail() {
+        let j = jail();
+        let bare = GateContext {
+            sandbox_available: false,
+            ..j.ctx.clone()
+        };
+        assert_eq!(
+            resolve_args(
+                PermissionMode::Ask,
+                &bare,
+                json!({ "command": "echo hi > x" })
+            ),
+            "Security"
+        );
+        assert_eq!(
+            resolve_args(
+                PermissionMode::Auto,
+                &bare,
+                json!({ "command": "echo hi > x" })
+            ),
+            "Security"
+        );
+    }
+
+    #[test]
+    fn jailed_ask_resolver_matrix() {
+        let j = jail();
+        let ask = |ctx: &GateContext, cmd: &str| {
+            resolve_args(PermissionMode::Ask, ctx, json!({ "command": cmd }))
+        };
+        // SA-2: in-profile silence, forced kinds still prompt.
+        assert_eq!(ask(&j.ctx, "ls -la"), "allow");
+        assert_eq!(ask(&j.ctx, "echo $(whoami)"), "Security");
+        assert_eq!(ask(&j.ctx, "curl https://example.com"), "Network");
+        let flagged = GateContext {
+            network_allowed: true,
+            ..j.ctx.clone()
+        };
+        assert_eq!(ask(&flagged, "curl https://example.com"), "allow");
+        // SA-3: escapes prompt before execution.
+        let escape = format!("cp a {}/f", j.outside.display());
+        assert_eq!(ask(&j.ctx, &escape), "prompt");
+        // No backend: per-command prompts, flag ignored.
+        let bare = GateContext {
+            sandbox_available: false,
+            network_allowed: true,
+            ..j.ctx.clone()
+        };
+        assert_eq!(ask(&bare, "ls -la"), "prompt");
+        assert_eq!(ask(&bare, "curl https://example.com"), "Network");
+        // `yolo` is never jailed and never asks.
+        assert_eq!(
+            resolve_args(
+                PermissionMode::Yolo,
+                &j.ctx,
+                json!({ "command": "echo hi > ~/x" })
+            ),
+            "allow"
+        );
+    }
+
+    #[test]
+    fn scratch_is_the_analysis_root_without_a_workspace() {
+        let j = jail();
+        let scratch_only = GateContext {
+            workspace: None,
+            ..j.ctx.clone()
+        };
+        let ask = |cmd: &str| {
+            resolve_args(
+                PermissionMode::Ask,
+                &scratch_only,
+                json!({ "command": cmd }),
+            )
+        };
+        // Relative writes land in the scratch: in profile.
+        assert_eq!(ask("echo hi > out.txt"), "allow");
+        assert_eq!(ask("cat attachments/data.csv"), "allow");
+        // Out-of-scratch targets surface before execution, never silently.
+        assert_ne!(ask("echo hi > /etc/x"), "allow");
+        assert_eq!(ask(&format!("cp x {}/f", j.outside.display())), "prompt");
+        assert_eq!(ask("cp x ~/f"), "prompt");
     }
 }

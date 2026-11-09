@@ -26,7 +26,95 @@ pub struct AstAnalysis {
     pub has_actual_operators: bool,
     /// True when the parse contained ERROR nodes (malformed syntax).
     pub has_parse_errors: bool,
+    /// Every redirect of the command, with heredoc geometry (ADR 09).
+    pub redirects: RedirectAnalysis,
 }
+
+/// The shape of one redirect occurrence (ADR 09 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectShape {
+    /// `>` / `N>`
+    Output,
+    /// `>>` / `N>>`
+    Append,
+    /// `>|`
+    Clobber,
+    /// `&>`
+    OutputBoth,
+    /// `&>>`
+    AppendBoth,
+    /// `>&file` (a file target, not a descriptor)
+    OutputDup,
+    /// `2>&1`, `>&2`, `N>&-`, `<&-`: descriptor plumbing, no file target.
+    FdDup,
+    /// Plain `<` file input.
+    Input,
+    /// `<<<` herestring.
+    Herestring,
+    /// A heredoc whose own statement writes it to a file with a data-only
+    /// command (`cat > f <<EOF`).
+    HeredocWrite,
+    /// Any other heredoc: pure input, or fed to a command that may execute
+    /// its stdin.
+    HeredocInput,
+    /// Anything else (`<&N`, `<>`, an operator this table does not know).
+    Other,
+}
+
+impl RedirectShape {
+    /// Output-family shapes: each must carry a file target.
+    pub fn writes_file(self) -> bool {
+        matches!(
+            self,
+            RedirectShape::Output
+                | RedirectShape::Append
+                | RedirectShape::Clobber
+                | RedirectShape::OutputBoth
+                | RedirectShape::AppendBoth
+                | RedirectShape::OutputDup
+        )
+    }
+}
+
+/// The destination of a file redirect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectTarget {
+    /// A literal path (quotes removed; `~` not yet expanded).
+    Literal(String),
+    /// Expansion, glob, substitution, or concatenation: not placeable.
+    Unresolvable,
+}
+
+/// One redirect occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    pub shape: RedirectShape,
+    /// `None` for shapes without a destination (fd-dup, heredocs) and for
+    /// an output operator whose destination could not be found.
+    pub target: Option<RedirectTarget>,
+}
+
+/// Redirect structure of a command, read from the AST.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedirectAnalysis {
+    /// Every redirect node (heredoc body text never yields one; command
+    /// substitutions inside unquoted bodies do, since they execute).
+    pub redirects: Vec<Redirect>,
+    /// Byte ranges of heredoc bodies (data, not shell syntax).
+    pub heredoc_bodies: Vec<(usize, usize)>,
+    /// A `<` or `>` byte outside strings, heredoc bodies, and comments
+    /// that is not a redirect operator (`[[ a > b ]]`, `$((1 > 2))`, a
+    /// recovered parse): the redirect set is not provably complete.
+    pub stray_operator: bool,
+    /// A command-separating newline that is neither a heredoc header
+    /// boundary nor inside a heredoc body.
+    pub unattributed_newline: bool,
+}
+
+/// Commands that only copy their stdin as data: a heredoc fed to one of
+/// these is data. An allowlist, so a command that may execute its stdin
+/// (`bash`, `python`, `env`, `eval`, ...) never qualifies.
+const HEREDOC_DATA_COMMANDS: &[&str] = &["cat"];
 
 /// Compound command structure extracted from the AST.
 #[derive(Debug, Clone, Default)]
@@ -97,12 +185,14 @@ pub fn analyze(command: &str) -> Option<AstAnalysis> {
         let compound = extract_compound_structure(root, command);
         let dangerous = extract_dangerous_patterns(root);
         let has_actual_operators = check_actual_operators(root);
+        let redirects = analyze_redirects(root, command);
 
         Some(AstAnalysis {
             compound,
             dangerous,
             has_actual_operators,
             has_parse_errors,
+            redirects,
         })
     })
     .flatten()
@@ -270,6 +360,269 @@ fn walk_for_errors(node: Node) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Redirect analysis
+// ---------------------------------------------------------------------------
+
+/// Node kinds whose bytes are data, not shell operators.
+const OPAQUE_KINDS: &[&str] = &[
+    "string",
+    "raw_string",
+    "ansi_c_string",
+    "translated_string",
+    "heredoc_body",
+    "comment",
+];
+
+#[derive(Default)]
+struct RedirectWalk {
+    redirects: Vec<Redirect>,
+    bodies: Vec<(usize, usize)>,
+    opaque: Vec<(usize, usize)>,
+    operators: Vec<(usize, usize)>,
+    /// Per heredoc: where its header boundary must end (body start, or
+    /// the terminator for an empty body) and where its start token ends.
+    headers: Vec<(usize, usize)>,
+}
+
+fn analyze_redirects(root: Node, command: &str) -> RedirectAnalysis {
+    let mut walk = RedirectWalk::default();
+    walk_redirects(root, command, &mut walk);
+    let inside = |ranges: &[(usize, usize)], i: usize| ranges.iter().any(|&(a, b)| i >= a && i < b);
+    let bytes = command.as_bytes();
+
+    let stray_operator = bytes.iter().enumerate().any(|(i, b)| {
+        matches!(b, b'<' | b'>') && !inside(&walk.opaque, i) && !inside(&walk.operators, i)
+    });
+
+    let mut unattributed_newline = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if !matches!(b, b'\n' | b'\r') || inside(&walk.opaque, i) {
+            continue;
+        }
+        // Only a newline followed by more text separates commands.
+        if command[i + 1..].trim().is_empty() {
+            continue;
+        }
+        // Backslash continuation at a word boundary (as `validate_newlines`).
+        if i > 0 && bytes[i - 1] == b'\\' && (i < 2 || bytes[i - 2].is_ascii_whitespace()) {
+            continue;
+        }
+        let header = walk.headers.iter().any(|&(start_end, body_start)| {
+            i >= start_end
+                && i < body_start
+                && command[i + 1..body_start]
+                    .bytes()
+                    .all(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+        });
+        if !header {
+            unattributed_newline = true;
+            break;
+        }
+    }
+
+    RedirectAnalysis {
+        redirects: walk.redirects,
+        heredoc_bodies: walk.bodies,
+        stray_operator,
+        unattributed_newline,
+    }
+}
+
+fn walk_redirects(node: Node, command: &str, out: &mut RedirectWalk) {
+    if OPAQUE_KINDS.contains(&node.kind()) {
+        out.opaque.push((node.start_byte(), node.end_byte()));
+    }
+    match node.kind() {
+        "file_redirect" => {
+            let redirect = file_redirect(node, command, out);
+            out.redirects.push(redirect);
+        }
+        "herestring_redirect" => {
+            mark_operator(node, out);
+            out.redirects.push(Redirect {
+                shape: RedirectShape::Herestring,
+                target: None,
+            });
+        }
+        "heredoc_redirect" => {
+            mark_operator(node, out);
+            out.redirects.push(Redirect {
+                shape: heredoc_shape(node, command),
+                target: None,
+            });
+            let mut start_end = None;
+            let mut body = None;
+            let mut end = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "heredoc_start" => start_end = Some(child.end_byte()),
+                    "heredoc_body" => body = Some((child.start_byte(), child.end_byte())),
+                    "heredoc_end" => end = Some(child.start_byte()),
+                    _ => {}
+                }
+            }
+            if let Some(range) = body {
+                out.bodies.push(range);
+            }
+            let body_start = match body {
+                Some((start, end_byte)) if end_byte > start => Some(start),
+                _ => end.or(body.map(|(start, _)| start)),
+            };
+            if let (Some(start_end), Some(body_start)) = (start_end, body_start) {
+                out.headers.push((start_end, body_start));
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_redirects(child, command, out);
+    }
+}
+
+/// Record the anonymous operator token(s) of a redirect node.
+fn mark_operator(node: Node, out: &mut RedirectWalk) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            out.operators.push((child.start_byte(), child.end_byte()));
+        }
+    }
+}
+
+fn file_redirect(node: Node, command: &str, out: &mut RedirectWalk) -> Redirect {
+    let mut operator = None;
+    let mut destination = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            if operator.is_none() {
+                operator = Some(node_text(child, command));
+            }
+            out.operators.push((child.start_byte(), child.end_byte()));
+        } else if child.kind() != "file_descriptor" && operator.is_some() && destination.is_none() {
+            destination = Some(child);
+        }
+    }
+    let target = destination.map(|dest| redirect_target(dest, command));
+    let shape = match operator.unwrap_or("") {
+        ">" => RedirectShape::Output,
+        ">>" => RedirectShape::Append,
+        ">|" => RedirectShape::Clobber,
+        "&>" => RedirectShape::OutputBoth,
+        "&>>" => RedirectShape::AppendBoth,
+        ">&-" | "<&-" => RedirectShape::FdDup,
+        ">&" => match destination {
+            Some(dest) if dest.kind() == "number" => RedirectShape::FdDup,
+            Some(dest) if node_text(dest, command) == "-" => RedirectShape::FdDup,
+            _ => RedirectShape::OutputDup,
+        },
+        "<" => RedirectShape::Input,
+        _ => RedirectShape::Other,
+    };
+    Redirect {
+        shape,
+        target: if shape == RedirectShape::FdDup {
+            None
+        } else {
+            target
+        },
+    }
+}
+
+/// A destination node as a literal path, when it is one.
+fn redirect_target(node: Node, command: &str) -> RedirectTarget {
+    let text = node_text(node, command);
+    let literal = match node.kind() {
+        "word" | "number" => Some(text.to_string()),
+        "raw_string" => text
+            .strip_prefix('\'')
+            .and_then(|t| t.strip_suffix('\''))
+            .map(str::to_string),
+        "string" => {
+            let mut cursor = node.walk();
+            let plain = node
+                .named_children(&mut cursor)
+                .all(|child| child.kind() == "string_content");
+            plain
+                .then(|| text.strip_prefix('"').and_then(|t| t.strip_suffix('"')))
+                .flatten()
+                .map(str::to_string)
+        }
+        _ => None,
+    };
+    match literal {
+        // Quoted text cannot expand, but a bare word still can: tilde
+        // forms other than `~` / `~/`, globs, braces, and escapes.
+        Some(path) if node.kind() == "word" && !plain_word(&path) => RedirectTarget::Unresolvable,
+        Some(path) if path.contains(['$', '`']) && node.kind() == "string" => {
+            RedirectTarget::Unresolvable
+        }
+        Some(path) if !path.is_empty() => RedirectTarget::Literal(path),
+        _ => RedirectTarget::Unresolvable,
+    }
+}
+
+fn plain_word(word: &str) -> bool {
+    if word.contains(['$', '`', '*', '?', '[', '{', '\\', '\'', '"']) {
+        return false;
+    }
+    !word.starts_with('~') || word == "~" || word.starts_with("~/")
+}
+
+/// Classify a heredoc by its own statement.
+fn heredoc_shape(heredoc: Node, command: &str) -> RedirectShape {
+    let Some(statement) = heredoc
+        .parent()
+        .filter(|p| p.kind() == "redirected_statement")
+    else {
+        return RedirectShape::HeredocInput;
+    };
+    // The statement's command must copy stdin as data.
+    let data_command = statement
+        .child_by_field_name("body")
+        .filter(|body| body.kind() == "command")
+        .and_then(|body| body.child_by_field_name("name"))
+        .map(|name| node_text(name, command))
+        .map(|name| name.rsplit('/').next().unwrap_or(name))
+        .is_some_and(|name| HEREDOC_DATA_COMMANDS.contains(&name));
+    if !data_command {
+        return RedirectShape::HeredocInput;
+    }
+    // And the statement itself must write to a file: a write redirect of
+    // its own (beside the heredoc, or nested in it by the grammar).
+    let mut writes = false;
+    let mut visit = |node: Node| {
+        if node.kind() == "file_redirect" {
+            let mut cursor = node.walk();
+            let op = node
+                .children(&mut cursor)
+                .find(|c| !c.is_named())
+                .map(|c| node_text(c, command));
+            if matches!(op, Some(">" | ">>" | ">|" | "&>" | "&>>")) {
+                writes = true;
+            }
+        }
+    };
+    let mut cursor = statement.walk();
+    for child in statement.children(&mut cursor) {
+        visit(child);
+        if child.id() == heredoc.id() {
+            let mut inner = child.walk();
+            for nested in child.children(&mut inner) {
+                visit(nested);
+            }
+        }
+    }
+    if writes {
+        RedirectShape::HeredocWrite
+    } else {
+        RedirectShape::HeredocInput
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,5 +796,97 @@ mod tests {
         let a = analyze(r"find . -type f -name '*.rs' -exec grep 'TODO' {} \;").unwrap();
         assert!(!a.has_actual_operators);
         assert!(!a.dangerous.has_command_substitution);
+    }
+
+    fn shapes(command: &str) -> Vec<RedirectShape> {
+        analyze(command)
+            .unwrap()
+            .redirects
+            .redirects
+            .iter()
+            .map(|r| r.shape)
+            .collect()
+    }
+
+    #[test]
+    fn redirect_shapes_come_from_the_ast() {
+        use RedirectShape::*;
+        assert_eq!(shapes("echo hi > f"), vec![Output]);
+        assert_eq!(shapes("echo hi >> f"), vec![Append]);
+        assert_eq!(shapes("echo hi >| f"), vec![Clobber]);
+        assert_eq!(shapes("cmd &> f"), vec![OutputBoth]);
+        assert_eq!(shapes("cmd &>> f"), vec![AppendBoth]);
+        assert_eq!(shapes("echo hi >& f"), vec![OutputDup]);
+        assert_eq!(shapes("cmd >&2"), vec![FdDup]);
+        assert_eq!(shapes("cmd 2>&1"), vec![FdDup]);
+        assert_eq!(shapes("cmd 3>&-"), vec![FdDup]);
+        assert_eq!(shapes("diff < f"), vec![Input]);
+        assert_eq!(shapes("cat <<< x"), vec![Herestring]);
+        assert_eq!(
+            shapes("cat > f <<'EOF'\nx\nEOF"),
+            vec![Output, HeredocWrite]
+        );
+        assert_eq!(shapes("cat <<EOF > f\nx\nEOF"), vec![HeredocWrite, Output]);
+        assert_eq!(shapes("cat <<'EOF'\nx\nEOF"), vec![HeredocInput]);
+        assert_eq!(
+            shapes("bash > f <<'EOF'\nls\nEOF"),
+            vec![Output, HeredocInput]
+        );
+        // `> 2` writes a file named 2.
+        let analysis = analyze("echo hi > 2").unwrap().redirects;
+        assert_eq!(
+            analysis.redirects[0].target,
+            Some(RedirectTarget::Literal("2".into()))
+        );
+    }
+
+    #[test]
+    fn redirect_targets_resolve_only_when_literal() {
+        let target = |command: &str| {
+            analyze(command).unwrap().redirects.redirects[0]
+                .target
+                .clone()
+        };
+        assert_eq!(
+            target("echo > 'a b'"),
+            Some(RedirectTarget::Literal("a b".into()))
+        );
+        assert_eq!(
+            target("echo > \"a b\""),
+            Some(RedirectTarget::Literal("a b".into()))
+        );
+        assert_eq!(
+            target("echo > ~/x"),
+            Some(RedirectTarget::Literal("~/x".into()))
+        );
+        assert_eq!(
+            target("echo > \"$out\""),
+            Some(RedirectTarget::Unresolvable)
+        );
+        assert_eq!(target("echo > $out"), Some(RedirectTarget::Unresolvable));
+        assert_eq!(target("echo > *.log"), Some(RedirectTarget::Unresolvable));
+        assert_eq!(target("echo > x\"y\""), Some(RedirectTarget::Unresolvable));
+        assert_eq!(target("echo > ~root/x"), Some(RedirectTarget::Unresolvable));
+    }
+
+    #[test]
+    fn heredoc_geometry_attributes_header_newlines() {
+        let r = |command: &str| analyze(command).unwrap().redirects;
+        assert!(!r("cat > f <<'EOF'\nx\nEOF").unattributed_newline);
+        assert!(!r("cat > f <<-'EOF'\n\tx\n\tEOF").unattributed_newline);
+        assert!(!r("cat > f <<EOF\nEOF").unattributed_newline);
+        assert!(!r("cat > f <<'EOF'\nx\nEOF\n").unattributed_newline);
+        assert!(r("cat > f <<'EOF'\nx\nEOF\nls").unattributed_newline);
+        assert!(r("cat > f <<'EOF'\nit's\nEOF\necho x > g").unattributed_newline);
+        assert!(r("ls\npwd").unattributed_newline);
+        assert!(!r("echo a \\\n  b").unattributed_newline);
+        // Body text is data: no operators, no stray bytes.
+        let body = r("cat > f <<'EOF'\na > b < c\nEOF");
+        assert!(!body.stray_operator);
+        assert_eq!(body.redirects.len(), 2);
+        // A `>` that is not a redirect operator is stray.
+        assert!(r("[[ a > b ]]").stray_operator);
+        assert!(r("echo $(( 1 > 2 ))").stray_operator);
+        assert!(!r("echo 'a > b' \"c < d\"").stray_operator);
     }
 }

@@ -375,17 +375,15 @@ pub enum Eligibility {
 pub enum AutoResolution {
     /// Classifier-judged, zero prompts.
     Judged,
-    /// No eligible judge: v2 semantics (sandbox plus a few prompts).
-    SandboxPrompts,
-    /// No eligible judge and no sandbox backend.
+    /// No eligible judge: the conversation runs in `ask`, which is the
+    /// sandbox-plus-prompts posture wherever a backend exists (ADR 08 §3).
     Ask,
 }
 
-/// Resolve `auto` from eligibility and sandbox availability.
-pub fn resolve_auto(eligibility: Option<&Eligibility>, sandbox_available: bool) -> AutoResolution {
+/// Resolve `auto` from the judge's eligibility.
+pub fn resolve_auto(eligibility: Option<&Eligibility>) -> AutoResolution {
     match eligibility {
         Some(Eligibility::Eligible(_)) => AutoResolution::Judged,
-        _ if sandbox_available => AutoResolution::SandboxPrompts,
         _ => AutoResolution::Ask,
     }
 }
@@ -403,6 +401,7 @@ fn probe_inputs() -> (Posture, AssembledTranscript, JudgmentRequest) {
         sandbox_available: false,
         network_allowed: false,
         scratch_dir: None,
+        cwd_drifted: false,
     };
     let command = "rm -rf /Users/demo/Documents/old-drafts";
     let args = serde_json::json!({ "command": command });
@@ -1101,14 +1100,11 @@ mod tests {
     fn auto_resolution_matrix() {
         let eligible = Eligibility::Eligible(JudgeParams::default());
         let ineligible = Eligibility::Ineligible { reason: "x".into() };
-        assert_eq!(resolve_auto(Some(&eligible), false), AutoResolution::Judged);
-        assert_eq!(resolve_auto(Some(&eligible), true), AutoResolution::Judged);
-        assert_eq!(
-            resolve_auto(Some(&ineligible), true),
-            AutoResolution::SandboxPrompts
-        );
-        assert_eq!(resolve_auto(Some(&ineligible), false), AutoResolution::Ask);
-        assert_eq!(resolve_auto(None, false), AutoResolution::Ask);
-        assert_eq!(resolve_auto(None, true), AutoResolution::SandboxPrompts);
+        // Two arms (ADR 08 §3): judged, or `ask` — which carries the jail
+        // wherever a backend exists, so sandbox availability no longer
+        // splits the ineligible case.
+        assert_eq!(resolve_auto(Some(&eligible)), AutoResolution::Judged);
+        assert_eq!(resolve_auto(Some(&ineligible)), AutoResolution::Ask);
+        assert_eq!(resolve_auto(None), AutoResolution::Ask);
     }
 }

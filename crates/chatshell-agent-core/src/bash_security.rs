@@ -1314,6 +1314,42 @@ pub fn check_command(
 pub struct CommandClassification {
     pub verdict: SecurityVerdict,
     pub ast_available: bool,
+    /// Every warning the validators emitted, attributed to its validator
+    /// (ADR 09 attribution payload). Empty unless `verdict` is `Warn`.
+    pub warnings: Vec<ClassifiedWarning>,
+    /// The command's redirect structure from the AST (`None` without it).
+    /// Context-free, so it is safe in the process-global memo; whether a
+    /// warning is absorbed depends on the conversation and is never cached.
+    pub redirects: Option<bash_ast::RedirectAnalysis>,
+}
+
+/// Which validator emitted a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningKind {
+    /// `validate_redirections` (any `<` / `>` outside quotes).
+    Redirection,
+    /// `validate_newlines` (a newline that could separate commands).
+    Newline,
+    /// Every other validator: never absorbed.
+    Other,
+}
+
+/// One validator warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedWarning {
+    pub kind: WarningKind,
+    pub message: String,
+}
+
+/// The pipeline's merged message for a set of warnings: the first, plus a
+/// count of the rest.
+fn merged_warning(messages: &[&str]) -> Option<String> {
+    let first = messages.first()?;
+    Some(if messages.len() > 1 {
+        format!("{}; (+{} more warning(s))", first, messages.len() - 1)
+    } else {
+        first.to_string()
+    })
 }
 
 /// Classify a command with the standard dangerous-pattern list, memoized.
@@ -1374,6 +1410,8 @@ fn check_command_inner(
     let blocked = |reason: String| CommandClassification {
         verdict: SecurityVerdict::Block(reason),
         ast_available: true,
+        warnings: Vec::new(),
+        redirects: None,
     };
     // 1. Check the full command for dangerous patterns.
     if let Some(msg) = check_dangerous(command) {
@@ -1418,63 +1456,66 @@ fn check_command_inner(
     // 3. Build validation context and run the validator pipeline.
     let ctx = ValidationContext::new(command);
     let ast_available = ctx.ast.is_some();
-    let done = |verdict: SecurityVerdict| CommandClassification {
-        verdict,
-        ast_available,
-    };
+    let redirects = ctx.ast.as_ref().map(|ast| ast.redirects.clone());
 
     // Each validator returns Allow (continue), Warn (collect), or Block (stop).
     // AST-based validators run alongside regex validators for defense-in-depth.
-    let validators: &[fn(&ValidationContext) -> SecurityVerdict] = &[
-        validate_control_characters,
-        validate_ast_parse_errors,
-        validate_incomplete_commands,
-        validate_ansi_c_quoting,
-        validate_dangerous_patterns,
-        validate_ast_dangerous_patterns,
-        validate_ast_compound_structure,
-        validate_dangerous_variables,
-        validate_newlines,
-        validate_ifs_injection,
-        validate_proc_environ,
-        validate_redirections,
-        validate_backslash_escaped_whitespace,
+    type Validator = fn(&ValidationContext) -> SecurityVerdict;
+    let validators: &[(Validator, WarningKind)] = &[
+        (validate_control_characters, WarningKind::Other),
+        (validate_ast_parse_errors, WarningKind::Other),
+        (validate_incomplete_commands, WarningKind::Other),
+        (validate_ansi_c_quoting, WarningKind::Other),
+        (validate_dangerous_patterns, WarningKind::Other),
+        (validate_ast_dangerous_patterns, WarningKind::Other),
+        (validate_ast_compound_structure, WarningKind::Other),
+        (validate_dangerous_variables, WarningKind::Other),
+        (validate_newlines, WarningKind::Newline),
+        (validate_ifs_injection, WarningKind::Other),
+        (validate_proc_environ, WarningKind::Other),
+        (validate_redirections, WarningKind::Redirection),
+        (validate_backslash_escaped_whitespace, WarningKind::Other),
         // Uses AST to skip false positive on `find -exec \;`
-        validate_backslash_escaped_operators_with_ast,
-        validate_unicode_whitespace,
-        validate_brace_expansion,
-        validate_zsh_dangerous_commands,
-        validate_eval,
+        (
+            validate_backslash_escaped_operators_with_ast,
+            WarningKind::Other,
+        ),
+        (validate_unicode_whitespace, WarningKind::Other),
+        (validate_brace_expansion, WarningKind::Other),
+        (validate_zsh_dangerous_commands, WarningKind::Other),
+        (validate_eval, WarningKind::Other),
     ];
 
-    let mut worst_warn: Option<String> = None;
-    let mut all_warnings: Vec<String> = Vec::new();
-
-    for validator in validators {
+    let mut warnings: Vec<ClassifiedWarning> = Vec::new();
+    for (validator, kind) in validators {
         match validator(&ctx) {
-            SecurityVerdict::Block(msg) => return done(SecurityVerdict::Block(msg)),
-            SecurityVerdict::Warn(msg) => {
-                if worst_warn.is_none() {
-                    worst_warn = Some(msg.clone());
-                }
-                all_warnings.push(msg);
+            SecurityVerdict::Block(msg) => {
+                return CommandClassification {
+                    verdict: SecurityVerdict::Block(msg),
+                    ast_available,
+                    warnings: Vec::new(),
+                    redirects,
+                };
             }
+            SecurityVerdict::Warn(message) => warnings.push(ClassifiedWarning {
+                kind: *kind,
+                message,
+            }),
             SecurityVerdict::Allow => {}
         }
     }
 
-    if let Some(first) = worst_warn {
-        if all_warnings.len() > 1 {
-            return done(SecurityVerdict::Warn(format!(
-                "{}; (+{} more warning(s))",
-                first,
-                all_warnings.len() - 1
-            )));
-        }
-        return done(SecurityVerdict::Warn(first));
+    let messages: Vec<&str> = warnings.iter().map(|w| w.message.as_str()).collect();
+    let verdict = match merged_warning(&messages) {
+        Some(message) => SecurityVerdict::Warn(message),
+        None => SecurityVerdict::Allow,
+    };
+    CommandClassification {
+        verdict,
+        ast_available,
+        warnings,
+        redirects,
     }
-
-    done(SecurityVerdict::Allow)
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,20 +1609,31 @@ pub fn check_with_context(value: &str, context: SecurityContext) -> SecurityVerd
 }
 
 // ---------------------------------------------------------------------------
-// Write-target extraction for the write blocklist
+// Write-target extraction (blocklist, boundary analysis, absorption)
 // ---------------------------------------------------------------------------
 
-/// Extract file paths that a bash command would write to (redirections + common
-/// write commands) and check each against `path_policy::check_write`.
+/// Check every write target of `command` (redirects and common write
+/// commands) against `path_policy::check_write`.
+///
+/// Relative targets are checked against every directory in `cwds` — the
+/// directories the command may actually run in (ADR 09 FA-5: the call's
+/// effective cwd, the shell-reported session directory, and `$HOME` when
+/// the command changes directory). With no `cwds`, relative targets are
+/// checked as spelled.
 ///
 /// Returns `Err(reason)` on the first blocklisted target. The workspace
 /// boundary is not enforced here: the permission gate owns it, and the
 /// OS jail confines sandboxed bash to its writable roots.
-pub fn check_write_targets(command: &str, cwd: Option<&str>) -> Result<(), String> {
-    let targets = extract_write_targets(command);
-    for target in &targets {
-        let resolved = resolve_target(target, cwd);
-        super::path_policy::check_write(&resolved, None)?;
+pub fn check_write_targets(command: &str, cwds: &[std::path::PathBuf]) -> Result<(), String> {
+    for target in write_targets(command) {
+        if is_relative_target(&target) && !cwds.is_empty() {
+            for cwd in cwds {
+                let resolved = resolve_target(&target, cwd.to_str());
+                super::path_policy::check_write(&resolved, None)?;
+            }
+        } else {
+            super::path_policy::check_write(&resolve_target(&target, None), None)?;
+        }
     }
     Ok(())
 }
@@ -1594,7 +1646,7 @@ pub fn write_ask_target(
     command: &str,
     cwd: Option<&str>,
 ) -> Option<super::path_policy::WriteBlock> {
-    let targets = extract_write_targets(command);
+    let targets = write_targets(command);
     if targets.is_empty() {
         return None;
     }
@@ -1612,7 +1664,7 @@ const DELETION_COMMANDS: &[&str] = &["rm", "unlink", "shred", "srm"];
 /// up to `--`; quotes are trimmed.
 pub fn extract_deletion_targets(command: &str) -> Vec<String> {
     let mut targets = Vec::new();
-    for sub in split_on_operators(command) {
+    for sub in command_segments(command) {
         let sub = strip_safe_wrappers(sub.trim());
         let mut parts = sub.split_whitespace();
         let Some(first) = parts.next() else {
@@ -1656,9 +1708,10 @@ fn deletion_subject(target: &str, cwd: Option<&str>) -> std::path::PathBuf {
 /// Irreversible-deletion guard: the first operand of a deletion command
 /// that would remove a path that already exists outside the workspace.
 /// Paths inside the workspace, inside `extra_roots` (the conversation
-/// scratch directory), and inside the system temp directory are not
-/// reported; paths that do not exist yet have nothing to lose. Without a
-/// workspace there is no boundary, so nothing is reported.
+/// scratch directory), and inside the jail's temp channel (`/tmp`) are
+/// not reported; paths that do not exist yet have nothing to lose.
+/// Without a workspace there is no boundary, so nothing is reported (the
+/// gate passes the scratch directory when no workspace is selected).
 ///
 /// The permission gate escalates a hit (prompt in `ask`, judgment in
 /// `auto`); `yolo` runs it. The bash tool itself does not refuse.
@@ -1681,7 +1734,7 @@ pub fn outside_deletion_target(
         if std::fs::symlink_metadata(&subject).is_err() {
             continue;
         }
-        if !scope.contains(&subject) {
+        if !scope.contains(&subject, false) {
             return Some(subject);
         }
     }
@@ -1690,9 +1743,11 @@ pub fn outside_deletion_target(
 
 /// Write targets of `command` (redirects, `tee`, `cp`/`mv` destinations,
 /// `touch`) that land outside the workspace, `extra_roots` (the scratch
-/// directory), and the system temp directory. Device files (`/dev/null`)
-/// are ignored. In sandboxed auto these are what the jail would refuse,
-/// so the gate judges them before execution instead.
+/// directory), and the jail's temp channel. Device files (`/dev/null`)
+/// are ignored, and so are targets that cannot be placed statically
+/// (expansions, globs). In sandboxed modes these are what the jail would
+/// refuse, so the gate escalates them before execution instead. Each is
+/// returned where the write would physically land (symlinks resolved).
 pub fn outside_write_targets(
     command: &str,
     workspace: Option<&std::path::Path>,
@@ -1702,7 +1757,7 @@ pub fn outside_write_targets(
     let Some(workspace) = workspace else {
         return Vec::new();
     };
-    let targets = extract_write_targets(command);
+    let targets = write_targets(command);
     if targets.is_empty() {
         return Vec::new();
     }
@@ -1714,22 +1769,26 @@ pub fn outside_write_targets(
         if target.contains(['$', '*', '?', '`']) {
             continue;
         }
-        let resolved = crate::path_policy::normalize_path(&resolve_target(target, cwd));
-        if resolved.starts_with("/dev") || scope.contains(&resolved) {
+        let spelled = resolve_target(target, cwd);
+        if crate::path_policy::normalize_path(&spelled).starts_with("/dev")
+            || scope.contains(&spelled, true)
+        {
             continue;
         }
-        if !outside.contains(&resolved) {
-            outside.push(resolved);
+        let landed = physical_path(&spelled, true)
+            .unwrap_or_else(|| crate::path_policy::normalize_path(&spelled));
+        if !outside.contains(&landed) {
+            outside.push(landed);
         }
     }
     outside
 }
 
 /// The directories a command may write without leaving the user's scope:
-/// the workspace and extra roots (themselves included) and the shared
-/// temp roots (strictly below themselves). Paths match lexically and
-/// with their parent resolved through symlinks (a final symlink is the
-/// entry itself, as `rm` and redirect creation treat it).
+/// the workspace and extra roots (themselves included) and the jail's
+/// temp channel (`/tmp`, strictly below it) when it is on. Never the
+/// analyzing process's own `env::temp_dir()`: the jail does not open it,
+/// so counting it would make silent writes die at the jail (INV-7).
 struct WriteScope {
     owned: Vec<std::path::PathBuf>,
     temp: Vec<std::path::PathBuf>,
@@ -1747,9 +1806,19 @@ impl WriteScope {
         };
         let mut owned = vec![workspace.to_path_buf()];
         owned.extend(extra_roots.iter().cloned());
+        let temp = if crate::sandbox::temp_channel_available(&owned) {
+            spellings(
+                crate::sandbox::TMP_SPELLINGS
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect(),
+            )
+        } else {
+            Vec::new()
+        };
         Self {
             owned: spellings(owned),
-            temp: spellings(vec![std::env::temp_dir(), std::path::PathBuf::from("/tmp")]),
+            temp,
         }
     }
 
@@ -1761,17 +1830,61 @@ impl WriteScope {
                 .any(|root| path.starts_with(root) && path != root.as_path())
     }
 
-    fn contains(&self, path: &std::path::Path) -> bool {
+    /// Whether a write (or deletion) of `path` stays in scope, both as
+    /// spelled and where it physically lands. `follow_final`: a redirect or
+    /// write opens *through* a final symlink (a workspace link to `~/f`
+    /// writes `~/f`), so writes pass `true`; deletion removes the link
+    /// itself, so it passes `false`.
+    fn contains(&self, path: &std::path::Path, follow_final: bool) -> bool {
         let lexical = crate::path_policy::normalize_path(path);
-        let resolved = lexical
-            .parent()
-            .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .map(|parent| match lexical.file_name() {
-                Some(name) => parent.join(name),
-                None => parent,
-            });
-        self.inside(&lexical) && resolved.as_deref().is_none_or(|r| self.inside(r))
+        if !self.inside(&lexical) {
+            return false;
+        }
+        physical_path(path, follow_final).is_some_and(|landed| self.inside(&landed))
     }
+}
+
+/// Where `path` physically lands: its parent resolved through the
+/// filesystem **as spelled** (lexical `..` popping before resolution
+/// would move `<ws>/link/../x` with `link -> /outside/dir` back inside),
+/// through the deepest existing ancestor when the parent does not exist
+/// yet. With `follow_final`, a final symlink is followed as well; a
+/// dangling one yields `None` (unplaceable).
+fn physical_path(path: &std::path::Path, follow_final: bool) -> Option<std::path::PathBuf> {
+    let Some(name) = path.file_name() else {
+        return Some(resolve_deepest(path));
+    };
+    let parent = path.parent().unwrap_or(std::path::Path::new("/"));
+    let joined = resolve_deepest(parent).join(name);
+    if follow_final
+        && std::fs::symlink_metadata(&joined).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return std::fs::canonicalize(&joined).ok();
+    }
+    Some(joined)
+}
+
+/// `path` canonicalized through its deepest existing ancestor; the
+/// missing remainder (which cannot contain symlinks) is normalized
+/// lexically.
+fn resolve_deepest(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(name) = existing.file_name().map(|n| n.to_os_string()) {
+        existing.pop();
+        rest.push(name);
+        if let Ok(canonical) = std::fs::canonicalize(&existing) {
+            let mut out = canonical;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return crate::path_policy::normalize_path(&out);
+        }
+    }
+    crate::path_policy::normalize_path(path)
 }
 
 /// Resolve a target path: expand `~`, make relative paths absolute using cwd.
@@ -1799,13 +1912,44 @@ fn resolve_target(target: &str, cwd: Option<&str>) -> std::path::PathBuf {
     }
 }
 
-/// Extract write targets from a command string.
+/// Whether a target resolves against the working directory.
+fn is_relative_target(target: &str) -> bool {
+    let trimmed = target.trim().trim_matches(|c| c == '\'' || c == '"');
+    !(trimmed.starts_with('/') || trimmed == "~" || trimmed.starts_with("~/"))
+}
+
+/// Write targets of a command: redirect destinations (from the AST when
+/// it is available, which bounds quotes and heredoc bodies exactly; a
+/// byte scan otherwise) plus `tee`/`cp`/`mv`/`touch` destinations.
+/// Unresolvable redirect destinations are left out.
+fn write_targets(command: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    match classify_command(command).redirects {
+        Some(analysis) => {
+            for redirect in &analysis.redirects {
+                if redirect.shape.writes_file()
+                    && let Some(bash_ast::RedirectTarget::Literal(target)) = &redirect.target
+                    && !target.starts_with("/dev/")
+                {
+                    targets.push(target.clone());
+                }
+            }
+        }
+        None => extract_redirect_targets(command, &mut targets),
+    }
+    extract_command_write_targets(command, &mut targets);
+    targets
+}
+
+/// Extract write targets from a command string by a byte scan (tests and
+/// the non-AST fallback of [`write_targets`]).
 ///
 /// Handles:
-/// - Output redirections: `>`, `>>`, `2>`, `&>`, `>&`
+/// - Output redirections: `>`, `>>`, `>|`, `2>`, `&>`, `&>>`, `>&file`
 /// - `tee` targets
-/// - `cp`/`mv` last argument
+/// - `cp`/`mv` destinations
 /// - `touch` arguments
+#[cfg(test)]
 fn extract_write_targets(command: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
@@ -1815,13 +1959,32 @@ fn extract_write_targets(command: &str) -> Vec<String> {
     targets
 }
 
-/// Extract redirect targets: `> file`, `>> file`, `2> file`, `&> file`.
+/// Byte-scan redirect targets: `> file`, `>> file`, `>| file`, `2> file`,
+/// `&> file`, `>&file`. Descriptor duplications (`>&2`, `2>&1`, `>&-`)
+/// carry no target; a purely numeric destination of a plain `>` does (`> 2`
+/// writes a file named `2`).
 fn extract_redirect_targets(command: &str, targets: &mut Vec<String>) {
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+
+    // After the operator at `j`: skip whitespace, read the destination.
+    let take = |mut j: usize, dup: bool, targets: &mut Vec<String>| -> usize {
+        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if let Some(path) = extract_token(command, j)
+            && !path.is_empty()
+            && !path.starts_with('&')
+            && !path.starts_with("/dev/")
+            && !(dup && (path == "-" || path.bytes().all(|b| b.is_ascii_digit())))
+        {
+            targets.push(path);
+        }
+        j
+    };
 
     while i < len {
         match bytes[i] {
@@ -1834,47 +1997,37 @@ fn extract_redirect_targets(command: &str, targets: &mut Vec<String>) {
                 i += 1;
             }
             b'>' if !in_single_quote && !in_double_quote => {
-                // Skip `>>` or just `>`
                 let mut j = i + 1;
-                if j < len && bytes[j] == b'>' {
-                    j += 1;
+                let mut dup = false;
+                match bytes.get(j) {
+                    Some(b'>') | Some(b'|') => j += 1,
+                    Some(b'&') => {
+                        j += 1;
+                        dup = true;
+                    }
+                    _ => {}
                 }
-                // Skip whitespace after redirect operator
-                while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                    j += 1;
-                }
-                if let Some(path) = extract_token(command, j)
-                    && !path.is_empty()
-                    && !path.starts_with('&')
-                    && !path.starts_with("/dev/")
-                {
-                    targets.push(path);
-                }
-                i = j;
+                i = take(j, dup, targets);
             }
             _ => {
-                // Check for `2>`, `&>` patterns
+                // `2>`, `&>`, `2>>`, `&>>`, `2>&1`
                 if !in_single_quote
                     && !in_double_quote
                     && i + 1 < len
                     && bytes[i + 1] == b'>'
-                    && (bytes[i] == b'&' || (bytes[i] >= b'0' && bytes[i] <= b'9'))
+                    && (bytes[i] == b'&' || bytes[i].is_ascii_digit())
                 {
                     let mut j = i + 2;
-                    if j < len && bytes[j] == b'>' {
-                        j += 1; // handle `2>>`
+                    let mut dup = false;
+                    match bytes.get(j) {
+                        Some(b'>') | Some(b'|') => j += 1,
+                        Some(b'&') => {
+                            j += 1;
+                            dup = true;
+                        }
+                        _ => {}
                     }
-                    while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                        j += 1;
-                    }
-                    if let Some(path) = extract_token(command, j)
-                        && !path.is_empty()
-                        && !path.starts_with('&')
-                        && !path.starts_with("/dev/")
-                    {
-                        targets.push(path);
-                    }
-                    i = j;
+                    i = take(j, dup, targets);
                 } else {
                     i += 1;
                 }
@@ -1883,39 +2036,77 @@ fn extract_redirect_targets(command: &str, targets: &mut Vec<String>) {
     }
 }
 
-/// Extract write targets from common write commands like `tee`, `cp`, `mv`, `touch`.
+/// Whether a command argument is (or starts) a redirection, which is not
+/// an operand of the command.
+fn redirect_token(arg: &str) -> Option<bool> {
+    let rest = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    if rest.starts_with('>') || rest.starts_with('<') {
+        // `>` alone consumes the next word; `>file` carries its target.
+        let op_only = rest.trim_start_matches(['>', '<', '|', '&']).is_empty();
+        return Some(op_only);
+    }
+    None
+}
+
+/// Operands of one segment, without redirections.
+fn operands(parts: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for part in parts {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if let Some(op_only) = redirect_token(part) {
+            skip_next = op_only;
+            continue;
+        }
+        out.push(part.trim_matches(|c| c == '\'' || c == '"').to_string());
+    }
+    out
+}
+
+/// Extract write targets from common write commands like `tee`, `cp`,
+/// `mv`, `touch`, in every segment, after stripping safe wrappers
+/// (`timeout`, `env X=1`, `nice`, ...).
 fn extract_command_write_targets(command: &str, targets: &mut Vec<String>) {
-    for sub in split_on_operators(command) {
-        let sub = sub.trim();
+    for sub in command_segments(command) {
+        let sub = strip_safe_wrappers(sub.trim());
         let parts: Vec<&str> = sub.split_whitespace().collect();
         if parts.is_empty() {
             continue;
         }
 
         let base_cmd = parts[0].rsplit('/').next().unwrap_or(parts[0]);
+        let args = operands(&parts[1..]);
 
         match base_cmd {
-            "tee" => {
-                // tee [-a] file [file...]
-                for &arg in &parts[1..] {
+            "tee" | "touch" => {
+                for arg in &args {
                     if !arg.starts_with('-') {
-                        targets.push(arg.to_string());
+                        targets.push(arg.clone());
                     }
                 }
             }
             "cp" | "mv" => {
-                // Last non-flag argument is the destination
-                let non_flag: Vec<&&str> =
-                    parts[1..].iter().filter(|a| !a.starts_with('-')).collect();
+                // `-t DIR` / `--target-directory=DIR` names the destination;
+                // otherwise the last non-flag operand does.
+                let mut explicit = None;
+                let mut iter = args.iter();
+                while let Some(arg) = iter.next() {
+                    if arg == "-t" {
+                        explicit = iter.next().cloned();
+                    } else if let Some(dir) = arg.strip_prefix("--target-directory=") {
+                        explicit = Some(dir.to_string());
+                    }
+                }
+                if let Some(dir) = explicit {
+                    targets.push(dir);
+                    continue;
+                }
+                let non_flag: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
                 if non_flag.len() >= 2 {
                     targets.push(non_flag.last().unwrap().to_string());
-                }
-            }
-            "touch" => {
-                for &arg in &parts[1..] {
-                    if !arg.starts_with('-') {
-                        targets.push(arg.to_string());
-                    }
                 }
             }
             _ => {}
@@ -1923,7 +2114,35 @@ fn extract_command_write_targets(command: &str, targets: &mut Vec<String>) {
     }
 }
 
-/// Split a command on `&&`, `||`, `|`, `;` (respecting quotes).
+/// `command` with heredoc bodies blanked (they are data, not commands),
+/// split into segments.
+fn command_segments(command: &str) -> Vec<String> {
+    split_on_operators(&mask_heredoc_bodies(command))
+}
+
+/// `command` with every heredoc body replaced by spaces (byte positions
+/// preserved).
+fn mask_heredoc_bodies(command: &str) -> String {
+    let Some(analysis) = classify_command(command).redirects else {
+        return command.to_string();
+    };
+    if analysis.heredoc_bodies.is_empty() {
+        return command.to_string();
+    }
+    let mut bytes = command.as_bytes().to_vec();
+    for &(start, end) in &analysis.heredoc_bodies {
+        for byte in &mut bytes[start..end.min(command.len())] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| command.to_string())
+}
+
+/// Split a command on `&&`, `||`, `|`, `;`, a background `&`, and
+/// newlines (respecting quotes). A `&` that belongs to a redirection
+/// (`2>&1`, `&>`) does not split.
 fn split_on_operators(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -1934,6 +2153,7 @@ fn split_on_operators(command: &str) -> Vec<String> {
     let mut in_double_quote = false;
 
     while i < len {
+        let unquoted = !in_single_quote && !in_double_quote;
         match bytes[i] {
             b'\'' if !in_double_quote => {
                 in_single_quote = !in_single_quote;
@@ -1945,11 +2165,18 @@ fn split_on_operators(command: &str) -> Vec<String> {
                 current.push('"');
                 i += 1;
             }
-            b'&' if !in_single_quote && !in_double_quote && i + 1 < len && bytes[i + 1] == b'&' => {
+            b'&' if unquoted && i + 1 < len && bytes[i + 1] == b'&' => {
                 parts.push(std::mem::take(&mut current));
                 i += 2;
             }
-            b'|' if !in_single_quote && !in_double_quote => {
+            b'&' if unquoted
+                && !(i > 0 && matches!(bytes[i - 1], b'>' | b'<'))
+                && bytes.get(i + 1) != Some(&b'>') =>
+            {
+                parts.push(std::mem::take(&mut current));
+                i += 1;
+            }
+            b'|' if unquoted => {
                 if i + 1 < len && bytes[i + 1] == b'|' {
                     i += 2;
                 } else {
@@ -1957,13 +2184,14 @@ fn split_on_operators(command: &str) -> Vec<String> {
                 }
                 parts.push(std::mem::take(&mut current));
             }
-            b';' if !in_single_quote && !in_double_quote => {
+            b';' | b'\n' if unquoted => {
                 parts.push(std::mem::take(&mut current));
                 i += 1;
             }
             _ => {
-                current.push(bytes[i] as char);
-                i += 1;
+                let ch = command[i..].chars().next().unwrap_or(' ');
+                current.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -2009,6 +2237,180 @@ fn extract_token(command: &str, start: usize) -> Option<String> {
         i += 1;
     }
     Some(token)
+}
+
+// ---------------------------------------------------------------------------
+// Contained-redirect absorption (ADR 09 §1)
+// ---------------------------------------------------------------------------
+
+/// Words that change the shell's directory, or run code that may: their
+/// presence anywhere makes the command's own cwd unprovable.
+const CWD_WORDS: &[&str] = &["cd", "pushd", "popd", "source", "eval", "exec"];
+
+/// Whether `command` may change its working directory: a cd-family or
+/// cwd-executing word at any position (a conservative word scan, so a
+/// compound like `while true; do cd ~; break; done` is caught), or `.` as
+/// a command word. Heredoc bodies are data and are not scanned.
+pub fn changes_directory(command: &str) -> bool {
+    let text = mask_heredoc_bodies(command);
+    let separator = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' | '$' | '"' | '\'' | '<' | '>' | '='
+            )
+    };
+    if text.split(separator).any(|word| CWD_WORDS.contains(&word)) {
+        return true;
+    }
+    // `.` (source) in command position.
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'.'
+            && bytes
+                .get(i + 1)
+                .is_none_or(|next| next.is_ascii_whitespace())
+            && text[..i]
+                .trim_end_matches([' ', '\t'])
+                .chars()
+                .last()
+                .is_none_or(|prev| matches!(prev, ';' | '&' | '|' | '(' | '{' | '\n' | '`'))
+    })
+}
+
+/// The working directory of a bash call, and whether it is provable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashCwd {
+    /// The directory the call runs in, when known.
+    pub path: Option<std::path::PathBuf>,
+    /// Whether relative targets may be placed against `path`.
+    pub trusted: bool,
+}
+
+impl BashCwd {
+    /// A call with `workdir` in a session launched in `launch_dir`, whose
+    /// shell has (`drifted`) or has not left that directory. An absolute
+    /// `workdir` is provable on its own (its subshell starts there); a
+    /// relative one joins the session directory, so it needs no drift.
+    pub fn new(workdir: Option<&str>, launch_dir: Option<&std::path::Path>, drifted: bool) -> Self {
+        match workdir {
+            Some(dir) if std::path::Path::new(dir).is_absolute() => BashCwd {
+                path: Some(std::path::PathBuf::from(dir)),
+                trusted: true,
+            },
+            Some(dir) => BashCwd {
+                path: launch_dir.map(|base| base.join(dir)),
+                trusted: !drifted && launch_dir.is_some(),
+            },
+            None => BashCwd {
+                path: launch_dir.map(std::path::Path::to_path_buf),
+                trusted: !drifted && launch_dir.is_some(),
+            },
+        }
+    }
+
+    /// The path as the analysis functions take it.
+    pub fn as_str(&self) -> Option<&str> {
+        self.path.as_deref().and_then(std::path::Path::to_str)
+    }
+}
+
+/// What redirect absorption needs to know about the call's environment.
+#[derive(Debug, Clone)]
+pub struct AbsorbScope {
+    /// A jail backend confines bash this turn.
+    pub sandboxed: bool,
+    /// The jail's writable roots: the analysis workspace (the workspace,
+    /// else the scratch directory) first, then the scratch directory.
+    pub roots: Vec<std::path::PathBuf>,
+    /// The call's working directory.
+    pub cwd: BashCwd,
+}
+
+/// Device nodes both jail backends let bash write.
+fn contained_device(target: &str) -> bool {
+    matches!(target, "/dev/null" | "/dev/zero" | "/dev/tty")
+        || target
+            .strip_prefix("/dev/fd/")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether every redirect occurrence is containment-bounded: an fd-dup,
+/// a heredoc written to a file by a data-only command, or an output
+/// redirect to a resolvable, blocklist-clean target (inside the roots, or
+/// outside them — the out-of-roots check then escalates it).
+fn redirects_absorbable(
+    analysis: &bash_ast::RedirectAnalysis,
+    roots: &[std::path::PathBuf],
+    cwd: Option<&str>,
+) -> bool {
+    if analysis.stray_operator || roots.is_empty() {
+        return false;
+    }
+    for redirect in &analysis.redirects {
+        match redirect.shape {
+            bash_ast::RedirectShape::FdDup | bash_ast::RedirectShape::HeredocWrite => {}
+            shape if shape.writes_file() => {
+                let Some(bash_ast::RedirectTarget::Literal(target)) = &redirect.target else {
+                    return false;
+                };
+                if target.starts_with("/dev/") {
+                    if contained_device(target) {
+                        continue;
+                    }
+                    return false;
+                }
+                if is_relative_target(target) && cwd.is_none() {
+                    return false;
+                }
+                let spelled = resolve_target(target, cwd);
+                if super::path_policy::check_write(&spelled, None).is_err() {
+                    return false;
+                }
+                match physical_path(&spelled, true) {
+                    Some(landed) if super::path_policy::check_write(&landed, None).is_ok() => {}
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The classifier warning that still applies to `command` under `scope`
+/// (ADR 09 §1): contained redirect and heredoc-newline warnings are
+/// absorbed, every other warning re-emits. `None` when nothing remains.
+/// The approval gate and the bash tool's output annotation both use this,
+/// so a silent gate never meets a loud result.
+pub fn effective_warning(
+    command: &str,
+    classification: &CommandClassification,
+    scope: &AbsorbScope,
+) -> Option<String> {
+    let SecurityVerdict::Warn(original) = &classification.verdict else {
+        return None;
+    };
+    let analysis = match &classification.redirects {
+        Some(analysis) if scope.sandboxed && classification.ast_available => analysis,
+        _ => return Some(original.clone()),
+    };
+    let cwd = (scope.cwd.trusted && !changes_directory(command))
+        .then(|| scope.cwd.as_str())
+        .flatten();
+    let redirects_ok = redirects_absorbable(analysis, &scope.roots, cwd);
+    let newline_ok = redirects_ok && !analysis.unattributed_newline;
+    let remaining: Vec<&str> = classification
+        .warnings
+        .iter()
+        .filter(|warning| match warning.kind {
+            WarningKind::Other => true,
+            WarningKind::Redirection => !redirects_ok,
+            WarningKind::Newline => !newline_ok,
+        })
+        .map(|warning| warning.message.as_str())
+        .collect();
+    merged_warning(&remaining)
 }
 
 // ===========================================================================
@@ -2828,10 +3230,26 @@ mod tests {
     #[test]
     fn write_targets_leave_the_workspace_boundary_to_the_gate() {
         assert!(
-            check_write_targets("echo hello > /tmp/out.txt", Some("/home/user/project")).is_ok()
+            check_write_targets(
+                "echo hello > /tmp/out.txt",
+                &[std::path::PathBuf::from("/home/user/project")]
+            )
+            .is_ok()
         );
-        assert!(check_write_targets("echo hello > ./out.txt", Some("/home/user/project")).is_ok());
-        assert!(check_write_targets("echo x > ~/.zshrc", Some("/home/user/project")).is_err());
+        assert!(
+            check_write_targets(
+                "echo hello > ./out.txt",
+                &[std::path::PathBuf::from("/home/user/project")]
+            )
+            .is_ok()
+        );
+        assert!(
+            check_write_targets(
+                "echo x > ~/.zshrc",
+                &[std::path::PathBuf::from("/home/user/project")]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2864,9 +3282,12 @@ mod tests {
         assert!(check("rm -rf ../keep").is_some());
         assert!(check(&format!("rm -rf {}/*", outside.display())).is_some());
         assert!(check(&format!("shred -u {}/notes.txt", outside.display())).is_some());
-        // Temp files and extra roots (scratch) stay deletable.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        assert!(check(&format!("rm {}", tmp.path().display())).is_none());
+        // Files under the jail's temp channel (`/tmp`) and extra roots
+        // (scratch) stay deletable.
+        if crate::sandbox::temp_channel_available(std::slice::from_ref(&workspace)) {
+            let tmp = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+            assert!(check(&format!("rm {}", tmp.path().display())).is_none());
+        }
         assert!(
             outside_deletion_target(
                 &format!("rm {}/notes.txt", outside.display()),
@@ -2918,8 +3339,22 @@ mod tests {
         assert_eq!(find("echo hi > ../out.txt"), vec![outside.clone()]);
         assert!(find("echo hi > build/log.txt && cat x > /dev/null").is_empty());
         assert!(find("echo hi > \"$HOME/x\"").is_empty());
-        let tmp = std::env::temp_dir().join("chatshell-t.txt");
-        assert!(find(&format!("touch {}", tmp.display())).is_empty());
+        if crate::sandbox::temp_channel_available(std::slice::from_ref(&ws)) {
+            assert!(find("touch /tmp/chatshell-t.txt").is_empty());
+        }
+        // The analyzing process's own TMPDIR is not a jail root (ADR 09
+        // §3): on macOS `/var/folders/.../T` is outside.
+        let host_tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        if !crate::sandbox::TMP_SPELLINGS
+            .iter()
+            .any(|tmp| host_tmp.starts_with(tmp))
+        {
+            let target = host_tmp.join("chatshell-t.txt");
+            assert_eq!(
+                find(&format!("touch {}", target.display())),
+                vec![target.clone()]
+            );
+        }
         assert!(outside_write_targets("echo > /etc/x", None, None, &[]).is_empty());
     }
 
@@ -2937,7 +3372,10 @@ mod tests {
 
     #[test]
     fn write_target_no_root_only_blocklist() {
-        let result = check_write_targets("echo hello > /tmp/out.txt", Some("/tmp"));
+        let result = check_write_targets(
+            "echo hello > /tmp/out.txt",
+            &[std::path::PathBuf::from("/tmp")],
+        );
         assert!(
             result.is_ok(),
             "Without project root, /tmp should be allowed"
@@ -2946,7 +3384,7 @@ mod tests {
 
     #[test]
     fn write_target_blocks_system_dir() {
-        let result = check_write_targets("echo evil > /etc/crontab", None);
+        let result = check_write_targets("echo evil > /etc/crontab", &[]);
         assert!(
             result.is_err(),
             "Should block writes to /etc/ regardless of project root"
@@ -3012,5 +3450,129 @@ mod classification_tests {
                 check_command(command, check_dangerous)
             );
         }
+    }
+
+    // ---- ADR 09: analysis scope ⊆ jail writable set ---------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_scope_resolves_symlinks_as_the_kernel_does() {
+        let root = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("dir")).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink(outside.join("dir"), ws.join("link")).unwrap();
+        std::fs::write(outside.join("f"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("f"), ws.join("file-link")).unwrap();
+        let scope = WriteScope::new(&ws, &[]);
+        // `<ws>/link/../x` lands in `outside/x`: `..` follows the link.
+        assert!(!scope.contains(&ws.join("link/../x"), true));
+        // A write opens through a final symlink; a deletion removes the link.
+        assert!(!scope.contains(&ws.join("file-link"), true));
+        assert!(scope.contains(&ws.join("file-link"), false));
+        // Plain in-workspace paths, existing or not.
+        assert!(scope.contains(&ws.join("src/new/file.rs"), true));
+        let find = |cmd: &str| outside_write_targets(cmd, Some(&ws), None, &[]);
+        assert_eq!(find("echo hi > link/../x"), vec![outside.join("x")]);
+        assert_eq!(find("echo hi > file-link"), vec![outside.join("f")]);
+    }
+
+    #[test]
+    fn write_scope_temp_roots_are_a_subset_of_the_jail() {
+        let home = dirs::home_dir().unwrap();
+        let ws = home.join("ws-property");
+        let scope = WriteScope::new(&ws, &[]);
+        let policy = crate::sandbox::SandboxPolicy::for_bash(Some(&ws), &home.join("s"), false);
+        for temp in &scope.temp {
+            // Every temp spelling the analysis counts is opened by the jail:
+            // the channel is on and the spelling is (a resolution of) /tmp.
+            assert!(policy.temp_scratch.is_some(), "{temp:?}");
+            assert!(
+                crate::sandbox::TMP_SPELLINGS
+                    .iter()
+                    .any(|tmp| temp.as_path() == std::path::Path::new(tmp)),
+                "{temp:?}"
+            );
+        }
+        // The analyzing process's TMPDIR is never a temp root.
+        let host = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        if !crate::sandbox::TMP_SPELLINGS
+            .iter()
+            .any(|t| host.starts_with(t))
+        {
+            assert!(!scope.inside(&host.join("x")));
+        }
+    }
+
+    #[test]
+    fn lexical_extractor_covers_the_output_family() {
+        assert_eq!(extract_write_targets("echo hi >& f"), vec!["f"]);
+        assert_eq!(extract_write_targets("echo hi >| f"), vec!["f"]);
+        assert_eq!(extract_write_targets("echo hi > 2"), vec!["2"]);
+        assert!(extract_write_targets("cmd >&2").is_empty());
+        assert!(extract_write_targets("cmd 2>&1").is_empty());
+        assert!(extract_write_targets("cmd >&-").is_empty());
+        assert_eq!(extract_write_targets("cmd &>> all.log"), vec!["all.log"]);
+    }
+
+    #[test]
+    fn command_targets_survive_wrappers_and_separators() {
+        let targets = |cmd: &str| write_targets(cmd);
+        assert_eq!(targets("timeout 5 cp a /x/b"), vec!["/x/b"]);
+        assert_eq!(targets("echo hi & cp a /x/b"), vec!["/x/b"]);
+        assert_eq!(targets("echo hi\ncp a /x/b"), vec!["/x/b"]);
+        assert_eq!(targets("cp -t /x/dir a b"), vec!["/x/dir"]);
+        assert_eq!(targets("cp a b 2>&1"), vec!["b"]);
+        assert_eq!(targets("cp a b > log"), vec!["log", "b"]);
+        // Heredoc body lines are data, not commands or targets.
+        assert_eq!(
+            targets("cat > f <<'EOF'\ncp a /x/b\nx > /y\nEOF"),
+            vec!["f"]
+        );
+        // An apostrophe in a body does not hide what follows it.
+        assert_eq!(
+            targets("cat > f <<'EOF'\nit's\nEOF\necho x > /z"),
+            vec!["f", "/z"]
+        );
+    }
+
+    #[test]
+    fn blocklist_checks_every_directory_the_command_may_run_in() {
+        let home = dirs::home_dir().unwrap();
+        let ws = home.join("some-project");
+        // Relative `.zshrc` from the workspace is harmless...
+        assert!(check_write_targets("echo x >> .zshrc", std::slice::from_ref(&ws)).is_ok());
+        // ...but not when the command may run in $HOME (FA-5).
+        assert!(check_write_targets("echo x >> .zshrc", &[ws.clone(), home.clone()]).is_err());
+    }
+
+    #[test]
+    fn cwd_changing_words_are_found_anywhere() {
+        assert!(changes_directory("cd ~ && ls"));
+        assert!(changes_directory("while true; do cd ~; break; done"));
+        assert!(changes_directory("pushd /x"));
+        assert!(changes_directory("source env.sh"));
+        assert!(changes_directory(". env.sh"));
+        assert!(changes_directory("ls; . ./env.sh"));
+        assert!(changes_directory("eval \"$x\""));
+        assert!(!changes_directory("cp a ."));
+        assert!(!changes_directory("echo abcd > cdrom.txt"));
+        assert!(!changes_directory("cat > f <<'EOF'\ncd /\nEOF"));
+    }
+
+    #[test]
+    fn warnings_are_attributed_to_their_validator() {
+        let c = classify_command("eval \"$cmd\" > src/f");
+        let kinds: Vec<WarningKind> = c.warnings.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&WarningKind::Redirection));
+        assert!(kinds.contains(&WarningKind::Other));
+        let c = classify_command("cat > f <<'EOF'\nx\nEOF");
+        let kinds: Vec<WarningKind> = c.warnings.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&WarningKind::Newline));
+        assert!(c.redirects.is_some());
+        // The merged message format is unchanged.
+        assert!(matches!(c.verdict, SecurityVerdict::Warn(ref m) if m.contains("more warning")));
     }
 }
