@@ -65,11 +65,15 @@ pub fn escape_delta(args: &Value, ctx: &GateContext, egress: bool) -> EscapePlan
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut unbounded: Vec<PathBuf> = Vec::new();
     for target in bash_security::outside_write_targets(command, root, cwd, &scratch) {
-        match target
-            .parent()
-            .and_then(existing_dir)
-            .filter(|r| boundable(r))
-        {
+        // A write into an existing directory (`cp a DIR`, `cp a DIR/`)
+        // creates an entry inside it: the directory itself must be
+        // writable, not its parent (which may be `$HOME`, unboundable).
+        let dir = if target.is_dir() {
+            existing_dir(&target)
+        } else {
+            target.parent().and_then(existing_dir)
+        };
+        match dir.filter(|r| boundable(r)) {
             Some(dir) => push_root(&mut roots, dir),
             None => unbounded.push(target),
         }
@@ -255,5 +259,25 @@ mod tests {
             execution_delta(&write, &json!({ "path": "/x" }), &ctx),
             None
         );
+    }
+
+    #[test]
+    fn copying_into_an_existing_directory_opens_that_directory() {
+        let (_dir, ctx, outside) = fixture();
+        // `cp a DIR` and `cp a DIR/` land in DIR/a: DIR itself must be
+        // writable, never its parent (which may be $HOME, unboundable).
+        for command in [
+            format!("cp a {}", outside.display()),
+            format!("cp a {}/", outside.display()),
+            format!("mv a b {}/", outside.display()),
+        ] {
+            let plan = escape_delta(&json!({ "command": command }), &ctx, false);
+            assert_eq!(
+                plan.delta.map(|d| d.writable_roots),
+                Some(vec![outside.clone()]),
+                "{command}"
+            );
+            assert!(plan.unbounded.is_empty(), "{command}");
+        }
     }
 }
