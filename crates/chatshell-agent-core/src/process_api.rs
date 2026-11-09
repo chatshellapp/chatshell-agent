@@ -46,6 +46,12 @@ pub trait ShellProcess: Send + 'static {
     fn read_line(&mut self, buf: &mut Vec<u8>) -> impl Future<Output = io::Result<usize>> + Send;
     /// Process id, for diagnostics.
     fn pid(&self) -> Option<u32>;
+    /// The shell's current directory as the OS reports it, when the
+    /// process is the shell itself (see [`shell_cwd`]). Unlike anything the
+    /// shell prints, the shell cannot misreport it.
+    fn cwd(&self) -> Option<PathBuf> {
+        self.pid().and_then(shell_cwd)
+    }
     /// True while the process has not exited.
     fn is_alive(&mut self) -> bool;
     /// Request termination without waiting (sync; safe in drop/shutdown).
@@ -106,6 +112,78 @@ pub trait ShellSpawner: Send + Sync + Clone + 'static {
     /// Spawn `spec` with piped stdin/stdout. Stderr is captured for
     /// [`ShellProcess::exit_report`] where the implementation supports it.
     fn spawn(&self, spec: &SpawnSpec) -> impl Future<Output = io::Result<Self::Shell>> + Send;
+}
+
+/// The current directory of process `pid`, read from the OS, when the
+/// process is a `bash` (unconfined bash, or Seatbelt's `sandbox-exec`,
+/// which execs bash in place). `None` for any other executable — a
+/// launcher that forks the shell (bubblewrap) has a directory of its own
+/// — and on platforms without a reader.
+pub fn shell_cwd(pid: u32) -> Option<PathBuf> {
+    let (exe, cwd) = process_exe_and_cwd(pid)?;
+    let name = exe.file_name()?.to_str()?;
+    (name == "bash" || name.starts_with("bash-")).then_some(cwd)
+}
+
+#[cfg(target_os = "linux")]
+fn process_exe_and_cwd(pid: u32) -> Option<(PathBuf, PathBuf)> {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let exe = std::fs::read_link(proc.join("exe")).ok()?;
+    let cwd = std::fs::read_link(proc.join("cwd")).ok()?;
+    Some((exe, cwd))
+}
+
+#[cfg(target_os = "macos")]
+fn process_exe_and_cwd(pid: u32) -> Option<(PathBuf, PathBuf)> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).ok()?;
+
+    let mut exe = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable for the size passed.
+    let len = unsafe { libc::proc_pidpath(pid, exe.as_mut_ptr().cast(), exe.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    exe.truncate(len as usize);
+
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
+    // SAFETY: a zeroed plain-data struct is valid; proc_pidinfo writes at
+    // most `size` bytes into it.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size as libc::c_int,
+        )
+    };
+    if written as usize != size {
+        return None;
+    }
+    // `vip_path` is a NUL-terminated MAXPATHLEN buffer split into rows.
+    // SAFETY: the rows are contiguous `c_char`s; read as bytes.
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let cwd = CStr::from_bytes_until_nul(raw).ok()?.to_bytes();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some((
+        PathBuf::from(std::ffi::OsStr::from_bytes(&exe)),
+        PathBuf::from(std::ffi::OsStr::from_bytes(cwd)),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_exe_and_cwd(_pid: u32) -> Option<(PathBuf, PathBuf)> {
+    None
 }
 
 /// tokio-backed [`ShellProcess`] over a real child process.
@@ -256,5 +334,38 @@ impl Drop for TokioShell {
         if let Some(drain) = self.stderr_drain.take() {
             drain.abort();
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_os_reports_the_shell_directory() {
+        let start = tempfile::tempdir().unwrap();
+        let start = start.path().canonicalize().unwrap();
+        let mut shell = TokioSpawner
+            .spawn(&SpawnSpec::new("bash", &start))
+            .await
+            .unwrap();
+        assert_eq!(shell.cwd(), Some(start.clone()));
+        shell.write_stdin(b"cd /; echo done\n").await.unwrap();
+        shell.flush_stdin().await.unwrap();
+        let mut line = Vec::new();
+        shell.read_line(&mut line).await.unwrap();
+        assert_eq!(shell.cwd(), Some(PathBuf::from("/")));
+        shell.kill().await;
+    }
+
+    #[tokio::test]
+    async fn a_process_that_is_not_bash_has_no_shell_directory() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("5")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert_eq!(child.id().and_then(shell_cwd), None);
+        let _ = child.start_kill();
     }
 }

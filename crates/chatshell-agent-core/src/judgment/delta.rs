@@ -31,23 +31,30 @@ pub fn execution_delta(
     if request.evidence.tool != "bash" {
         return None;
     }
-    let egress = matches!(request.evidence.network, NetworkClass::Egress { .. });
+    let egress = match &request.evidence.network {
+        NetworkClass::Egress { detail } => Some(detail.as_str()),
+        _ => None,
+    };
     escape_delta(args, ctx, egress).delta
 }
 
 /// What approving a bash call's escapes authorizes (ADR 08 §1): the
-/// per-execution delta, and the outside write targets no bounded delta can
+/// per-execution delta, the egress it opens the network for (so a card
+/// can disclose it), and the outside write targets no bounded delta can
 /// open (they run jailed and surface a denial).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EscapePlan {
     pub delta: Option<ExecutionDelta>,
+    /// The detected egress the delta opens the network for, when it does.
+    pub network: Option<String>,
     pub unbounded: Vec<PathBuf>,
 }
 
 /// The escapes of bash call `args` under `ctx`, for a judge's allow or a
-/// human's approval alike. `egress`: the call contacts the network (the
-/// delta opens it unless the session flag already does).
-pub fn escape_delta(args: &Value, ctx: &GateContext, egress: bool) -> EscapePlan {
+/// human's approval alike. `egress`: the detected egress of the call, if
+/// any (the delta opens the network for it unless the session flag
+/// already does).
+pub fn escape_delta(args: &Value, ctx: &GateContext, egress: Option<&str>) -> EscapePlan {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return EscapePlan::default();
     };
@@ -60,7 +67,7 @@ pub fn escape_delta(args: &Value, ctx: &GateContext, egress: bool) -> EscapePlan
     let root = ctx.analysis_root();
     let scratch: Vec<PathBuf> = ctx.scratch_dir.iter().cloned().collect();
 
-    let network = egress && !ctx.network_allowed;
+    let network = egress.filter(|_| !ctx.network_allowed);
 
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut unbounded: Vec<PathBuf> = Vec::new();
@@ -90,12 +97,13 @@ pub fn escape_delta(args: &Value, ctx: &GateContext, egress: bool) -> EscapePlan
         }
     }
     let delta = ExecutionDelta {
-        network,
+        network: network.is_some(),
         writable_roots: roots,
         unsandboxed: false,
     };
     EscapePlan {
         delta: (!delta.is_empty()).then_some(delta),
+        network: network.map(str::to_string),
         unbounded,
     }
 }
@@ -271,7 +279,7 @@ mod tests {
             format!("cp a {}/", outside.display()),
             format!("mv a b {}/", outside.display()),
         ] {
-            let plan = escape_delta(&json!({ "command": command }), &ctx, false);
+            let plan = escape_delta(&json!({ "command": command }), &ctx, None);
             assert_eq!(
                 plan.delta.map(|d| d.writable_roots),
                 Some(vec![outside.clone()]),
@@ -279,5 +287,18 @@ mod tests {
             );
             assert!(plan.unbounded.is_empty(), "{command}");
         }
+    }
+
+    #[test]
+    fn the_plan_names_the_egress_it_opens() {
+        let (_dir, mut ctx, _) = fixture();
+        let args = json!({ "command": "curl https://example.com" });
+        let plan = escape_delta(&args, &ctx, Some("curl -> example.com"));
+        assert_eq!(plan.network.as_deref(), Some("curl -> example.com"));
+        assert!(plan.delta.is_some_and(|d| d.network));
+        // The session flag already opens it: nothing to authorize or name.
+        ctx.network_allowed = true;
+        let plan = escape_delta(&args, &ctx, Some("curl -> example.com"));
+        assert_eq!(plan, EscapePlan::default());
     }
 }

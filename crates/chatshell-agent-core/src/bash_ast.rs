@@ -28,6 +28,10 @@ pub struct AstAnalysis {
     pub has_parse_errors: bool,
     /// Every redirect of the command, with heredoc geometry (ADR 09).
     pub redirects: RedirectAnalysis,
+    /// Some command's name cannot be read literally (`"c""d"`, `c\d`,
+    /// `$'cd'`, `$x`), also after `builtin` / `command`: which command
+    /// runs, `cd` included, is not provable from the text.
+    pub unreadable_command_name: bool,
 }
 
 /// The shape of one redirect occurrence (ADR 09 §1).
@@ -186,6 +190,7 @@ pub fn analyze(command: &str) -> Option<AstAnalysis> {
         let dangerous = extract_dangerous_patterns(root);
         let has_actual_operators = check_actual_operators(root);
         let redirects = analyze_redirects(root, command);
+        let unreadable_command_name = has_unreadable_command_name(root, command);
 
         Some(AstAnalysis {
             compound,
@@ -193,6 +198,7 @@ pub fn analyze(command: &str) -> Option<AstAnalysis> {
             has_actual_operators,
             has_parse_errors,
             redirects,
+            unreadable_command_name,
         })
     })
     .flatten()
@@ -626,6 +632,61 @@ fn heredoc_shape(heredoc: Node, command: &str) -> RedirectShape {
 }
 
 // ---------------------------------------------------------------------------
+// Command names
+// ---------------------------------------------------------------------------
+
+/// Builtins that run the builtin named by their first operand.
+const NAME_WRAPPERS: &[&str] = &["builtin", "command"];
+
+/// Whether any command's effective name (past `builtin` / `command` and
+/// their options) is not a plain literal word.
+fn has_unreadable_command_name(node: Node, command: &str) -> bool {
+    if node.kind() == "command" && !command_name_readable(node, command) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| has_unreadable_command_name(child, command))
+}
+
+fn command_name_readable(node: Node, command: &str) -> bool {
+    let mut words: Vec<Node> = node.child_by_field_name("name").into_iter().collect();
+    let mut cursor = node.walk();
+    words.extend(node.children_by_field_name("argument", &mut cursor));
+    let mut wrapped = false;
+    for word in words {
+        let Some(text) = literal_word(word, command) else {
+            return false;
+        };
+        if wrapped && text.starts_with('-') {
+            continue;
+        }
+        if NAME_WRAPPERS.contains(&text) {
+            wrapped = true;
+            continue;
+        }
+        return true;
+    }
+    // A wrapper with no operand runs nothing; no name is fine too.
+    true
+}
+
+/// The text of a plain literal word (a command name or operand), or
+/// `None` when quoting, escapes, or expansion make it unreadable.
+fn literal_word<'a>(node: Node, command: &'a str) -> Option<&'a str> {
+    let node = if node.kind() == "command_name" {
+        node.named_child(0)?
+    } else {
+        node
+    };
+    if !matches!(node.kind(), "word" | "number") {
+        return None;
+    }
+    let text = node_text(node, command);
+    (!text.contains(['$', '`', '\'', '"', '\\', '{', '*', '?', '['])).then_some(text)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -888,5 +949,22 @@ mod tests {
         assert!(r("[[ a > b ]]").stray_operator);
         assert!(r("echo $(( 1 > 2 ))").stray_operator);
         assert!(!r("echo 'a > b' \"c < d\"").stray_operator);
+    }
+
+    #[test]
+    fn unreadable_command_names_are_flagged() {
+        let flagged = |command: &str| analyze(command).unwrap().unreadable_command_name;
+        assert!(flagged("\"c\"\"d\" ~ && echo hi > out.txt"));
+        assert!(flagged("c\\d ~"));
+        assert!(flagged("$'cd' ~"));
+        assert!(flagged("$x ~"));
+        assert!(flagged("builtin \"c\"\"d\" ~"));
+        assert!(flagged("command -p 'cd' ~"));
+        assert!(flagged("ls; if true; then \"c\"d /; fi"));
+        assert!(!flagged("cd ~ && ls"));
+        assert!(!flagged("echo \"a b\" > 'out file'"));
+        assert!(!flagged("builtin echo hi"));
+        assert!(!flagged("X=1 ./build.sh --flag"));
+        assert!(!flagged("cat > f <<'EOF'\n\"c\"\"d\" /\nEOF"));
     }
 }

@@ -1128,4 +1128,36 @@ else:
             );
         }
     }
+
+    #[tokio::test]
+    async fn a_shell_that_hides_its_directory_still_meets_the_blocklist() {
+        // Jailed, so even a regression could not touch the real file.
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let blocked = |out: &str| out.starts_with("ERR") && out.contains("protected user file");
+        // No directory reported: unknown, so `$HOME` is checked too.
+        run(&f.tool, "cd ~; unset PWD").await;
+        assert!(f.drifted.load(Ordering::SeqCst));
+        let out = run(&f.tool, "echo x >> .zshrc").await;
+        assert!(blocked(&out), "{out}");
+        // A forged report (`PWD`, or an `echo` that rewrites the marker)
+        // loses to the OS where the process is the shell itself (Seatbelt
+        // execs bash in place; bubblewrap forks it, and the jail contains).
+        if cfg!(target_os = "macos") {
+            let launch = f.root.display();
+            run(&f.tool, &format!("cd ~; PWD='{launch}'")).await;
+            assert!(f.drifted.load(Ordering::SeqCst));
+            let out = run(&f.tool, "echo x >> .zshrc").await;
+            assert!(blocked(&out), "{out}");
+            run(
+                &f.tool,
+                &format!("cd ~; echo() {{ builtin echo \"${{1%%|*}}|{launch}\"; }}"),
+            )
+            .await;
+            assert!(f.drifted.load(Ordering::SeqCst));
+            let out = run(&f.tool, "echo x >> .zshrc").await;
+            assert!(blocked(&out), "{out}");
+        }
+    }
 }

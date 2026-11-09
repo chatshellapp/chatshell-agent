@@ -2042,6 +2042,7 @@ mod tests {
             ("echo x > .git/hooks/pre-commit".into(), "Security"),
             ("echo hi > /dev/sdb1".into(), "Security"),
             ("cd ~ && echo hi > out.txt".into(), "Security"),
+            ("\"c\"\"d\" ~ && echo hi > out.txt".into(), "Security"),
             (
                 "while true; do cd ~; break; done; echo hi > out.txt".into(),
                 "Security",

@@ -63,6 +63,10 @@ uuid.workspace = true
 zstd.workspace = true
 blake3 = "1"
 
+# Reading the bash process's own working directory (proc_pidinfo on macOS).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 eventsource-stream = "0.2"

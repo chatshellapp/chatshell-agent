@@ -1321,6 +1321,9 @@ pub struct CommandClassification {
     /// Context-free, so it is safe in the process-global memo; whether a
     /// warning is absorbed depends on the conversation and is never cached.
     pub redirects: Option<bash_ast::RedirectAnalysis>,
+    /// Some command's name is not a plain literal word (AST only), so the
+    /// command may run `cd` in a spelling no word scan finds.
+    pub unreadable_command_name: bool,
 }
 
 /// Which validator emitted a warning.
@@ -1412,6 +1415,7 @@ fn check_command_inner(
         ast_available: true,
         warnings: Vec::new(),
         redirects: None,
+        unreadable_command_name: false,
     };
     // 1. Check the full command for dangerous patterns.
     if let Some(msg) = check_dangerous(command) {
@@ -1457,6 +1461,10 @@ fn check_command_inner(
     let ctx = ValidationContext::new(command);
     let ast_available = ctx.ast.is_some();
     let redirects = ctx.ast.as_ref().map(|ast| ast.redirects.clone());
+    let unreadable_command_name = ctx
+        .ast
+        .as_ref()
+        .is_some_and(|ast| ast.unreadable_command_name);
 
     // Each validator returns Allow (continue), Warn (collect), or Block (stop).
     // AST-based validators run alongside regex validators for defense-in-depth.
@@ -1495,6 +1503,7 @@ fn check_command_inner(
                     ast_available,
                     warnings: Vec::new(),
                     redirects,
+                    unreadable_command_name,
                 };
             }
             SecurityVerdict::Warn(message) => warnings.push(ClassifiedWarning {
@@ -1515,6 +1524,7 @@ fn check_command_inner(
         ast_available,
         warnings,
         redirects,
+        unreadable_command_name,
     }
 }
 
@@ -2243,15 +2253,24 @@ fn extract_token(command: &str, start: usize) -> Option<String> {
 // Contained-redirect absorption (ADR 09 §1)
 // ---------------------------------------------------------------------------
 
-/// Words that change the shell's directory, or run code that may: their
+/// Words that change the shell's directory, or run code in the current
+/// shell that may (`trap` handlers, `fc` history re-execution): their
 /// presence anywhere makes the command's own cwd unprovable.
-const CWD_WORDS: &[&str] = &["cd", "pushd", "popd", "source", "eval", "exec"];
+const CWD_WORDS: &[&str] = &[
+    "cd", "pushd", "popd", "source", "eval", "exec", "trap", "fc",
+];
 
 /// Whether `command` may change its working directory: a cd-family or
 /// cwd-executing word at any position (a conservative word scan, so a
-/// compound like `while true; do cd ~; break; done` is caught), or `.` as
-/// a command word. Heredoc bodies are data and are not scanned.
+/// compound like `while true; do cd ~; break; done` is caught), `.` as a
+/// command word, or a command name the AST cannot read literally
+/// (`"c""d" ~`). Without the AST the answer is yes (unprovable). Heredoc
+/// bodies are data and are not scanned.
 pub fn changes_directory(command: &str) -> bool {
+    let classification = classify_command(command);
+    if !classification.ast_available || classification.unreadable_command_name {
+        return true;
+    }
     let text = mask_heredoc_bodies(command);
     let separator = |c: char| {
         c.is_whitespace()
@@ -3557,6 +3576,11 @@ mod classification_tests {
         assert!(changes_directory(". env.sh"));
         assert!(changes_directory("ls; . ./env.sh"));
         assert!(changes_directory("eval \"$x\""));
+        // Spellings no word scan reads: the AST flags the command name.
+        assert!(changes_directory("\"c\"\"d\" ~ && echo hi > out.txt"));
+        assert!(changes_directory("c\\d ~"));
+        assert!(changes_directory("builtin 'cd' ~"));
+        assert!(changes_directory("trap 'cd ~' DEBUG"));
         assert!(!changes_directory("cp a ."));
         assert!(!changes_directory("echo abcd > cdrom.txt"));
         assert!(!changes_directory("cat > f <<'EOF'\ncd /\nEOF"));

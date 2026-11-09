@@ -51,9 +51,21 @@ pub struct BashSession<P: ShellProcess> {
     /// How this session was launched; a different desired launch (sandbox
     /// toggled, network granted, env changed) respawns the session.
     launch: SpawnSpec,
-    /// The shell's working directory after its last command, as the shell
-    /// reported it in the completion marker (`None` before the first).
-    reported_pwd: Option<PathBuf>,
+    /// The shell's working directory after its last command.
+    dir: ShellDir,
+}
+
+/// Where the persistent shell is between commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellDir {
+    /// No command has run: a fresh shell is in its launch directory.
+    Fresh,
+    /// After the last command: read from the OS where the process is the
+    /// shell itself (unforgeable), else the directory the shell reported.
+    Known(PathBuf),
+    /// The shell reported no directory (`PWD` unset or emptied) and the OS
+    /// could not be asked: anywhere.
+    Unknown,
 }
 
 /// Shared session handle for a spawner `S`, used by `BashTool`,
@@ -85,7 +97,7 @@ impl<P: ShellProcess> BashSession<P> {
                 .await
                 .map_err(|e| BashError(format!("Failed to spawn bash: {}", e)))?,
             launch,
-            reported_pwd: None,
+            dir: ShellDir::Fresh,
         };
         session.initialize().await?;
         Ok(session)
@@ -208,7 +220,13 @@ impl<P: ShellProcess> BashSession<P> {
 
         match result {
             Ok(Ok((exit_code, pwd))) => {
-                self.reported_pwd = pwd;
+                // The OS answer wins: the shell controls `$PWD` (and even
+                // `echo`), so its own report is only the fallback.
+                self.dir = match (self.proc.cwd(), pwd) {
+                    (Some(os), _) => ShellDir::Known(os),
+                    (None, Some(reported)) => ShellDir::Known(reported),
+                    (None, None) => ShellDir::Unknown,
+                };
                 Ok(CommandOutput {
                     captured: capture.finish(),
                     exit_code,
@@ -242,12 +260,14 @@ impl<P: ShellProcess> BashSession<P> {
         self.proc.is_alive()
     }
 
-    /// Whether the shell has left the directory it was launched in. Unknown
-    /// (no report yet) counts as not drifted: a fresh shell starts there.
+    /// Whether the shell may have left the directory it was launched in. A
+    /// fresh shell has not; an unknown directory may have.
     fn drifted(&self) -> bool {
-        self.reported_pwd
-            .as_deref()
-            .is_some_and(|pwd| canonical_dir(pwd) != canonical_dir(&self.launch.cwd))
+        match &self.dir {
+            ShellDir::Fresh => false,
+            ShellDir::Known(dir) => canonical_dir(dir) != canonical_dir(&self.launch.cwd),
+            ShellDir::Unknown => true,
+        }
     }
 
     pub async fn kill(&mut self) {
@@ -460,18 +480,20 @@ impl<S: ShellSpawner + Default> BashTool<S> {
 
     /// Directories a relative write target of this call may resolve
     /// against (ADR 09 FA-5): the call's cwd from the launch directory and
-    /// from the shell-reported directory, and `$HOME` when the command
-    /// itself changes directory.
+    /// from the shell's current directory (`$HOME` standing in when that is
+    /// unknown), and `$HOME` when the command itself changes directory.
     fn write_check_dirs(
         &self,
         command: &str,
         workdir: Option<&str>,
-        reported: Option<&std::path::Path>,
+        shell_dir: &ShellDir,
     ) -> Vec<PathBuf> {
         let launch = PathBuf::from(self.resolve_cwd());
         let mut bases = vec![launch];
-        if let Some(reported) = reported {
-            bases.push(reported.to_path_buf());
+        match shell_dir {
+            ShellDir::Fresh => {}
+            ShellDir::Known(dir) => bases.push(dir.clone()),
+            ShellDir::Unknown => bases.extend(dirs::home_dir()),
         }
         let mut dirs: Vec<PathBuf> = Vec::new();
         for base in bases {
@@ -656,7 +678,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
             tracing::warn!("🛡️ [bash] Command blocked: {}", command);
             return Err(BashError(msg.clone()));
         }
-        let reported_pwd = guard.as_ref().and_then(|s| s.reported_pwd.clone());
+        let shell_dir = guard.as_ref().map_or(ShellDir::Fresh, |s| s.dir.clone());
         let drifted = guard.as_ref().is_some_and(|s| s.drifted());
         let security_warning =
             self.output_warning(command, &classification, args.workdir.as_deref(), drifted);
@@ -666,8 +688,7 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
 
         // --- write-target blocklist (redirect targets + write commands),
         // against every directory the command may run in ---
-        let check_dirs =
-            self.write_check_dirs(command, args.workdir.as_deref(), reported_pwd.as_deref());
+        let check_dirs = self.write_check_dirs(command, args.workdir.as_deref(), &shell_dir);
         if let Err(msg) = bash_security::check_write_targets(command, &check_dirs) {
             tracing::warn!("🛡️ [bash] Write target blocked: {} — {}", msg, command);
             return Err(BashError(msg));
