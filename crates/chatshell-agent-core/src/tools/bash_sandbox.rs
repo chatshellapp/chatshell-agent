@@ -254,6 +254,105 @@ pub fn detect_denial(output: &str, network_allowed: bool) -> Option<(EscalationK
     find(CREDENTIAL_MARKERS).map(|line| (EscalationKind::Credentials, line))
 }
 
+/// The `errno` behind "Operation not permitted" on Linux and macOS.
+const EPERM: i32 = 1;
+
+const EPERM_MARKER: &str = "operation not permitted";
+
+/// A filesystem "denial" that the host itself would meet: every
+/// filesystem marker in `output` is an EPERM line naming an existing path
+/// that this (unsandboxed) process is refused too. Returns the first such
+/// path.
+///
+/// On macOS, privacy controls (TCC: Desktop, Documents, Downloads, Full
+/// Disk Access locations) and SIP refuse the whole app with the same
+/// EPERM a Seatbelt denial produces. Running such a command outside the
+/// sandbox fails the same way, so offering that (or reporting a jail
+/// denial) would be wrong. The probe is read-only: `stat`, then listing a
+/// directory or opening a regular file for reading; other file types are
+/// never probed. Relative paths resolve against `base`, the directory the
+/// command ran in; a path that cannot be found or placed keeps the
+/// denial, so a real sandbox denial is never hidden.
+pub fn host_refusal(output: &str, base: &std::path::Path) -> Option<PathBuf> {
+    host_refusal_with(output, base, host_refused)
+}
+
+fn host_refusal_with(
+    output: &str,
+    base: &std::path::Path,
+    refused: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let mut first = None;
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        let marked =
+            FILESYSTEM_MARKERS.iter().any(|m| lower.contains(m)) || lower.contains(MASK_MARKER);
+        if !marked {
+            continue;
+        }
+        let path = eperm_path(line, &lower)?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base.join(path)
+        };
+        if !refused(&path) {
+            return None;
+        }
+        first.get_or_insert(path);
+    }
+    first
+}
+
+/// The path of a `prog: PATH: Operation not permitted` line (also
+/// `bash: line 1: PATH: ...` and GNU's `... '/PATH': ...`), `~` expanded.
+fn eperm_path(line: &str, lower: &str) -> Option<PathBuf> {
+    // ASCII lowercasing keeps byte offsets, so `lower` indexes `line`.
+    let at = lower.find(EPERM_MARKER)?;
+    let before = line[..at].trim_end().strip_suffix(':')?;
+    let segment = before.rsplit(": ").next()?.trim();
+    let quoted = segment
+        .find(['\'', '`', '‘'])
+        .zip(segment.rfind(['\'', '’']))
+        .filter(|(open, close)| close > open)
+        .map(|(open, close)| {
+            let open = open + segment[open..].chars().next().map_or(1, char::len_utf8);
+            &segment[open..close]
+        });
+    let text = quoted.unwrap_or(segment);
+    if text.is_empty() {
+        return None;
+    }
+    if text == "~" || text.starts_with("~/") {
+        return Some(dirs::home_dir()?.join(text.trim_start_matches('~').trim_start_matches('/')));
+    }
+    Some(PathBuf::from(text))
+}
+
+/// Whether this process is refused read access to `path` with EPERM.
+fn host_refused(path: &std::path::Path) -> bool {
+    let eperm =
+        |result: std::io::Result<()>| matches!(result, Err(e) if e.raw_os_error() == Some(EPERM));
+    match std::fs::metadata(path) {
+        Err(e) => e.raw_os_error() == Some(EPERM),
+        Ok(meta) if meta.is_dir() => eperm(std::fs::read_dir(path).map(drop)),
+        Ok(meta) if meta.is_file() => eperm(std::fs::File::open(path).map(drop)),
+        Ok(_) => false,
+    }
+}
+
+/// Result annotation: the operating system, not the sandbox, refused
+/// access to `path`.
+pub fn note_host_refused(path: &std::path::Path) -> String {
+    format!(
+        "[not the sandbox: the operating system refused access to {} for this app as well \
+         (on macOS, privacy settings such as Files and Folders or Full Disk Access). Running \
+         outside the sandbox would fail the same way; tell the user, who can grant access in \
+         System Settings > Privacy & Security.]",
+        path.display()
+    )
+}
+
 /// Whether an error line names a path the read policy blocks
 /// (`cat: /home/u/.zshrc: Permission denied`,
 /// `ls: cannot open directory '/home/u/.ssh': Permission denied`).
@@ -335,6 +434,92 @@ without OS confinement after the user approved it.]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eperm_lines_name_their_path() {
+        let path = |line: &str| eperm_path(line, &line.to_ascii_lowercase());
+        assert_eq!(
+            path("ls: /Users/x/Desktop/: Operation not permitted"),
+            Some(PathBuf::from("/Users/x/Desktop/"))
+        );
+        assert_eq!(
+            path("bash: line 1: /Users/x/f.txt: Operation not permitted"),
+            Some(PathBuf::from("/Users/x/f.txt"))
+        );
+        assert_eq!(
+            path("ls: cannot open directory '/Users/x/Desktop': Operation not permitted"),
+            Some(PathBuf::from("/Users/x/Desktop"))
+        );
+        assert_eq!(
+            path("touch: notes.txt: Operation not permitted"),
+            Some(PathBuf::from("notes.txt"))
+        );
+        assert_eq!(
+            path("cat: ~/Desktop/a: Operation not permitted"),
+            Some(dirs::home_dir().unwrap().join("Desktop/a"))
+        );
+        // No path before the marker, or not an EPERM line at all.
+        assert_eq!(path("Operation not permitted"), None);
+        assert_eq!(path("cp: /x: Read-only file system"), None);
+    }
+
+    #[test]
+    fn only_a_refusal_the_host_shares_is_not_a_sandbox_denial() {
+        let base = std::path::Path::new("/work");
+        let host_refuses_desktop = |p: &std::path::Path| p.starts_with("/Users/x/Desktop");
+        let refusal = |out: &str| host_refusal_with(out, base, host_refuses_desktop);
+        assert_eq!(
+            refusal("ls: /Users/x/Desktop/: Operation not permitted\n---\nok"),
+            Some(PathBuf::from("/Users/x/Desktop/"))
+        );
+        // The host is not refused: the sandbox was (escalate as before).
+        assert_eq!(
+            refusal("touch: /Users/x/outside.txt: Operation not permitted"),
+            None
+        );
+        // Relative paths are placed in the command's directory.
+        assert_eq!(
+            host_refusal_with("touch: f: Operation not permitted", base, |p| {
+                p == std::path::Path::new("/work/f")
+            }),
+            Some(PathBuf::from("/work/f"))
+        );
+        // One real denial among host refusals keeps the denial.
+        assert_eq!(
+            refusal(
+                "ls: /Users/x/Desktop/: Operation not permitted\n\
+                 cp: /Users/x/outside.txt: Operation not permitted"
+            ),
+            None
+        );
+        // Markers without an EPERM path keep the denial.
+        assert_eq!(
+            refusal("cp: /Users/x/Desktop/a: Read-only file system"),
+            None
+        );
+        assert_eq!(refusal("sandbox-exec: deny(1) file-write-create /x"), None);
+        // No filesystem marker at all: nothing to say.
+        assert_eq!(refusal("plain failure"), None);
+    }
+
+    #[test]
+    fn the_host_probe_reports_only_eperm() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(!host_refused(dir.path()));
+        assert!(!host_refused(&file));
+        assert!(!host_refused(&dir.path().join("missing")));
+        // Where this process is itself refused (macOS privacy controls on
+        // ~/Desktop for an app without Files and Folders access), the probe
+        // says so.
+        let desktop = dirs::home_dir().unwrap().join("Desktop");
+        if std::fs::read_dir(&desktop).is_err_and(|e| e.raw_os_error() == Some(EPERM)) {
+            assert!(host_refused(&desktop));
+            let out = format!("ls: {}/: Operation not permitted", desktop.display());
+            assert!(host_refusal(&out, dir.path()).is_some());
+        }
+    }
 
     #[test]
     fn deltas_are_consumed_by_exactly_one_matching_execution() {
@@ -1127,6 +1312,26 @@ else:
                 "{command}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_host_shares_raises_no_card() {
+        let Some(f) = fixture(EscalationDecision::RetryUnsandboxed) else {
+            return;
+        };
+        // Only where this process is itself refused (macOS privacy controls
+        // on ~/Desktop for an app without Files and Folders access).
+        let desktop = dirs::home_dir().unwrap().join("Desktop");
+        if !std::fs::read_dir(&desktop).is_err_and(|e| e.raw_os_error() == Some(EPERM)) {
+            return;
+        }
+        let out = run(&f.tool, "ls ~/Desktop/").await;
+        assert!(f.recorder.requests.lock().unwrap().is_empty(), "{out}");
+        assert!(out.contains("not the sandbox"), "{out}");
+        assert!(!out.contains(NOTE_RETRIED_UNSANDBOXED), "{out}");
+        // A real sandbox denial still escalates.
+        let out = run(&f.tool, &format!("touch {}", f.outside.display())).await;
+        assert_eq!(f.recorder.requests.lock().unwrap().len(), 1, "{out}");
     }
 
     #[tokio::test]

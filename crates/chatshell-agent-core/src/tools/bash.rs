@@ -20,9 +20,10 @@ use crate::shell_env;
 use crate::tool_fs::{Fs, StdFs};
 use crate::tools::bash_output::{Captured, OutputCapture, SpillTarget, spill_notice};
 use crate::tools::bash_sandbox::{
-    BashSandbox, EscalationDecision, EscalationRequest, ExecutionDelta, NOTE_NETWORK_ALLOWED,
-    NOTE_RETRIED_UNSANDBOXED, NOTE_RUN_ANYWAY_UNSANDBOXED, NOTE_SANDBOX_UNAVAILABLE, detect_denial,
-    note_delta, note_denied, note_reported,
+    BashSandbox, EscalationDecision, EscalationKind, EscalationRequest, ExecutionDelta,
+    NOTE_NETWORK_ALLOWED, NOTE_RETRIED_UNSANDBOXED, NOTE_RUN_ANYWAY_UNSANDBOXED,
+    NOTE_SANDBOX_UNAVAILABLE, detect_denial, host_refusal, note_delta, note_denied,
+    note_host_refused, note_reported,
 };
 use std::sync::atomic::Ordering;
 
@@ -478,6 +479,21 @@ impl<S: ShellSpawner + Default> BashTool<S> {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    /// The directory a call ran in, for placing relative paths in its
+    /// output: an absolute `workdir`, else `workdir` joined onto the shell's
+    /// directory before the call (the launch directory for a fresh or
+    /// unknown one).
+    fn command_dir(&self, workdir: Option<&str>, shell_dir: &ShellDir) -> PathBuf {
+        let base = match shell_dir {
+            ShellDir::Known(dir) => dir.clone(),
+            ShellDir::Fresh | ShellDir::Unknown => PathBuf::from(self.resolve_cwd()),
+        };
+        match workdir {
+            Some(w) => base.join(w),
+            None => base,
+        }
+    }
+
     /// Directories a relative write target of this call may resolve
     /// against (ADR 09 FA-5): the call's cwd from the launch directory and
     /// from the shell's current directory (`$HOME` standing in when that is
@@ -782,49 +798,67 @@ impl<S: ShellSpawner + Default> Tool for BashTool<S> {
                     || delta.as_ref().is_some_and(|delta| delta.network),
             )
         {
-            tracing::info!("🛡️ [bash] Sandbox denial ({kind:?}): {detail}");
-            let decision = match &sandbox.escalator {
-                Some(escalator) => Some(
-                    escalator
-                        .escalate(EscalationRequest {
-                            command: command.to_string(),
-                            kind,
-                            detail,
-                        })
-                        .await,
-                ),
-                None => None,
-            };
-            match decision {
-                Some(EscalationDecision::RetryUnsandboxed) => {
-                    let spec = self.launch_spec(None, None)?.spec;
-                    let mut once: Option<BashSession<S::Shell>> =
-                        Some(BashSession::new(&self.spawner, spec).await?);
-                    let rerun = self.run_in(&mut once, &effective_command, timeout).await;
-                    if let Some(mut session) = once.take() {
-                        session.kill().await;
-                    }
-                    cmd = rerun?;
-                    notes.push(NOTE_RETRIED_UNSANDBOXED.to_string());
-                }
-                Some(EscalationDecision::AllowNetworkSession) => {
-                    sandbox.network_allowed.store(true, Ordering::SeqCst);
-                    let relaunch = self.launch()?;
-                    self.ensure_session(&mut guard, &relaunch.spec).await?;
-                    let rerun = self.run_in(&mut guard, &effective_command, timeout).await;
-                    self.publish_drift(guard.as_ref());
-                    match rerun {
-                        Ok(rerun) => cmd = rerun,
-                        Err(e) => {
-                            *guard = None;
-                            return Err(e);
+            // macOS privacy controls (and SIP) refuse the whole app with the
+            // same EPERM a Seatbelt denial produces: when the host is refused
+            // too, it was not the sandbox, and running outside it would fail
+            // the same way. No card, no jail-denied marker; say so instead.
+            let refused = (kind == EscalationKind::Filesystem)
+                .then(|| {
+                    let base = self.command_dir(args.workdir.as_deref(), &shell_dir);
+                    host_refusal(&cmd.captured.scan_text, &base)
+                })
+                .flatten();
+            if let Some(path) = refused {
+                tracing::info!(
+                    "🛡️ [bash] Not a sandbox denial: the host is refused {} too",
+                    path.display()
+                );
+                notes.push(note_host_refused(&path));
+            } else {
+                tracing::info!("🛡️ [bash] Sandbox denial ({kind:?}): {detail}");
+                let decision = match &sandbox.escalator {
+                    Some(escalator) => Some(
+                        escalator
+                            .escalate(EscalationRequest {
+                                command: command.to_string(),
+                                kind,
+                                detail,
+                            })
+                            .await,
+                    ),
+                    None => None,
+                };
+                match decision {
+                    Some(EscalationDecision::RetryUnsandboxed) => {
+                        let spec = self.launch_spec(None, None)?.spec;
+                        let mut once: Option<BashSession<S::Shell>> =
+                            Some(BashSession::new(&self.spawner, spec).await?);
+                        let rerun = self.run_in(&mut once, &effective_command, timeout).await;
+                        if let Some(mut session) = once.take() {
+                            session.kill().await;
                         }
+                        cmd = rerun?;
+                        notes.push(NOTE_RETRIED_UNSANDBOXED.to_string());
                     }
-                    notes.push(NOTE_NETWORK_ALLOWED.to_string());
+                    Some(EscalationDecision::AllowNetworkSession) => {
+                        sandbox.network_allowed.store(true, Ordering::SeqCst);
+                        let relaunch = self.launch()?;
+                        self.ensure_session(&mut guard, &relaunch.spec).await?;
+                        let rerun = self.run_in(&mut guard, &effective_command, timeout).await;
+                        self.publish_drift(guard.as_ref());
+                        match rerun {
+                            Ok(rerun) => cmd = rerun,
+                            Err(e) => {
+                                *guard = None;
+                                return Err(e);
+                            }
+                        }
+                        notes.push(NOTE_NETWORK_ALLOWED.to_string());
+                    }
+                    Some(EscalationDecision::Deny) => notes.push(note_denied(kind, true)),
+                    Some(EscalationDecision::Reported) => notes.push(note_reported(kind)),
+                    None => notes.push(note_denied(kind, false)),
                 }
-                Some(EscalationDecision::Deny) => notes.push(note_denied(kind, true)),
-                Some(EscalationDecision::Reported) => notes.push(note_reported(kind)),
-                None => notes.push(note_denied(kind, false)),
             }
         }
 
