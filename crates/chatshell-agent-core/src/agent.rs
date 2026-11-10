@@ -20,9 +20,6 @@ use crate::types::{
     SamplingParameters,
 };
 
-/// Default max_tokens for Anthropic (required by the API, unlike OpenAI).
-pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8192;
-
 /// Create an Anthropic completion model with prompt caching enabled.
 ///
 /// The single construction site shared by core's `run_generation` and
@@ -44,18 +41,33 @@ pub fn create_anthropic_completion_model(
     Ok(client.completion_model(model_id).with_prompt_caching())
 }
 
-fn sampling_parameters_with_default_max_tokens(
+/// The sampling parameters of an Anthropic request: the caller's, plus a
+/// model-sized `max_tokens` (required by the API) and a readable-thinking
+/// default when the caller set neither (see [`crate::anthropic_models`]).
+fn anthropic_sampling_parameters(
+    model_id: &str,
     parameters: &SamplingParameters,
-    default_max_tokens: u64,
-) -> SamplingParameters {
-    if parameters.max_tokens.is_some() {
-        parameters.clone()
-    } else {
-        SamplingParameters {
-            max_tokens: Some(default_max_tokens),
-            ..parameters.clone()
-        }
-    }
+) -> Result<SamplingParameters, AgentError> {
+    let additional = parameters
+        .additional_params_json
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|error| AgentError::InvalidProvider(error.to_string()))?;
+    let additional = crate::anthropic_models::with_anthropic_thinking_default(
+        model_id,
+        parameters.temperature,
+        additional,
+    );
+    Ok(SamplingParameters {
+        temperature: parameters.temperature,
+        max_tokens: Some(
+            parameters
+                .max_tokens
+                .unwrap_or_else(|| crate::anthropic_models::anthropic_default_max_tokens(model_id)),
+        ),
+        additional_params_json: additional.map(|value| value.to_string()),
+    })
 }
 
 /// A built agent plus the model handle it was built from. The handle is kept
@@ -76,10 +88,12 @@ pub async fn run_generation(
     let (prompt, history, system_prompt) = build_messages(&request.messages)?;
     let agent = create_agent(&request, system_prompt.as_deref())?;
 
-    let default_max_tokens = if request.provider.kind == ProviderKind::Anthropic {
-        Some(ANTHROPIC_DEFAULT_MAX_TOKENS)
+    // The client-tool path builds its request from these parameters, not
+    // from the agent, so it needs the same Anthropic defaults.
+    let parameters = if request.provider.kind == ProviderKind::Anthropic {
+        anthropic_sampling_parameters(&request.model, &request.parameters)?
     } else {
-        None
+        request.parameters.clone()
     };
 
     run_stream(
@@ -90,8 +104,7 @@ pub async fn run_generation(
             tools: request.tools.clone(),
             system_prompt: system_prompt.as_deref(),
         },
-        &request.parameters,
-        default_max_tokens,
+        &parameters,
         &EventSink {
             sender: &sender,
             cancellation: &cancellation,
@@ -144,10 +157,7 @@ fn create_agent(
                 request.provider.base_url.as_deref(),
                 model,
             )?;
-            let anthropic_parameters = sampling_parameters_with_default_max_tokens(
-                parameters,
-                ANTHROPIC_DEFAULT_MAX_TOKENS,
-            );
+            let anthropic_parameters = anthropic_sampling_parameters(&request.model, parameters)?;
             build_provider_agent(kind, model, system_prompt, &anthropic_parameters)
         }
         ProviderKind::OpenRouter => {
@@ -556,14 +566,8 @@ async fn run_stream(
     agent: ProviderAgent,
     turn: Turn<'_>,
     parameters: &SamplingParameters,
-    default_max_tokens: Option<u64>,
     sink: &EventSink<'_>,
 ) -> Result<(), AgentError> {
-    let parameters = match default_max_tokens {
-        Some(default) => sampling_parameters_with_default_max_tokens(parameters, default),
-        None => parameters.clone(),
-    };
-
     let ProviderAgent { agent, model, .. } = agent;
 
     if turn.tools.is_empty() {
@@ -576,7 +580,7 @@ async fn run_stream(
         )
         .await
     } else {
-        stream_agent_with_client_tools(Arc::new(model), turn, &parameters, sink).await
+        stream_agent_with_client_tools(Arc::new(model), turn, parameters, sink).await
     }
 }
 

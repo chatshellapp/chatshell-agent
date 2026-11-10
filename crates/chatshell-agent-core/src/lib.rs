@@ -1,5 +1,6 @@
 mod agent;
 pub mod anchor_store;
+pub mod anthropic_models;
 pub mod bash_ast;
 pub mod bash_security;
 pub mod compaction;
@@ -43,10 +44,7 @@ pub mod visual_output;
 pub mod web_fetch;
 pub mod web_search;
 
-pub use agent::{
-    ANTHROPIC_DEFAULT_MAX_TOKENS, create_anthropic_completion_model, create_http_client,
-    run_generation,
-};
+pub use agent::{create_anthropic_completion_model, create_http_client, run_generation};
 pub use history::{HistoryRole, HistoryRow, ToolCallRow, pair_history};
 pub use mcp::{McpConnection, McpHttpConfig, McpToolInfo, McpToolResult};
 pub use provider_registry::{
