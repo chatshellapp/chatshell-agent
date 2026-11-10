@@ -1,13 +1,19 @@
 //! Visual-output routing: one system-prompt fragment telling the model which
 //! format fits which content, built from what the requesting client renders.
 //!
-//! Every format (Markdown tables, LaTeX math, Mermaid, SVG figures) used to
+//! Every format (Markdown tables, LaTeX math, Mermaid, SVG figures, OpenUI
+//! blocks) used to
 //! need its own fragment, and each one invited its own format. One routing
 //! fragment keeps the instructions consistent and never offers a format the
 //! client cannot draw. The fragment is static per capability set, so it does
 //! not break prompt caching across turns.
 //!
-//! Design: `internal-docs/features/visual-output-formats.md`.
+//! The OpenUI section (`openui_prompt.txt`) is written in the desktop app
+//! next to the component library it renders (`src/lib/openui/prompt.ts`); a
+//! desktop test fails when the two drift apart.
+//!
+//! Design: `internal-docs/features/visual-output-formats.md`,
+//! `internal-docs/features/openui-blocks.md`.
 
 use crate::svg_figure::svg_figure_rules;
 
@@ -21,20 +27,28 @@ pub struct VisualCapabilities {
     pub mermaid: bool,
     /// `$...$` and `$$...$$` render as math.
     pub math: bool,
+    /// ```openui-lang fences render as OpenUI charts and KPI cards.
+    pub openui: bool,
 }
+
+/// The OpenUI library section, generated from the desktop renderer's library.
+const OPENUI_PROMPT: &str = include_str!("openui_prompt.txt");
 
 const INTRO: &str = "\
 Visual output: choose the format by what the content is; the first rule that \
 matches wins.";
 
-const NUMBERS_WITH_SVG: &str = "\
-- Numbers to compare: put exact values or attributes side by side in a Markdown table. \
-Never draw a chart in SVG; when a trend or comparison matters, use the table \
-and state the takeaway in one sentence.";
+const NUMBERS_OPENUI: &str = "\
+- Numbers to compare: a few exact values to read go in a Markdown table; when a \
+trend, distribution, share, or set of metrics is worth seeing, use an \
+```openui-lang block with a chart or KPI cards, following the OpenUI rules \
+below.";
 
 const NUMBERS: &str = "\
 - Numbers to compare: put exact values or attributes side by side in a Markdown table; \
 when a trend or comparison matters, state the takeaway in one sentence.";
+
+const NO_SVG_CHARTS: &str = " Never draw a chart in SVG.";
 
 const MATH: &str = "\
 - Formulas: LaTeX between $...$ inline or $$...$$ for display; it renders. \
@@ -69,11 +83,16 @@ const PROSE: &str = "\
 /// The visual-output fragment for a client with `caps`.
 ///
 /// Rules are ordered like the routing table in the design doc (numbers,
-/// formulas, graphs, pictures, prose) and filtered to the enabled formats;
-/// the SVG drawing rules follow when SVG is enabled.
+/// formulas, graphs, pictures, prose) and filtered to the enabled
+/// formats; the SVG drawing rules and the OpenUI library section follow when
+/// those formats are enabled.
 pub fn visual_output_prompt(caps: &VisualCapabilities) -> String {
-    let mut lines: Vec<&str> = vec![INTRO];
-    lines.push(if caps.svg { NUMBERS_WITH_SVG } else { NUMBERS });
+    let mut numbers = String::from(if caps.openui { NUMBERS_OPENUI } else { NUMBERS });
+    if caps.svg {
+        numbers.push_str(NO_SVG_CHARTS);
+    }
+
+    let mut lines: Vec<&str> = vec![INTRO, &numbers];
     lines.push(if caps.math { MATH } else { NO_MATH });
     if caps.mermaid {
         lines.push(if caps.svg { MERMAID_WITH_SVG } else { MERMAID });
@@ -88,6 +107,10 @@ pub fn visual_output_prompt(caps: &VisualCapabilities) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(&svg_figure_rules());
     }
+    if caps.openui {
+        prompt.push_str("\n\n");
+        prompt.push_str(OPENUI_PROMPT.trim_end());
+    }
     prompt
 }
 
@@ -100,7 +123,14 @@ mod tests {
         for svg in [false, true] {
             for mermaid in [false, true] {
                 for math in [false, true] {
-                    out.push(VisualCapabilities { svg, mermaid, math });
+                    for openui in [false, true] {
+                        out.push(VisualCapabilities {
+                            svg,
+                            mermaid,
+                            math,
+                            openui,
+                        });
+                    }
                 }
             }
         }
@@ -126,6 +156,8 @@ mod tests {
                 "{caps:?}"
             );
             assert_eq!(prompt.contains("SVG"), caps.svg, "{caps:?}");
+            assert_eq!(prompt.contains("```openui-lang"), caps.openui, "{caps:?}");
+            assert_eq!(prompt.contains("OpenUI"), caps.openui, "{caps:?}");
         }
     }
 
@@ -145,11 +177,13 @@ mod tests {
             svg: true,
             mermaid: true,
             math: true,
+            openui: false,
         });
         let without = visual_output_prompt(&VisualCapabilities {
             svg: true,
             mermaid: false,
             math: true,
+            openui: false,
         });
         assert!(!with.contains("state machine"));
         assert!(with.contains("Use SVG only for what Mermaid"));
@@ -162,6 +196,7 @@ mod tests {
             svg: true,
             mermaid: false,
             math: false,
+            openui: false,
         });
         assert!(prompt.contains("Never draw a chart in SVG"));
     }
@@ -172,6 +207,7 @@ mod tests {
             svg: true,
             mermaid: true,
             math: true,
+            openui: false,
         });
         let order = [
             "- Numbers to compare:",
@@ -192,5 +228,65 @@ mod tests {
             assert!(prompt.is_ascii(), "prompt must stay ASCII: {caps:?}");
             assert_eq!(prompt, visual_output_prompt(&caps));
         }
+    }
+
+    fn openui_caps() -> VisualCapabilities {
+        VisualCapabilities {
+            svg: true,
+            mermaid: true,
+            math: true,
+            openui: true,
+        }
+    }
+
+    #[test]
+    fn openui_takes_charts_and_metrics() {
+        let prompt = visual_output_prompt(&openui_caps());
+        assert!(prompt.contains("```openui-lang block with a chart or KPI cards"));
+        assert!(prompt.contains("Never draw a chart in SVG"));
+    }
+
+    #[test]
+    fn openui_blocks_are_static() {
+        // Blocks only display: nothing in the prompt invites input, clicks,
+        // links, state, or tool calls.
+        let prompt = visual_output_prompt(&openui_caps());
+        for dynamic in [
+            "@ToAssistant",
+            "@OpenUrl",
+            "ActionExpression",
+            "$binding",
+            "Form(",
+            "Button(",
+            "FollowUp",
+            "Query(",
+            "Mutation(",
+            "sources",
+        ] {
+            assert!(!prompt.contains(dynamic), "{dynamic}");
+        }
+        assert!(prompt.contains("Blocks only display data"));
+    }
+
+    #[test]
+    fn openui_library_section_comes_last() {
+        let prompt = visual_output_prompt(&openui_caps());
+        let svg_rules = prompt.find("SVG figures:").unwrap();
+        let library = prompt
+            .find("OpenUI blocks: a ```openui-lang fenced block")
+            .unwrap();
+        assert!(svg_rules < library);
+        assert!(prompt.ends_with(OPENUI_PROMPT.trim_end()));
+        assert!(prompt.contains("root = Chart("));
+        assert!(prompt.contains("root = Stats("));
+    }
+
+    #[test]
+    fn generated_openui_section_is_sane() {
+        // Rewritten by the desktop test; guard against an empty, oversized,
+        // or whole-response prompt sneaking in.
+        assert!(OPENUI_PROMPT.starts_with("OpenUI blocks:"));
+        assert!(OPENUI_PROMPT.len() < 3_000);
+        assert!(!OPENUI_PROMPT.contains("ENTIRE response"));
     }
 }

@@ -1541,7 +1541,8 @@ pub fn prepare_svg_figure(
 }
 
 /// The visual formats a client renders inline. Mirrors
-/// `chatshell_agent_core::visual_output::VisualCapabilities`.
+/// `chatshell_agent_core::visual_output::VisualCapabilities` minus `openui`:
+/// OpenUI blocks render only on desktop, so mobile clients never offer them.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct VisualCapabilities {
     /// ```svg fences render as figures (the user setting is on).
@@ -1558,6 +1559,7 @@ impl From<VisualCapabilities> for core::visual_output::VisualCapabilities {
             svg: value.svg,
             mermaid: value.mermaid,
             math: value.math,
+            openui: false,
         }
     }
 }
