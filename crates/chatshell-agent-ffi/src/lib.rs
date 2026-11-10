@@ -1450,6 +1450,9 @@ pub struct SvgPalette {
     pub success: String,
     pub warning: String,
     pub error: String,
+    /// Six series colors (`#rrggbb`) for `--c1`..`--c6`, in order, so figures
+    /// match the host's charts; empty to derive them from `accent`.
+    pub series: Vec<String>,
     pub is_dark: bool,
 }
 
@@ -1464,6 +1467,7 @@ impl From<SvgPalette> for core::svg_figure::SvgPalette {
             success: value.success,
             warning: value.warning,
             error: value.error,
+            series: value.series,
             is_dark: value.is_dark,
         }
     }

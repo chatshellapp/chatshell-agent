@@ -69,6 +69,11 @@ pub(super) fn is_achromatic(color: &str) -> bool {
     !matches!(parse_hex(color).map(rgb_to_oklch), Some((_, chroma, _)) if chroma >= MIN_ACCENT_CHROMA)
 }
 
+/// Whether `color` is a `#rgb` / `#rrggbb` color the figure can use as is.
+pub(super) fn parse_hex_color(color: &str) -> bool {
+    parse_hex(color).is_some()
+}
+
 /// `#rgb` / `#rrggbb` (alpha suffixes ignored) to 0..255 channels.
 fn parse_hex(value: &str) -> Option<(f64, f64, f64)> {
     let hex = value.trim().strip_prefix('#')?;

@@ -42,7 +42,9 @@ pub const MAX_USE_REFERENCES: usize = 500;
 pub const MAX_VIEWBOX_EDGE: f64 = 10_000.0;
 
 /// Theme colors a figure's `var(--name)` tokens resolve to. Values are CSS
-/// colors (`#RRGGBB` recommended); `c1`…`c6` are derived from `accent`.
+/// colors (`#RRGGBB` recommended). `c1`…`c6` come from `series` when it
+/// holds six hex colors (the host's chart palette, so figures match its
+/// charts); otherwise they are derived from `accent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SvgPalette {
     pub fg: String,
@@ -53,6 +55,8 @@ pub struct SvgPalette {
     pub success: String,
     pub warning: String,
     pub error: String,
+    /// The host's six series colors, in order; empty to derive them.
+    pub series: Vec<String>,
     pub is_dark: bool,
 }
 

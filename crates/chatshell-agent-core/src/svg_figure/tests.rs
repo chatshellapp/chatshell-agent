@@ -10,6 +10,7 @@ fn palette(is_dark: bool) -> SvgPalette {
         success: "#16a34a".into(),
         warning: "#d97706".into(),
         error: "#dc2626".into(),
+        series: Vec::new(),
         is_dark,
     }
 }
@@ -425,4 +426,49 @@ fn rules_cover_drawing_but_not_routing() {
     assert!(!rules.contains("mermaid"));
     assert!(!rules.contains("Markdown table"));
     assert!(rules.is_ascii(), "prompt must stay ASCII");
+}
+
+const SERIES_FIGURE: &str = r##"<svg viewBox="0 0 100 20" xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="var(--c1)"/><rect x="20" width="10" height="10" fill="var(--c6)"/><rect x="40" width="10" height="10" fill="var(--accent)"/></svg>"##;
+
+#[test]
+fn host_series_colors_replace_the_derived_ones() {
+    let mut themed = palette(false);
+    themed.accent = "#1a1a1a".into(); // A gray accent, like the desktop theme.
+    themed.series = [
+        "#0097a7", "#d81b60", "#8e24aa", "#ef6c00", "#388e3c", "#3f51b5",
+    ]
+    .map(String::from)
+    .to_vec();
+    let svg = prepare_svg_figure(SERIES_FIGURE, &themed, &PrepareOptions::default())
+        .expect("figure prepares")
+        .svg;
+    assert!(svg.contains(r##"fill="#0097a7""##), "{svg}");
+    assert!(svg.contains(r##"fill="#3f51b5""##), "{svg}");
+    // The gray accent gives way to the first series color.
+    assert_eq!(svg.matches(r##"fill="#0097a7""##).count(), 2, "{svg}");
+}
+
+#[test]
+fn incomplete_host_series_falls_back_to_derived_colors() {
+    for series in [
+        vec!["#0097a7".to_string(); 5],
+        [
+            "#0097a7",
+            "#d81b60",
+            "#8e24aa",
+            "#ef6c00",
+            "#388e3c",
+            "oklch(0.5 0.1 200)",
+        ]
+        .map(String::from)
+        .to_vec(),
+    ] {
+        let mut themed = palette(false);
+        themed.series = series;
+        let svg = prepare_svg_figure(SERIES_FIGURE, &themed, &PrepareOptions::default())
+            .expect("figure prepares")
+            .svg;
+        let derived = &series_colors("#2563eb", false)[0];
+        assert!(svg.contains(&format!("fill=\"{derived}\"")), "{svg}");
+    }
 }

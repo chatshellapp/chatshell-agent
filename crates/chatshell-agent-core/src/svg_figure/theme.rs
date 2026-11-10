@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::color::{is_achromatic, series_colors};
+use super::color::{is_achromatic, parse_hex_color, series_colors};
 use super::tree::{Element, Node};
 use super::{MAX_VIEWBOX_EDGE, SvgFigureError, SvgPalette};
 
@@ -37,7 +37,8 @@ impl Tokens {
         colors.insert("warning", palette.warning.clone());
         colors.insert("error", palette.error.clone());
         const SERIES: [&str; 6] = ["c1", "c2", "c3", "c4", "c5", "c6"];
-        let series = series_colors(&palette.accent, palette.is_dark);
+        let series = host_series(&palette.series)
+            .unwrap_or_else(|| series_colors(&palette.accent, palette.is_dark));
         // A gray accent (monochrome themes) would read as plain text; the
         // first series color stands in so highlights stay visible.
         let accent = if is_achromatic(&palette.accent) {
@@ -157,4 +158,12 @@ fn parse_length(value: &str) -> Option<f64> {
     let value = value.trim();
     let number = value.strip_suffix("px").unwrap_or(value).trim();
     number.parse().ok()
+}
+
+/// The host's series colors when it supplies six parseable hex colors.
+fn host_series(series: &[String]) -> Option<[String; 6]> {
+    if series.len() != 6 || !series.iter().all(|color| parse_hex_color(color)) {
+        return None;
+    }
+    Some(std::array::from_fn(|at| series[at].trim().to_string()))
 }
