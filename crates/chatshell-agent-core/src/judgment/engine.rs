@@ -114,6 +114,49 @@ impl ReviewFailure {
     }
 }
 
+/// Longest provider-error detail kept in a review failure.
+const PROVIDER_ERROR_MAX_CHARS: usize = 300;
+
+/// A provider error shortened for the places a review failure is shown: the
+/// "auto unavailable" reason in the UI and the tool result fed back to the
+/// model. Gateways often answer an error with a whole HTML page (`500 ...
+/// with message: <!DOCTYPE html>...`); the page is replaced by a short note,
+/// whitespace is collapsed, and the rest is capped at
+/// [`PROVIDER_ERROR_MAX_CHARS`]. Classification happens before this, on the
+/// full text.
+pub fn concise_provider_error(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    let html_at = ["<!doctype", "<html"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min();
+    let mut text = match html_at {
+        Some(index) => {
+            let head = detail[..index].trim_end();
+            let head_lower = head.to_ascii_lowercase();
+            let head = head_lower
+                .strip_suffix("with message:")
+                .map_or(head, |rest| &head[..rest.len()])
+                .trim_end()
+                .trim_end_matches(':')
+                .trim_end();
+            format!("{head} (the server returned an HTML error page)")
+        }
+        None => detail.to_string(),
+    };
+    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > PROVIDER_ERROR_MAX_CHARS {
+        text = text
+            .chars()
+            .take(PROVIDER_ERROR_MAX_CHARS)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        text.push('…');
+    }
+    text
+}
+
 /// Result of one review.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReviewOutcome {
@@ -249,18 +292,24 @@ async fn run(
                 return (outcome, attempts, max_tokens);
             }
             Err(JudgeError::Cancelled) => return (ReviewOutcome::Cancelled, attempts, max_tokens),
-            Err(JudgeError::Permanent(detail)) => ReviewFailure::Unavailable(detail),
+            Err(JudgeError::Permanent(detail)) => {
+                ReviewFailure::Unavailable(concise_provider_error(&detail))
+            }
             Err(JudgeError::Truncated(_)) if budget_retry => {
                 budget_retry = false;
                 max_tokens = ESCALATED_OUTPUT_TOKENS;
                 continue;
             }
-            Err(JudgeError::Truncated(detail)) => ReviewFailure::Truncated(detail),
+            Err(JudgeError::Truncated(detail)) => {
+                ReviewFailure::Truncated(concise_provider_error(&detail))
+            }
             Err(JudgeError::Transient(_)) if transient_retry => {
                 transient_retry = false;
                 continue;
             }
-            Err(JudgeError::Transient(detail)) => ReviewFailure::Unavailable(detail),
+            Err(JudgeError::Transient(detail)) => {
+                ReviewFailure::Unavailable(concise_provider_error(&detail))
+            }
         };
         return (ReviewOutcome::Failed { failure }, attempts, max_tokens);
     }
@@ -567,6 +616,30 @@ impl EligibilityCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_with_html_pages_are_shortened() {
+        let detail = "HttpError: Invalid status code 500 Internal Server Error with message: \
+                      <!DOCTYPE html><html><head><script>window.x = {\"a\":1}</script>\
+                      <title>ZenMux</title></head><body>...</body></html>";
+        assert_eq!(
+            concise_provider_error(detail),
+            "HttpError: Invalid status code 500 Internal Server Error \
+             (the server returned an HTML error page)"
+        );
+    }
+
+    #[test]
+    fn long_provider_errors_are_capped_and_whitespace_collapsed() {
+        assert_eq!(
+            concise_provider_error("400 Bad Request:\n   invalid   params"),
+            "400 Bad Request: invalid params"
+        );
+        let long = "x".repeat(1000);
+        let short = concise_provider_error(&long);
+        assert_eq!(short.chars().count(), PROVIDER_ERROR_MAX_CHARS + 1);
+        assert!(short.ends_with('…'));
+    }
     use crate::judgment::verdict::{Authorization, RiskLevel};
     use std::collections::VecDeque;
     use std::sync::Arc;
