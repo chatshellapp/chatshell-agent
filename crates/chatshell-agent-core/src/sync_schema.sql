@@ -329,30 +329,6 @@ CREATE TABLE IF NOT EXISTS message_contexts (
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS message_prompts (
-    id TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL,
-    prompt_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT '',
-    deleted_at TEXT,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
-    FOREIGN KEY (prompt_id) REFERENCES prompts(id) ON DELETE CASCADE,
-    UNIQUE(message_id, prompt_id)
-);
-
-CREATE TABLE IF NOT EXISTS message_tools (
-    id TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL,
-    tool_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT '',
-    deleted_at TEXT,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
-    FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE CASCADE,
-    UNIQUE(message_id, tool_id)
-);
-
 CREATE TABLE IF NOT EXISTS assistant_tools (
     id TEXT PRIMARY KEY,
     assistant_id TEXT NOT NULL,

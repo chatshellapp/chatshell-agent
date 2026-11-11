@@ -48,6 +48,9 @@ const fn t(name: &'static str) -> TableSpec {
     }
 }
 
+/// Append-only spec. No production table is append-only today (every synced
+/// table carries tombstones); the test registry still exercises the path.
+#[cfg(test)]
 const fn immut(name: &'static str) -> TableSpec {
     TableSpec {
         name,
@@ -108,8 +111,6 @@ pub const PRODUCTION_MERGE_TABLES: &[TableSpec] = &[
     t("content_blocks"),
     tnk("message_attachments", "message_id, attachment_id"),
     tnk("message_contexts", "message_id, context_type, context_id"),
-    immut("message_prompts"),
-    immut("message_tools"),
     tnk("assistant_tools", "assistant_id, tool_id"),
     tnk("assistant_skills", "assistant_id, skill_id"),
     tpk("conversation_settings", "conversation_id"),

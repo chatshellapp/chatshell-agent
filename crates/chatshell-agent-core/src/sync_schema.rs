@@ -54,7 +54,12 @@ pub const SYNC_SCHEMA_SQL: &str = include_str!("sync_schema.sql");
 /// Monotonic version of [`SYNC_SCHEMA_SQL`]'s shape, recorded in the `meta`
 /// table under [`META_SCHEMA_VERSION`]. Bump on every shape change;
 /// [`ensure_sync_tables`] stamps it into fresh databases.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 5;
+///
+/// v6 dropped the `message_prompts` / `message_tools` junction tables: no
+/// platform ever wrote or read them. Skewed peers stay compatible because
+/// `merge_remote` skips tables a snapshot lacks and ignores tables outside
+/// its registry.
+pub const CANONICAL_SCHEMA_VERSION: i64 = 6;
 
 /// `meta` key holding [`CANONICAL_SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
