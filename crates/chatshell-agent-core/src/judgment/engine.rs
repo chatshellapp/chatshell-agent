@@ -416,7 +416,127 @@ impl DenialCounters {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Eligibility {
     Eligible(JudgeParams),
-    Ineligible { reason: String },
+    /// `reason` is the technical detail (logs, hover text); `cause` is what
+    /// the UI explains to the user.
+    Ineligible {
+        reason: String,
+        cause: IneligibleCause,
+    },
+}
+
+/// Why a model cannot judge, in terms a user can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IneligibleCause {
+    /// The provider rejected the credentials (401) or refused access to
+    /// the model (403).
+    Unauthorized,
+    /// The provider does not know the model or endpoint (404).
+    NotFound,
+    /// Rate limited or out of quota (429, 402).
+    RateLimited,
+    /// The provider or the network failed (5xx, timeout, connection).
+    Unreachable,
+    /// The provider rejected the request for another reason (4xx).
+    Rejected,
+    /// The model ran out of output budget before a verdict.
+    OutputBudget,
+    /// The model answered without a structured verdict.
+    NoVerdict,
+    /// The check was cancelled.
+    Cancelled,
+}
+
+impl IneligibleCause {
+    /// Stable identifier for hosts (UI message keys).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IneligibleCause::Unauthorized => "unauthorized",
+            IneligibleCause::NotFound => "notFound",
+            IneligibleCause::RateLimited => "rateLimited",
+            IneligibleCause::Unreachable => "unreachable",
+            IneligibleCause::Rejected => "rejected",
+            IneligibleCause::OutputBudget => "outputBudget",
+            IneligibleCause::NoVerdict => "noVerdict",
+            IneligibleCause::Cancelled => "cancelled",
+        }
+    }
+
+    /// The cause of a provider failure, read from its HTTP status (the
+    /// first status-like number after a status marker, else any standalone
+    /// 4xx/5xx), then from well-known phrases.
+    pub fn of_provider_error(detail: &str) -> Self {
+        let lower = detail.to_ascii_lowercase();
+        if let Some(status) = http_status(&lower) {
+            return match status {
+                401 | 403 => IneligibleCause::Unauthorized,
+                404 => IneligibleCause::NotFound,
+                402 | 429 => IneligibleCause::RateLimited,
+                408 | 500..=599 => IneligibleCause::Unreachable,
+                _ => IneligibleCause::Rejected,
+            };
+        }
+        let has = |markers: &[&str]| markers.iter().any(|m| lower.contains(m));
+        if has(&[
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "invalid_api_key",
+            "incorrect api key",
+            "authentication",
+            "permission",
+            "access_denied",
+        ]) {
+            IneligibleCause::Unauthorized
+        } else if has(&["not found", "not_found", "does not exist", "no such model"]) {
+            IneligibleCause::NotFound
+        } else if has(&["rate limit", "rate_limit", "too many requests", "quota"]) {
+            IneligibleCause::RateLimited
+        } else if has(&[
+            "timed out",
+            "timeout",
+            "connection",
+            "connect error",
+            "dns",
+            "network",
+            "overloaded",
+            "unavailable",
+            "html error page",
+        ]) {
+            IneligibleCause::Unreachable
+        } else {
+            IneligibleCause::Rejected
+        }
+    }
+}
+
+/// The HTTP status in a provider error: a number after `status`, `status
+/// code` or `http`, else the first standalone 4xx/5xx number.
+fn http_status(lower: &str) -> Option<u16> {
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let as_status = |t: &str| {
+        (t.len() == 3)
+            .then(|| t.parse::<u16>().ok())
+            .flatten()
+            .filter(|n| (400..600).contains(n))
+    };
+    for (i, token) in tokens.iter().enumerate() {
+        if matches!(*token, "status" | "http") {
+            let next = tokens.get(i + 1).copied();
+            let after = tokens.get(i + 2).copied();
+            if let Some(n) = next.and_then(as_status) {
+                return Some(n);
+            }
+            if next == Some("code")
+                && let Some(n) = after.and_then(as_status)
+            {
+                return Some(n);
+            }
+        }
+    }
+    tokens.iter().find_map(|t| as_status(t))
 }
 
 /// How `auto` resolves for a conversation.
@@ -546,6 +666,7 @@ pub async fn probe_with(
                 ReviewOutcome::Cancelled => {
                     return Eligibility::Ineligible {
                         reason: "The capability check was cancelled.".to_string(),
+                        cause: IneligibleCause::Cancelled,
                     };
                 }
                 ReviewOutcome::Failed {
@@ -558,18 +679,21 @@ pub async fn probe_with(
             }
         }
     }
-    Eligibility::Ineligible {
-        reason: match last {
-            Some(ReviewFailure::Unavailable(detail)) => {
-                format!("The model could not be reached for review: {detail}")
-            }
-            Some(ReviewFailure::Truncated(_)) => format!(
+    match last {
+        Some(ReviewFailure::Unavailable(detail)) => Eligibility::Ineligible {
+            cause: IneligibleCause::of_provider_error(&detail),
+            reason: format!("The model could not be reached for review: {detail}"),
+        },
+        Some(ReviewFailure::Truncated(_)) => Eligibility::Ineligible {
+            reason: format!(
                 "The model ran out of output budget before giving a verdict, even with \
                  {ESCALATED_OUTPUT_TOKENS} tokens."
             ),
-            Some(ReviewFailure::Unparseable(_)) | None => {
-                "The model did not return a structured verdict.".to_string()
-            }
+            cause: IneligibleCause::OutputBudget,
+        },
+        Some(ReviewFailure::Unparseable(_)) | None => Eligibility::Ineligible {
+            reason: "The model did not return a structured verdict.".to_string(),
+            cause: IneligibleCause::NoVerdict,
         },
     }
 }
@@ -1042,12 +1166,13 @@ mod tests {
             Step::Fail(JudgeError::Truncated("finish_reason=Length".into())),
             Step::Fail(JudgeError::Truncated("finish_reason=Length".into())),
         ]);
-        let Eligibility::Ineligible { reason } =
+        let Eligibility::Ineligible { reason, cause } =
             probe(mock.as_ref(), &CancellationToken::new()).await
         else {
             panic!("should be ineligible");
         };
         assert!(reason.contains("output budget"), "{reason}");
+        assert_eq!(cause, IneligibleCause::OutputBudget);
     }
 
     #[tokio::test]
@@ -1125,12 +1250,13 @@ mod tests {
     #[tokio::test]
     async fn probe_rejects_models_without_structured_verdicts() {
         let mock = Mock::new(vec![Step::Reply("Sure! The command lists files.")]);
-        let Eligibility::Ineligible { reason } =
+        let Eligibility::Ineligible { reason, cause } =
             probe(mock.as_ref(), &CancellationToken::new()).await
         else {
             panic!("should be ineligible");
         };
         assert!(reason.contains("structured verdict"));
+        assert_eq!(cause, IneligibleCause::NoVerdict);
         // Offline: ineligible, with the reason.
         let mock = Mock::new(vec![
             Step::Fail(JudgeError::Transient("connection refused".into())),
@@ -1140,8 +1266,49 @@ mod tests {
         ]);
         assert!(matches!(
             probe(mock.as_ref(), &CancellationToken::new()).await,
-            Eligibility::Ineligible { .. }
+            Eligibility::Ineligible {
+                cause: IneligibleCause::Unreachable,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn provider_errors_map_to_user_facing_causes() {
+        let cases = [
+            (
+                "ProviderResponseError: status 403 Forbidden: {\"error\":{\"code\":\"403\",\
+                 \"type\":\"access_denied\",\"message\":\"You have no permission\"}}",
+                IneligibleCause::Unauthorized,
+            ),
+            (
+                "HttpError: Invalid status code 401 Unauthorized with message: bad key",
+                IneligibleCause::Unauthorized,
+            ),
+            ("HTTP 404: model gpt-x not found", IneligibleCause::NotFound),
+            ("429 Too Many Requests", IneligibleCause::RateLimited),
+            (
+                "Invalid status code 500 Internal Server Error (the server returned an HTML error page)",
+                IneligibleCause::Unreachable,
+            ),
+            ("connection refused", IneligibleCause::Unreachable),
+            (
+                "status 400 Bad Request: max_tokens must be at most 4096",
+                IneligibleCause::Rejected,
+            ),
+            ("Incorrect API key provided", IneligibleCause::Unauthorized),
+            (
+                "unknown parameter: reasoning_effort",
+                IneligibleCause::Rejected,
+            ),
+        ];
+        for (detail, cause) in cases {
+            assert_eq!(
+                IneligibleCause::of_provider_error(detail),
+                cause,
+                "{detail}"
+            );
+        }
     }
 
     #[test]
@@ -1153,6 +1320,7 @@ mod tests {
             key.clone(),
             Eligibility::Ineligible {
                 reason: "offline".into(),
+                cause: IneligibleCause::Unreachable,
             },
         );
         // Cached: a probe failure stays ineligible, no re-probe per call.
@@ -1172,7 +1340,10 @@ mod tests {
     #[test]
     fn auto_resolution_matrix() {
         let eligible = Eligibility::Eligible(JudgeParams::default());
-        let ineligible = Eligibility::Ineligible { reason: "x".into() };
+        let ineligible = Eligibility::Ineligible {
+            reason: "x".into(),
+            cause: IneligibleCause::NoVerdict,
+        };
         // Two arms (ADR 08 §3): judged, or `ask` — which carries the jail
         // wherever a backend exists, so sandbox availability no longer
         // splits the ineligible case.
