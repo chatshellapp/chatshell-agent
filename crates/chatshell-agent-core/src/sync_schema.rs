@@ -59,7 +59,12 @@ pub const SYNC_SCHEMA_SQL: &str = include_str!("sync_schema.sql");
 /// platform ever wrote or read them. Skewed peers stay compatible because
 /// `merge_remote` skips tables a snapshot lacks and ignores tables outside
 /// its registry.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 6;
+///
+/// v7 added `skills.files_manifest` (the per-file list ChatShell's own
+/// skills ship their files by, as blobs) and redefined `skills.path` as the
+/// directory name relative to the source root. Older peers drop the column
+/// through intersection.
+pub const CANONICAL_SCHEMA_VERSION: i64 = 7;
 
 /// `meta` key holding [`CANONICAL_SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
