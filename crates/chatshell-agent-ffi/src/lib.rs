@@ -1545,8 +1545,7 @@ pub fn prepare_svg_figure(
 }
 
 /// The visual formats a client renders inline. Mirrors
-/// `chatshell_agent_core::visual_output::VisualCapabilities` minus `openui`:
-/// OpenUI blocks render only on desktop, so mobile clients never offer them.
+/// `chatshell_agent_core::visual_output::VisualCapabilities`.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct VisualCapabilities {
     /// ```svg fences render as figures (the user setting is on).
@@ -1555,6 +1554,10 @@ pub struct VisualCapabilities {
     pub mermaid: bool,
     /// `$...$` and `$$...$$` render as math.
     pub math: bool,
+    /// ```openui-lang fences render as charts and KPI cards (the client
+    /// draws `parse_openui_block` output and the user setting is on).
+    #[uniffi(default = false)]
+    pub openui: bool,
 }
 
 impl From<VisualCapabilities> for core::visual_output::VisualCapabilities {
@@ -1563,14 +1566,126 @@ impl From<VisualCapabilities> for core::visual_output::VisualCapabilities {
             svg: value.svg,
             mermaid: value.mermaid,
             math: value.math,
-            openui: false,
+            openui: value.openui,
         }
     }
 }
 
 /// System-prompt fragment routing content to the formats the client renders
-/// (Markdown tables, math, Mermaid, SVG figures).
+/// (Markdown tables, math, Mermaid, SVG figures, OpenUI blocks).
 #[uniffi::export]
 pub fn visual_output_prompt(capabilities: VisualCapabilities) -> String {
     core::visual_output::visual_output_prompt(&capabilities.into())
+}
+
+// ---------------------------------------------------------------------------
+// OpenUI blocks (core `openui`)
+// ---------------------------------------------------------------------------
+
+/// A parsed ```openui-lang block: a chart or a row of KPI cards.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum OpenUiBlock {
+    Chart { chart: OpenUiChart },
+    Stats { items: Vec<OpenUiStat> },
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OpenUiChart {
+    pub kind: OpenUiChartKind,
+    pub title: String,
+    pub labels: Vec<String>,
+    pub series: Vec<OpenUiSeries>,
+    pub description: Option<String>,
+    /// Only a variant valid for `kind`.
+    pub variant: Option<OpenUiChartVariant>,
+    /// Currency code or short suffix; prose units are already dropped.
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OpenUiChartKind {
+    Bar,
+    Line,
+    Area,
+    Pie,
+    Radar,
+    Radial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OpenUiChartVariant {
+    Stacked,
+    Horizontal,
+    Donut,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OpenUiSeries {
+    pub name: String,
+    pub values: Vec<f64>,
+    pub total: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OpenUiStat {
+    pub label: String,
+    pub value: String,
+    pub change: Option<String>,
+    pub note: Option<String>,
+}
+
+impl From<core::openui::OpenUiBlock> for OpenUiBlock {
+    fn from(value: core::openui::OpenUiBlock) -> Self {
+        use core::openui as o;
+        match value {
+            o::OpenUiBlock::Chart(chart) => Self::Chart {
+                chart: OpenUiChart {
+                    kind: match chart.kind {
+                        o::ChartKind::Bar => OpenUiChartKind::Bar,
+                        o::ChartKind::Line => OpenUiChartKind::Line,
+                        o::ChartKind::Area => OpenUiChartKind::Area,
+                        o::ChartKind::Pie => OpenUiChartKind::Pie,
+                        o::ChartKind::Radar => OpenUiChartKind::Radar,
+                        o::ChartKind::Radial => OpenUiChartKind::Radial,
+                    },
+                    title: chart.title,
+                    labels: chart.labels,
+                    series: chart
+                        .series
+                        .into_iter()
+                        .map(|s| OpenUiSeries {
+                            name: s.name,
+                            values: s.values,
+                            total: s.total,
+                        })
+                        .collect(),
+                    description: chart.description,
+                    variant: chart.variant.map(|v| match v {
+                        o::ChartVariant::Stacked => OpenUiChartVariant::Stacked,
+                        o::ChartVariant::Horizontal => OpenUiChartVariant::Horizontal,
+                        o::ChartVariant::Donut => OpenUiChartVariant::Donut,
+                    }),
+                    unit: chart.unit,
+                },
+            },
+            o::OpenUiBlock::Stats(items) => Self::Stats {
+                items: items
+                    .into_iter()
+                    .map(|s| OpenUiStat {
+                        label: s.label,
+                        value: s.value,
+                        change: s.change,
+                        note: s.note,
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Parse a ```openui-lang fence body (possibly still streaming). `None`
+/// when nothing is drawable yet or the program is not ChatShell's library.
+#[uniffi::export]
+pub fn parse_openui_block(source: String) -> Option<OpenUiBlock> {
+    core::openui::parse_openui_block(&source).map(Into::into)
 }

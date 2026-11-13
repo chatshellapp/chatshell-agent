@@ -32,7 +32,7 @@ pub struct VisualCapabilities {
 }
 
 /// The OpenUI library section, generated from the desktop renderer's library.
-const OPENUI_PROMPT: &str = include_str!("openui_prompt.txt");
+pub(crate) const OPENUI_PROMPT: &str = include_str!("openui_prompt.txt");
 
 const INTRO: &str = "\
 Visual output: choose the format by what the content is; the first rule that \
