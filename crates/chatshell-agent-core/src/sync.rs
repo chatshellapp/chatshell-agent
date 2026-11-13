@@ -37,6 +37,13 @@ pub struct TableSpec {
     /// conflict clause drops the remote copy instead of failing the merge.
     /// First-seen wins; later edits still propagate through the pk clause.
     pub natural_key: Option<&'static str>,
+    /// Row-level exchange filter for tables that mix synced and
+    /// device-local rows. Given a row alias and the schema the row lives in
+    /// (`main` or `remote_db`), returns a SQL predicate that holds for rows
+    /// that travel between devices. Rows failing it are never merged in and
+    /// never count as unshipped local rows, so a device-local row can
+    /// neither leak to peers nor trigger a republish loop.
+    pub exchange_filter: Option<fn(alias: &str, schema: &str) -> String>,
 }
 
 const fn t(name: &'static str) -> TableSpec {
@@ -45,6 +52,7 @@ const fn t(name: &'static str) -> TableSpec {
         pk: "id",
         mutable: true,
         natural_key: None,
+        exchange_filter: None,
     }
 }
 
@@ -57,6 +65,7 @@ const fn immut(name: &'static str) -> TableSpec {
         pk: "id",
         mutable: false,
         natural_key: None,
+        exchange_filter: None,
     }
 }
 
@@ -66,6 +75,7 @@ const fn tpk(name: &'static str, pk: &'static str) -> TableSpec {
         pk,
         mutable: true,
         natural_key: None,
+        exchange_filter: None,
     }
 }
 
@@ -75,6 +85,37 @@ const fn tnk(name: &'static str, natural_key: &'static str) -> TableSpec {
         natural_key: Some(natural_key),
         ..t(name)
     }
+}
+
+/// Skill sources whose rows sync between devices. ChatShell's own skills
+/// (`user`) travel with their files as blobs; `builtin` skills ship with
+/// every app build. Skills discovered in other agents' directories
+/// (`~/.claude/skills`, `~/.agents/skills`, ...) belong to the device that
+/// found them: peers cannot resolve their files, and a peer treating such a
+/// row as stale would tombstone it for every device.
+pub const SYNCED_SKILL_SOURCES: &[&str] = &["user", "builtin"];
+
+fn synced_skill_sources_sql() -> String {
+    SYNCED_SKILL_SOURCES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `skills` exchange filter: only synced sources travel.
+fn skills_exchange_filter(alias: &str, _schema: &str) -> String {
+    format!("{alias}.source IN ({})", synced_skill_sources_sql())
+}
+
+/// `assistant_skills` exchange filter: a link travels only when its skill
+/// does (looked up in the same database as the link row).
+fn assistant_skills_exchange_filter(alias: &str, schema: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM {schema}.skills s \
+         WHERE s.id = {alias}.skill_id AND s.source IN ({}))",
+        synced_skill_sources_sql()
+    )
 }
 
 /// Production merge registry, ordered parents-first so FK constraints hold
@@ -92,7 +133,10 @@ pub const PRODUCTION_MERGE_TABLES: &[TableSpec] = &[
     tnk("model_parameter_presets", "name"),
     t("assistants"),
     t("tools"),
-    tnk("skills", "name, source"),
+    TableSpec {
+        exchange_filter: Some(skills_exchange_filter),
+        ..tnk("skills", "name, source")
+    },
     t("prompts"),
     tpk("settings", "key"),
     t("fetch_results"),
@@ -112,7 +156,10 @@ pub const PRODUCTION_MERGE_TABLES: &[TableSpec] = &[
     tnk("message_attachments", "message_id, attachment_id"),
     tnk("message_contexts", "message_id, context_type, context_id"),
     tnk("assistant_tools", "assistant_id, tool_id"),
-    tnk("assistant_skills", "assistant_id, skill_id"),
+    TableSpec {
+        exchange_filter: Some(assistant_skills_exchange_filter),
+        ..tnk("assistant_skills", "assistant_id, skill_id")
+    },
     tpk("conversation_settings", "conversation_id"),
     tnk(
         "conversation_participants",
@@ -357,13 +404,20 @@ pub fn merge_remote(
             // locally (after this registry's parents-first pass) are
             // excluded from the INSERT instead of aborting it with
             // SQLITE_CONSTRAINT_FOREIGNKEY — see [`fk_guards`].
-            let guards = fk_guards(local, spec.name)?;
-            let guard_conjunction = guards.join(" AND ");
-            if !guards.is_empty() {
+            let fk = fk_guards(local, spec.name)?;
+            // Device-local rows (exchange filter) are excluded before the FK
+            // orphan count: they are withheld by design, not orphaned.
+            let exchange = spec.exchange_filter.map(|f| f("r", "remote_db"));
+            let exchange_conj = exchange
+                .as_deref()
+                .map(|e| format!(" AND ({e})"))
+                .unwrap_or_default();
+            if !fk.is_empty() {
+                let fk_conjunction = fk.join(" AND ");
                 let orphaned: i64 = local.query_row(
                     &format!(
                         "SELECT COUNT(*) FROM remote_db.{name} r \
-                         WHERE NOT ({guard_conjunction})",
+                         WHERE NOT ({fk_conjunction}){exchange_conj}",
                         name = spec.name
                     ),
                     [],
@@ -378,6 +432,8 @@ pub fn merge_remote(
                     );
                 }
             }
+            let guards: Vec<String> = exchange.into_iter().chain(fk).collect();
+            let guard_conjunction = guards.join(" AND ");
             let src = format!("SELECT {col_list} FROM remote_db.{} r", spec.name);
             // The mutable upsert already opens with `WHERE true` (upsert
             // parse disambiguation); the immutable INSERT OR IGNORE takes
@@ -804,9 +860,14 @@ fn local_rows_absent_from_remote(
                     }
                 })
                 .unwrap_or_default();
+            // Device-local rows never ship, so they are never "missing".
+            let exchange = spec
+                .exchange_filter
+                .map(|f| format!("({}) AND ", f("m", "main")))
+                .unwrap_or_default();
             let n: i64 = local.query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM main.{name} m WHERE NOT ( \
+                    "SELECT COUNT(*) FROM main.{name} m WHERE {exchange}NOT ( \
                      EXISTS (SELECT 1 FROM remote_db.{name} r \
                              WHERE r.{pk} = m.{pk}{freshness}){natural})",
                     name = spec.name,
@@ -1910,6 +1971,115 @@ CREATE TABLE conversations (
             out_b.action, "converged",
             "twin counts as present: {out_b:?}"
         );
+        for _ in 0..3 {
+            assert!(!a.sync_now().unwrap().republished);
+            assert!(!b.sync_now().unwrap().republished);
+        }
+    }
+
+    /// Skills from other agents' directories stay on the device that found
+    /// them: neither the row nor its assistant link merges into a peer, and
+    /// the withheld rows never read as "unshipped" (no republish loop).
+    #[test]
+    fn device_local_skills_never_leave_their_device() {
+        static TABLES: &[TableSpec] = &[
+            t("assistants"),
+            TableSpec {
+                exchange_filter: Some(skills_exchange_filter),
+                ..tnk("skills", "name, source")
+            },
+            TableSpec {
+                exchange_filter: Some(assistant_skills_exchange_filter),
+                ..tnk("assistant_skills", "assistant_id, skill_id")
+            },
+        ];
+        let space = dir("device-local-skills");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let ts = "2026-11-12T10:00:00+00:00";
+        let make = |name: &str| -> PathBuf {
+            let path = space.path().join(format!("{name}.db"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL);
+                 CREATE TABLE assistants (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL, deleted_at TEXT);
+                 CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+                 source TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, \
+                 UNIQUE(name, source));
+                 CREATE TABLE assistant_skills (id TEXT PRIMARY KEY, \
+                 assistant_id TEXT NOT NULL REFERENCES assistants(id), \
+                 skill_id TEXT NOT NULL REFERENCES skills(id), \
+                 updated_at TEXT NOT NULL, deleted_at TEXT, \
+                 UNIQUE(assistant_id, skill_id));",
+            )
+            .unwrap();
+            path
+        };
+        let a_path = make("a");
+        let b_path = make("b");
+        {
+            let a = Connection::open(&a_path).unwrap();
+            a.execute(
+                "INSERT INTO assistants VALUES ('as-1', 'Writer', ?1, NULL)",
+                [ts],
+            )
+            .unwrap();
+            for (id, name, source) in [
+                ("sk-user", "notes", "user"),
+                ("sk-builtin", "skill-installer", "builtin"),
+                ("sk-claude", "pdf", "claude"),
+                ("sk-agents", "review", "agents"),
+            ] {
+                a.execute(
+                    "INSERT INTO skills VALUES (?1, ?2, ?3, ?4, NULL)",
+                    rusqlite::params![id, name, source, ts],
+                )
+                .unwrap();
+                a.execute(
+                    "INSERT INTO assistant_skills VALUES (?1, 'as-1', ?2, ?3, NULL)",
+                    rusqlite::params![format!("link-{id}"), id, ts],
+                )
+                .unwrap();
+            }
+        }
+        let engine = |p: &Path, tag: &str| {
+            let mut e = SyncEngine::new_with_tables(
+                p,
+                cloud.clone(),
+                space.path().join(format!("cache-{tag}")),
+                None,
+                TABLES,
+            )
+            .unwrap();
+            e.min_publish_interval = std::time::Duration::ZERO;
+            e
+        };
+        let mut a = engine(&a_path, "a");
+        let mut b = engine(&b_path, "b");
+        a.sync_now().unwrap();
+        b.sync_now().unwrap();
+
+        let b_conn = Connection::open(&b_path).unwrap();
+        let ids = |sql: &str| -> Vec<String> {
+            let mut stmt = b_conn.prepare(sql).unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            ids("SELECT id FROM skills ORDER BY id"),
+            vec!["sk-builtin", "sk-user"]
+        );
+        assert_eq!(
+            ids("SELECT skill_id FROM assistant_skills ORDER BY skill_id"),
+            vec!["sk-builtin", "sk-user"]
+        );
+
+        // B republishes without A's device-local rows; A must not read that
+        // as unshipped local rows and republish forever.
         for _ in 0..3 {
             assert!(!a.sync_now().unwrap().republished);
             assert!(!b.sync_now().unwrap().republished);

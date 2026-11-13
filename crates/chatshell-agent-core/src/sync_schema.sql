@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS skills (
     content_hash TEXT,
     cached_instructions TEXT,
     is_enabled INTEGER DEFAULT 1,
+    files_manifest TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     deleted_at TEXT,
