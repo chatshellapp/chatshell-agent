@@ -125,6 +125,8 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cancelled: bool,
+        /// The reply stopped at `max_tokens` and is partial.
+        output_limited: bool,
     },
 }
 
@@ -838,12 +840,14 @@ impl From<core::AgentEvent> for AgentEvent {
                 input_tokens,
                 output_tokens,
                 cancelled,
+                output_limited,
             } => Self::Completed {
                 content,
                 reasoning,
                 input_tokens,
                 output_tokens,
                 cancelled,
+                output_limited,
             },
         }
     }

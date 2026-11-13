@@ -129,6 +129,9 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cancelled: bool,
+        /// The last model call stopped at `max_tokens`: the reply is partial
+        /// and should be shown as cut off, not as a finished answer.
+        output_limited: bool,
     },
 }
 
