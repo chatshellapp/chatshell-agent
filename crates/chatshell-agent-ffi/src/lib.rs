@@ -1,5 +1,6 @@
 #[cfg(target_os = "android")]
 mod android_tls;
+mod documents;
 
 use std::collections::HashMap;
 use std::sync::Arc;
