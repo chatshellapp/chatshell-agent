@@ -623,18 +623,29 @@ pub fn publish_snapshot_compressed(conn: &Connection, target: &Path, staging: &P
     Ok(())
 }
 
-/// The header's `sync_version`: `<counter>:<blake3_hex(device_id)>`. The DB
-/// meta table keeps the full device id; the header hashes it so the
-/// provider sees no device census or per-device activity timeline
-/// (ADR 04 §4).
+/// The header's `sync_version`: the in-DB version id with its device part
+/// hashed, `<counter>:<blake3_hex(id)>`, so the provider sees no device
+/// census or per-device activity timeline (ADR 04 §4).
+///
+/// The hashed id is the one carried by the VERSION STRING, not this
+/// device's `device_id` meta: a device that adopted a peer's version and
+/// republishes it unchanged ships the peer's content under the peer's id.
+/// [`plan_sync_header`] hashes the version-string id on the reading side,
+/// so hashing the publisher's own id here made such a republish look like
+/// divergent content (and its staged meta disagree with its own header).
 fn hashed_sync_version(conn: &Connection) -> Result<String> {
     let version = get_meta(conn, META_SYNC_VERSION)?.unwrap_or_else(|| "0:none".into());
-    let device = get_meta(conn, META_DEVICE_ID)?.unwrap_or_else(|| "none".into());
-    Ok(format!(
+    Ok(hash_version_id(&version))
+}
+
+/// `<counter>:<id>` -> `<counter>:<blake3_hex(id)>` (the header form).
+fn hash_version_id(version: &str) -> String {
+    let id = version.split_once(':').map(|(_, id)| id).unwrap_or("");
+    format!(
         "{}:{}",
-        counter_of(&version),
-        crate::crypto::blake3_hex(device.as_bytes())
-    ))
+        counter_of(version),
+        crate::crypto::blake3_hex(id.as_bytes())
+    )
 }
 
 /// Canonical schema version for the header; falls back to the built-in
@@ -1026,6 +1037,10 @@ pub struct SyncEngine {
     force_first_flush: bool,
     /// Age threshold for [`sweep_stale_staged`]; tests shrink it to zero.
     staged_max_age: std::time::Duration,
+    /// Test hook run between the encrypted header probe and the full
+    /// artifact read, to simulate the provider swapping file versions.
+    #[cfg(test)]
+    after_header_probe: Option<Box<dyn FnMut() + Send>>,
 }
 /// Meta key recording whether the previous process ended with a successful
 /// publish (diagnostic only; the forced-flush decision uses
@@ -1193,6 +1208,8 @@ impl SyncEngine {
             last_publish_at: None,
             force_first_flush: false,
             staged_max_age: STALE_STAGED_AGE,
+            #[cfg(test)]
+            after_header_probe: None,
         };
         engine.ensure_device_id()?;
         // Cross-process unshipped-write detection (audit F2, fixed
@@ -1455,8 +1472,46 @@ impl SyncEngine {
             match action {
                 SyncAction::UpToDate => self.up_to_date_tail(manual),
                 SyncAction::Adopt | SyncAction::Merge => {
-                    let staged = self.stage_encrypted(&enc)?;
-                    let outcome = self.merge_against_staged(&staged, Some(&header), action, manual);
+                    // The header probe and the full read are two opens of
+                    // a file the cloud provider replaces in place. When it
+                    // swaps versions in between (two devices published
+                    // from the same base and the provider is resolving the
+                    // conflict), the payload belongs to a different
+                    // artifact than the probed header. Planning and the
+                    // merged-remote marker must follow the header of the
+                    // bytes actually decrypted: recording the probed
+                    // header after merging other content marked a peer's
+                    // artifact as merged while its rows never arrived, so
+                    // every later pass skipped it (real-device finding
+                    // 2026-11-13: an iOS conversation stranded this way).
+                    #[cfg(test)]
+                    if let Some(hook) = self.after_header_probe.as_mut() {
+                        hook();
+                    }
+                    let (staged, staged_header) = self.stage_encrypted(&enc)?;
+                    let outcome = if staged_header == header {
+                        self.merge_against_staged(&staged, Some(&header), action, manual)
+                    } else {
+                        tracing::warn!(
+                            probed = %header.sync_version,
+                            read = %staged_header.sync_version,
+                            "cloud artifact changed between the header probe and \
+                             the full read; planning from the bytes read"
+                        );
+                        if let Some(crypto) = self.crypto.as_mut() {
+                            crypto.adopt_slot_from(&staged_header);
+                        }
+                        match plan_sync_header(&self.conn, &staged_header) {
+                            Ok(SyncAction::UpToDate) => self.up_to_date_tail(manual),
+                            Ok(action) => self.merge_against_staged(
+                                &staged,
+                                Some(&staged_header),
+                                action,
+                                manual,
+                            ),
+                            Err(err) => Err(err),
+                        }
+                    };
                     let _ = std::fs::remove_file(&staged);
                     outcome
                 }
@@ -1485,9 +1540,10 @@ impl SyncEngine {
     }
 
     /// Decrypt + decompress the encrypted artifact into the app-private
-    /// cache dir (never the OS temp dir). The staged file is removed by the
-    /// caller after the pass.
-    fn stage_encrypted(&self, enc: &Path) -> Result<PathBuf> {
+    /// cache dir (never the OS temp dir). Returns the staged path together
+    /// with the header parsed from the SAME bytes that were decrypted. The
+    /// staged file is removed by the caller after the pass.
+    fn stage_encrypted(&self, enc: &Path) -> Result<(PathBuf, ArtifactHeader)> {
         let Some(crypto) = self.crypto.as_ref() else {
             bail!("stage_encrypted without crypto state");
         };
@@ -1510,7 +1566,7 @@ impl SyncEngine {
             .with_context(|| format!("create staged snapshot {}", plain.display()))?;
         zstd::stream::copy_decode(&zst[..], &mut out)
             .with_context(|| format!("zstd decompress into {}", plain.display()))?;
-        Ok(plain)
+        Ok((plain, parsed))
     }
 
     /// Resolve the cloud artifact to a readable plain SQLite path. Prefers
@@ -1574,14 +1630,16 @@ impl SyncEngine {
                 .as_ref()
                 .and_then(|c| get_meta(c, META_DEVICE_ID).ok().flatten())
                 .unwrap_or_default();
-            let staged_hash = crate::crypto::blake3_hex(staged_device.as_bytes());
-            let header_id = header
-                .sync_version
-                .split_once(':')
-                .map(|(_, id)| id)
-                .unwrap_or("");
-            if counter_of(&staged_version) != counter_of(&header.sync_version)
-                || staged_hash != header_id
+            // Publishers hash the version-string id (see
+            // `hashed_sync_version`); builds before that fix hashed their
+            // own `device_id` meta, which still describes the same bytes.
+            let legacy_form = format!(
+                "{}:{}",
+                counter_of(&staged_version),
+                crate::crypto::blake3_hex(staged_device.as_bytes())
+            );
+            if header.sync_version != hash_version_id(&staged_version)
+                && header.sync_version != legacy_form
             {
                 tracing::warn!(
                     staged = %staged_version,
@@ -2583,6 +2641,134 @@ CREATE TABLE conversations (
         crypto: sync_crypto::SyncCrypto,
     ) -> SyncEngine {
         SyncEngine::new_with_tables(db, cloud, cache, Some(crypto), ENGINE_TABLES).unwrap()
+    }
+
+    fn add_conv(engine: &SyncEngine, id: &str, title: &str) {
+        engine
+            .connection()
+            .execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) \
+                 VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ'), \
+                 strftime('%Y-%m-%dT%H:%M:%fZ'))",
+                rusqlite::params![id, title],
+            )
+            .unwrap();
+    }
+
+    fn has_conv(engine: &SyncEngine, id: &str) -> bool {
+        engine
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Real-device finding 2026-11-13: desktop and iOS both published
+    /// counter N+1 from base N. Desktop probed the iOS header, the provider
+    /// swapped the file back to desktop's own artifact before the full
+    /// read, and desktop recorded the iOS header as merged after merging
+    /// its own content. Once desktop republished ahead, the iOS artifact
+    /// read as an already-merged lower counter forever and its rows
+    /// stranded. The marker must follow the bytes actually decrypted.
+    #[test]
+    fn artifact_swapped_between_probe_and_read_does_not_strand_peer_rows() {
+        let space = dir("torn");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        seed(&a_path, "a1", "from A");
+        seed(&b_path, "b1", "from B");
+        let group = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("ca"),
+            group.clone(),
+        );
+        let mut b = encrypted_engine(&b_path, cloud.clone(), space.path().join("cb"), group);
+        a.min_publish_interval = std::time::Duration::ZERO;
+        b.min_publish_interval = std::time::Duration::ZERO;
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+
+        // Converge on one shared base.
+        a.sync_now().unwrap();
+        b.sync_now().unwrap();
+        a.sync_now().unwrap();
+        b.sync_now().unwrap();
+        assert_eq!(a.sync_now().unwrap().action, "up-to-date");
+        let base = std::fs::read(&enc).unwrap();
+
+        // Both devices publish N+1 from the same base.
+        add_conv(&a, "a2", "desktop write");
+        a.sync_now_manual().unwrap();
+        let from_a = std::fs::read(&enc).unwrap();
+        std::fs::write(&enc, &base).unwrap();
+        add_conv(&b, "b2", "ios write");
+        b.sync_now_manual().unwrap();
+        let from_b = std::fs::read(&enc).unwrap();
+
+        // A probes B's header, then the provider swaps A's own artifact in
+        // before the full read. A also holds an unshipped write, so the
+        // pass republishes ahead of both N+1 artifacts.
+        add_conv(&a, "a3", "unshipped desktop write");
+        let swap_target = enc.clone();
+        let own = from_a.clone();
+        a.after_header_probe = Some(Box::new(move || {
+            std::fs::write(&swap_target, &own).unwrap();
+        }));
+        a.sync_now_manual().unwrap();
+        a.after_header_probe = None;
+        assert!(!has_conv(&a, "b2"), "the swapped read carried A's content");
+
+        // The provider settles on B's artifact. A must still merge it.
+        std::fs::write(&enc, &from_b).unwrap();
+        let out = a.sync_now().unwrap();
+        assert!(out.rows_merged > 0, "peer artifact was skipped: {out:?}");
+        assert!(has_conv(&a, "b2"));
+    }
+
+    /// A device that adopted a peer's version republishes the peer's
+    /// content under the peer's id; the header must say so, or readers
+    /// treat the unchanged artifact as divergent content.
+    #[test]
+    fn adopted_republish_header_matches_its_content() {
+        let space = dir("adopted-header");
+        let a_path = space.path().join("a.db");
+        let b_path = space.path().join("b.db");
+        let cloud = space.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        seed(&a_path, "x", "shared");
+        seed(&b_path, "x", "shared");
+        let group = weak_crypto();
+        let mut a = encrypted_engine(
+            &a_path,
+            cloud.clone(),
+            space.path().join("ca"),
+            group.clone(),
+        );
+        a.sync_now().unwrap();
+        let a_version = get_meta(a.connection(), META_SYNC_VERSION)
+            .unwrap()
+            .unwrap();
+        let mut b = encrypted_engine(&b_path, cloud.clone(), space.path().join("cb"), group);
+        b.sync_now().unwrap();
+        assert_eq!(
+            get_meta(b.connection(), META_SYNC_VERSION)
+                .unwrap()
+                .unwrap(),
+            a_version,
+            "B adopted A's version"
+        );
+        b.publish().unwrap();
+        let enc = encrypted_snapshot_name(&cloud.join(SNAPSHOT_FILE));
+        let header = sync_crypto::read_artifact_header(&enc).unwrap();
+        assert_eq!(header.sync_version, hash_version_id(&a_version));
+        assert_eq!(a.sync_now().unwrap().action, "up-to-date");
     }
 
     #[test]
