@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use rig::agent::{Agent, AgentBuilder, ModelHandle, MultiTurnStreamItem};
 use rig::client::{CompletionClient, Nothing};
-use rig::completion::{CompletionModel, Message, ToolDefinition};
+use rig::completion::{CompletionModel, FinishReason, Message, ToolDefinition};
 use rig::message::{
     AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Reasoning,
     UserContent,
@@ -446,6 +446,7 @@ async fn stream_agent(
     let mut reasoning = String::new();
     let mut input_tokens = 0;
     let mut output_tokens = 0;
+    let mut output_limited = false;
 
     loop {
         let item = tokio::select! {
@@ -459,6 +460,7 @@ async fn stream_agent(
                         input_tokens,
                         output_tokens,
                         cancelled: true,
+                        output_limited: false,
                     },
                 ).await?;
                 return Ok(());
@@ -518,6 +520,10 @@ async fn stream_agent(
                 let usage = response.usage();
                 input_tokens = usage.input_tokens;
                 output_tokens = usage.output_tokens;
+                output_limited = response
+                    .completion_calls()
+                    .last()
+                    .is_some_and(|call| call.finish_reason == Some(FinishReason::Length));
                 for data_url in image_data_urls(response.content()) {
                     send_event(sender, AgentEvent::Image { data_url }).await?;
                 }
@@ -539,6 +545,7 @@ async fn stream_agent(
             input_tokens,
             output_tokens,
             cancelled: false,
+            output_limited,
         },
     )
     .await
@@ -641,6 +648,7 @@ async fn stream_agent_with_client_tools(
     let mut reasoning = String::new();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut output_limited = false;
 
     loop {
         let item = tokio::select! {
@@ -654,6 +662,7 @@ async fn stream_agent_with_client_tools(
                         input_tokens,
                         output_tokens,
                         cancelled: true,
+                        output_limited: false,
                     },
                 )
                 .await?;
@@ -710,6 +719,7 @@ async fn stream_agent_with_client_tools(
             Ok(StreamedAssistantContent::Final(final_resp)) => {
                 input_tokens = final_resp.usage.input_tokens;
                 output_tokens = final_resp.usage.output_tokens;
+                output_limited = final_resp.finish_reason == Some(FinishReason::Length);
             }
             Ok(_) => {}
             Err(error) => return Err(provider_error(error)),
@@ -728,6 +738,7 @@ async fn stream_agent_with_client_tools(
             input_tokens,
             output_tokens,
             cancelled: false,
+            output_limited,
         },
     )
     .await

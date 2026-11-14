@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod net_policy;
 pub mod office;
 pub mod openai_compat;
+pub mod openui;
 pub mod path_policy;
 pub mod pdf_images;
 pub mod pdf_text;
