@@ -950,6 +950,32 @@ mod os_sandbox_integration {
     }
 
     #[tokio::test]
+    async fn private_exceptions_are_readable_in_the_jail() {
+        let Some(f) = fixture(EscalationDecision::Deny) else {
+            return;
+        };
+        let private = f.outside.with_file_name("app-data-with-skills");
+        let skills = private.join("skills");
+        std::fs::create_dir_all(skills.join("notes")).unwrap();
+        std::fs::write(skills.join("notes/SKILL.md"), "SKILL-BODY").unwrap();
+        std::fs::write(private.join("data.db"), "OTHER-CONVERSATION").unwrap();
+        // Registered before the first command, which spawns the session.
+        crate::path_policy::register_private_dir(&private);
+        crate::path_policy::register_private_exception(&skills);
+        let out = run(
+            &f.tool,
+            &format!(
+                "cat '{}'; cat '{}'",
+                skills.join("notes/SKILL.md").display(),
+                private.join("data.db").display()
+            ),
+        )
+        .await;
+        assert!(out.contains("SKILL-BODY"), "{out}");
+        assert!(!out.contains("OTHER-CONVERSATION"), "{out}");
+    }
+
+    #[tokio::test]
     async fn git_hooks_stay_read_only() {
         let Some(f) = fixture(EscalationDecision::Deny) else {
             return;

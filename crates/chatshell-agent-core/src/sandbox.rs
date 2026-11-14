@@ -169,6 +169,11 @@ pub struct SandboxPolicy {
     /// Extra directories that must not be read (the host's own data
     /// directory; see `path_policy::register_private_dir`).
     pub private_dirs: Vec<PathBuf>,
+    /// Subtrees of `private_dirs` that stay readable (see
+    /// `path_policy::register_private_exception`). Writes there are not
+    /// granted: they fail in the jail and escalate like any other write
+    /// outside the writable roots.
+    pub private_exceptions: Vec<PathBuf>,
     /// The temp channel: the conversation scratch directory when literal
     /// `/tmp` is writable inside the jail. Linux binds the scratch over
     /// `/tmp` (`/tmp` *is* the scratch); macOS cannot mount, so it allows
@@ -229,6 +234,7 @@ impl SandboxPolicy {
             allow_network,
             home: dirs::home_dir(),
             private_dirs: crate::path_policy::private_dirs(),
+            private_exceptions: crate::path_policy::private_exceptions(),
             temp_scratch,
         }
     }
@@ -288,6 +294,9 @@ struct ReadDenies {
     names: Vec<&'static str>,
     /// File-name prefixes denied anywhere, with exempt names.
     prefixes: Vec<(&'static str, &'static [&'static str])>,
+    /// Private directories denied except for the listed subtrees
+    /// (kernel spelling).
+    carved: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
 fn read_denies(policy: &SandboxPolicy, roots: &[PathBuf]) -> ReadDenies {
@@ -310,15 +319,33 @@ fn read_denies(policy: &SandboxPolicy, roots: &[PathBuf]) -> ReadDenies {
             }
         }
     }
-    denies
-        .paths
-        .extend(policy.private_dirs.iter().map(|dir| resolved(dir)));
+    let exceptions: Vec<PathBuf> = policy
+        .private_exceptions
+        .iter()
+        .map(|dir| resolved(dir))
+        .collect();
+    for dir in &policy.private_dirs {
+        let dir = resolved(dir);
+        let open: Vec<PathBuf> = exceptions
+            .iter()
+            .filter(|exception| exception.starts_with(&dir) && **exception != dir)
+            .cloned()
+            .collect();
+        if open.is_empty() {
+            denies.paths.push(dir);
+        } else {
+            denies.carved.push((dir, open));
+        }
+    }
     // A deny covering a writable root would make the workspace itself
     // unreadable (and, under bubblewrap, hide it): skip it. The file
     // tools still refuse those paths.
     denies
         .paths
         .retain(|deny| !roots.iter().any(|root| root.starts_with(deny)));
+    denies
+        .carved
+        .retain(|(deny, _)| !roots.iter().any(|root| root.starts_with(deny)));
     denies.paths.sort();
     denies.paths.dedup();
     denies
@@ -537,6 +564,18 @@ fn seatbelt_profile(policy: &SandboxPolicy, roots: &[PathBuf]) -> SeatbeltBuilde
         b.profile
             .push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
     }
+    // Private directories with open subtrees: one deny that excludes them,
+    // so no allow rule can reopen anything another deny closed.
+    for (path, open) in denies.carved {
+        let name = b.param("READ_DENY", path);
+        let mut rule = format!("(deny file-read* (require-all (subpath (param \"{name}\"))");
+        for exception in open {
+            let name = b.param("READ_OPEN", exception);
+            rule.push_str(&format!(" (require-not (subpath (param \"{name}\")))"));
+        }
+        rule.push_str("))\n");
+        b.profile.push_str(&rule);
+    }
     b
 }
 
@@ -704,6 +743,12 @@ fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathB
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()))
         .cloned()
         .collect();
+    // bubblewrap cannot mount inside a masked directory, so a private
+    // directory with open subtrees is masked entry by entry around them
+    // (its entry names stay listable).
+    for (dir, open) in &denies.carved {
+        mask_around(dir, open, &mut masks);
+    }
     let mut budget = MASK_SCAN_LIMIT;
     for root in roots {
         scan_blocked_names(&denies, root, 0, &mut budget, &mut masks);
@@ -720,6 +765,26 @@ fn bubblewrap_read_masks(policy: &SandboxPolicy, roots: &[PathBuf]) -> Vec<PathB
         }
     }
     kept
+}
+
+/// Mask every entry of `dir` except the `open` subtrees (descending into
+/// entries that contain one).
+fn mask_around(dir: &Path, open: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if open.contains(&path) {
+            continue;
+        }
+        let is_real_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_real_dir && open.iter().any(|o| o.starts_with(&path)) {
+            mask_around(&path, open, out);
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 fn scan_blocked_names(
@@ -810,6 +875,7 @@ mod tests {
             allow_network: network,
             home: Some(PathBuf::from("/Users/tester")),
             private_dirs: Vec::new(),
+            private_exceptions: Vec::new(),
             temp_scratch: None,
         }
     }
@@ -1061,6 +1127,69 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("READ_DENY_") && a.ends_with(&base_deny))
         );
+    }
+
+    #[test]
+    fn private_exceptions_are_carved_out_of_the_seatbelt_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let app_data = base.join("app-data");
+        let skills = app_data.join("skills");
+        let mut p = policy(&root, false);
+        p.private_dirs = vec![app_data.clone()];
+        p.private_exceptions = vec![skills.clone(), base.join("unrelated")];
+        let profile = seatbelt_profile(&p, &[root]);
+        let param = |prefix: &str, path: &Path| {
+            profile
+                .params
+                .iter()
+                .find(|(n, p)| n.starts_with(prefix) && p == path)
+                .map(|(n, _)| n.clone())
+                .unwrap()
+        };
+        let deny = param("READ_DENY", &app_data);
+        let open = param("READ_OPEN", &skills);
+        assert!(
+            profile.profile.contains(&format!(
+                "(deny file-read* (require-all (subpath (param \"{deny}\")) (require-not (subpath (param \"{open}\")))))"
+            )),
+            "{}",
+            profile.profile
+        );
+        // No plain deny of the whole directory, and nothing is allowed.
+        assert!(
+            !profile
+                .profile
+                .contains(&format!("(deny file-read* (subpath (param \"{deny}\")))"))
+        );
+        assert!(
+            !profile
+                .profile
+                .contains("(allow file-read* (subpath (param \"READ_OPEN")
+        );
+    }
+
+    #[test]
+    fn bubblewrap_masks_around_private_exceptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("work");
+        let app_data = base.join("app-data");
+        let skills = app_data.join("skills");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(skills.join("notes")).unwrap();
+        std::fs::create_dir_all(app_data.join("logs")).unwrap();
+        std::fs::write(app_data.join("data.db"), "x").unwrap();
+        let mut p = policy(&root, false);
+        p.private_dirs = vec![app_data.clone()];
+        p.private_exceptions = vec![skills.clone()];
+        let masks = bubblewrap_read_masks(&p, &[root]);
+        assert!(masks.contains(&app_data.join("data.db")), "{masks:?}");
+        assert!(masks.contains(&app_data.join("logs")), "{masks:?}");
+        assert!(!masks.iter().any(|m| m.starts_with(&skills)), "{masks:?}");
+        assert!(!masks.contains(&app_data), "{masks:?}");
     }
 
     #[test]

@@ -296,6 +296,47 @@ pub fn private_dirs() -> Vec<PathBuf> {
         .clone()
 }
 
+/// Subdirectories of private directories the agent may use like any other
+/// path (ChatShell's skills folder inside its data directory): reads and
+/// writes there follow the ordinary rules instead of the private deny.
+static PRIVATE_EXCEPTIONS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// Register a directory inside a private directory that stays open to the
+/// agent. Only the subtree is opened; the rest of the private directory,
+/// and any private directory nested inside the exception, stay closed.
+pub fn register_private_exception(dir: &Path) {
+    let mut dirs = PRIVATE_EXCEPTIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = normalize_path(dir);
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+/// The registered private exceptions.
+pub fn private_exceptions() -> Vec<PathBuf> {
+    PRIVATE_EXCEPTIONS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// The private directory `path` falls in, if any: a private directory that
+/// contains it, unless an exception inside that directory also contains it.
+fn private_match<'a>(
+    private: &'a [PathBuf],
+    exceptions: &[PathBuf],
+    path: &Path,
+) -> Option<&'a PathBuf> {
+    private.iter().find(|dir| {
+        path.starts_with(dir)
+            && !exceptions
+                .iter()
+                .any(|exception| exception.starts_with(dir) && path.starts_with(exception))
+    })
+}
+
 /// The deny groups that apply on this platform.
 pub fn active_read_groups() -> impl Iterator<Item = &'static DenyGroup> {
     READ_DENY_GROUPS.iter().filter(|g| g.platform.current())
@@ -333,6 +374,8 @@ pub struct ReadClassifier {
     /// Absolute entries with their symlink-resolved spelling.
     absolutes: Vec<(&'static str, Option<PathBuf>)>,
     private: Vec<PathBuf>,
+    /// Subtrees of `private` that stay open (see [`register_private_exception`]).
+    exceptions: Vec<PathBuf>,
 }
 
 impl Default for ReadClassifier {
@@ -343,10 +386,10 @@ impl Default for ReadClassifier {
 
 impl ReadClassifier {
     pub fn new() -> Self {
-        Self::with(home_dir().as_deref(), private_dirs())
+        Self::with(home_dir().as_deref(), private_dirs(), private_exceptions())
     }
 
-    fn with(home: Option<&Path>, private: Vec<PathBuf>) -> Self {
+    fn with(home: Option<&Path>, private: Vec<PathBuf>, exceptions: Vec<PathBuf>) -> Self {
         let homes = home
             .into_iter()
             .flat_map(|home| {
@@ -366,6 +409,7 @@ impl ReadClassifier {
             homes,
             absolutes,
             private,
+            exceptions,
         }
     }
 
@@ -382,19 +426,11 @@ impl ReadClassifier {
     /// produced by a walk that does not follow links, under a root that
     /// was itself classified with [`ReadClassifier::classify`]).
     pub fn classify_lexical(&self, path: &Path) -> Option<ReadBlock> {
-        let mut best = None;
-        for dir in &self.private {
-            if path.starts_with(dir) {
-                best = stricter(
-                    best,
-                    Some(ReadBlock {
-                        tier: ReadTier::Deny,
-                        label: PRIVATE_DIR_LABEL,
-                        matched: dir.display().to_string(),
-                    }),
-                );
-            }
-        }
+        let mut best = private_match(&self.private, &self.exceptions, path).map(|dir| ReadBlock {
+            tier: ReadTier::Deny,
+            label: PRIVATE_DIR_LABEL,
+            matched: dir.display().to_string(),
+        });
         for group in active_read_groups() {
             for entry in group.entries {
                 if let Some(matched) = self.entry_matches(entry, path) {
@@ -422,7 +458,7 @@ impl ReadClassifier {
     }
 
     fn classify_write_lexical(&self, path: &Path) -> Option<WriteBlock> {
-        if let Some(dir) = self.private.iter().find(|dir| path.starts_with(dir)) {
+        if let Some(dir) = private_match(&self.private, &self.exceptions, path) {
             return Some(WriteBlock {
                 label: PRIVATE_DIR_LABEL,
                 matched: dir.display().to_string(),
@@ -983,7 +1019,7 @@ mod tests {
                 .unwrap();
             std::os::unix::fs::symlink(home.join(".zshrc"), project.join("rc")).unwrap();
             std::os::unix::fs::symlink(home.join(".aws"), project.join("cloud")).unwrap();
-            let policy = ReadClassifier::with(Some(&home), Vec::new());
+            let policy = ReadClassifier::with(Some(&home), Vec::new(), Vec::new());
             assert_eq!(
                 policy.classify(&project.join("notes")).unwrap().tier,
                 ReadTier::Deny
@@ -1007,11 +1043,56 @@ mod tests {
     fn private_dirs_are_denied() {
         let dir = tempfile::tempdir().unwrap();
         let private = dir.path().join("app-data");
-        let policy = ReadClassifier::with(None, vec![private.clone()]);
+        let policy = ReadClassifier::with(None, vec![private.clone()], Vec::new());
         let block = policy.classify(&private.join("data.db")).unwrap();
         assert_eq!(block.tier, ReadTier::Deny);
         assert_eq!(block.label, PRIVATE_DIR_LABEL);
         assert!(policy.classify(&dir.path().join("app-data-2/x")).is_none());
+    }
+
+    #[test]
+    fn private_exceptions_open_only_their_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("app-data");
+        let skills = private.join("skills");
+        let nested = skills.join("inner-private");
+        let elsewhere = dir.path().join("elsewhere");
+        let policy = ReadClassifier::with(
+            None,
+            vec![private.clone(), nested.clone()],
+            vec![skills.clone(), elsewhere],
+        );
+        assert!(policy.classify(&skills.join("notes/SKILL.md")).is_none());
+        assert!(
+            policy
+                .classify_write(&skills.join("new/SKILL.md"))
+                .is_none()
+        );
+        // The rest of the private directory stays closed.
+        assert_eq!(
+            policy.classify(&private.join("data.db")).unwrap().label,
+            PRIVATE_DIR_LABEL
+        );
+        assert!(policy.classify_write(&private.join("data.db")).is_some());
+        assert!(policy.classify(&private.join("skills-trash/x")).is_some());
+        // Escaping the exception lexically does not help.
+        assert!(policy.classify(&skills.join("../data.db")).is_some());
+        // A private directory nested inside the exception stays closed.
+        assert!(policy.classify(&nested.join("x")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_out_of_a_private_exception_stay_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().canonicalize().unwrap().join("app-data");
+        let skills = private.join("skills");
+        std::fs::create_dir_all(skills.join("notes")).unwrap();
+        std::fs::write(private.join("data.db"), "secret").unwrap();
+        std::os::unix::fs::symlink(private.join("data.db"), skills.join("notes/link")).unwrap();
+        let policy = ReadClassifier::with(None, vec![private.clone()], vec![skills.clone()]);
+        assert!(policy.classify(&skills.join("notes/link")).is_some());
+        assert!(policy.classify_write(&skills.join("notes/link")).is_some());
     }
 
     #[test]
@@ -1151,7 +1232,7 @@ mod tests {
     fn private_dir_writes_are_ask_tier() {
         let dir = tempfile::tempdir().unwrap();
         let private = dir.path().join("app-data");
-        let policy = ReadClassifier::with(None, vec![private.clone()]);
+        let policy = ReadClassifier::with(None, vec![private.clone()], Vec::new());
         let block = policy
             .classify_write(&private.join("permission_grants.db"))
             .unwrap();
