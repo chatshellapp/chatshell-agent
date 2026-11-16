@@ -374,9 +374,15 @@ fn to_rig_message(message: &ChatMessage) -> Message {
                 .tool_result_call_id
                 .clone()
                 .or_else(|| message.tool_call_id.clone());
-            let text = vec![rig::message::ToolResultContent::text(
-                message.content.clone(),
-            )];
+            // Hosts executing tools client-side return images as
+            // `data:image/...;base64,` lines (read tool pages, video
+            // frames); send those as image blocks, not base64 text.
+            let text =
+                crate::tool_images::tool_result_content(&message.content).unwrap_or_else(|| {
+                    vec![rig::message::ToolResultContent::text(
+                        message.content.clone(),
+                    )]
+                });
             let content = match call_id {
                 Some(call_id) if !call_id.is_empty() && !id.is_empty() => {
                     vec![UserContent::tool_result_with_call_id(
@@ -904,6 +910,31 @@ mod tests {
             matches!(rig_message, Message::User { .. }),
             "tool result should map to a User message"
         );
+    }
+
+    #[test]
+    fn tool_result_image_lines_become_image_blocks() {
+        let message = ChatMessage {
+            role: MessageRole::Tool,
+            content: "Page 1\ndata:image/png;base64,iVBORw0KGgo=".into(),
+            reasoning_content: None,
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: Some("call_1".into()),
+            tool_result_call_id: Some("call_1".into()),
+        };
+        let Message::User { content } = to_rig_message(&message) else {
+            panic!("tool result should map to a User message");
+        };
+        let Some(UserContent::ToolResult(result)) = content.first() else {
+            panic!("expected a tool result");
+        };
+        let blocks: Vec<_> = result.content.iter().collect();
+        assert_eq!(blocks.len(), 2, "text plus one image block");
+        assert!(matches!(
+            blocks[1],
+            rig::message::ToolResultContent::Image(_)
+        ));
     }
 
     #[test]
