@@ -231,7 +231,6 @@ pub struct ProviderRoute {
     pub key_required: bool,
     pub key_display: Option<String>,
     pub local_no_key: bool,
-    pub string_content_only: bool,
     pub default_api_style: Option<String>,
 }
 
@@ -988,7 +987,6 @@ impl From<core::provider_catalog::ProviderRoute> for ProviderRoute {
             key_required: value.key_required,
             key_display: value.key_display.map(str::to_string),
             local_no_key: value.local_no_key,
-            string_content_only: value.string_content_only,
             default_api_style: value.default_api_style.map(str::to_string),
         }
     }

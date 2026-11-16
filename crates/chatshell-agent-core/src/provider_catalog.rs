@@ -8,15 +8,13 @@
 //! - which core [`ProviderKind`] the provider maps to,
 //! - the default base URL (where one exists),
 //! - whether an API key is required and its display name for errors,
-//! - whether the provider requires string-only message content,
 //! - the default OpenAI API surface (`responses` vs `chat_completions`).
 //!
 //! Desktop consumes this table from `llm/agent_builder.rs` to dispatch
 //! construction; iOS consumes it through the `resolve_provider_route` FFI
 //! lookup exported by `chatshell-agent-ffi`.
 //!
-//! The legacy helpers [`default_base_url`] and [`is_string_content_only`]
-//! remain as thin queries over the table.
+//! The legacy helper [`default_base_url`] remains as a thin query over the table.
 
 use crate::types::ProviderKind;
 
@@ -64,9 +62,6 @@ pub struct ProviderRoute {
     pub key_display: Option<&'static str>,
     /// Local endpoints accept a missing key (placeholder `no-key`).
     pub local_no_key: bool,
-    /// Whether user message content must be serialized as a plain string
-    /// (see [`crate::openai_compat::CompletionModel::with_string_content_only`]).
-    pub string_content_only: bool,
     /// Default OpenAI API surface. `Some("responses")` or
     /// `Some("chat_completions")` for OpenAI-wire providers, `None` otherwise.
     pub default_api_style: Option<&'static str>,
@@ -80,7 +75,6 @@ const fn route(wire: Wire) -> ProviderRoute {
         key_required: true,
         key_display: None,
         local_no_key: false,
-        string_content_only: false,
         default_api_style: None,
     }
 }
@@ -173,7 +167,6 @@ const NAMED_ROUTES: &[(&str, ProviderRoute)] = &[
         ProviderRoute {
             kind: Some(ProviderKind::CustomOpenAi),
             key_display: Some("MiniMax"),
-            string_content_only: true,
             default_api_style: Some("chat_completions"),
             ..route(Wire::OpenAiCompat)
         },
@@ -183,7 +176,6 @@ const NAMED_ROUTES: &[(&str, ProviderRoute)] = &[
         ProviderRoute {
             kind: Some(ProviderKind::CustomOpenAi),
             key_display: Some("MiniMax CN"),
-            string_content_only: true,
             default_api_style: Some("chat_completions"),
             ..route(Wire::OpenAiCompat)
         },
@@ -200,7 +192,6 @@ const NAMED_ROUTES: &[(&str, ProviderRoute)] = &[
         "deepseek",
         ProviderRoute {
             key_display: Some("DeepSeek"),
-            string_content_only: true,
             ..route(Wire::RigNative)
         },
     ),
@@ -312,7 +303,6 @@ pub fn resolve(provider_type: &str) -> Option<ProviderRoute> {
         default_base_url: Some(url),
         key_required: !is_local,
         local_no_key: is_local,
-        string_content_only: is_string_content_only(provider_type),
         default_api_style: Some("chat_completions"),
         ..route(Wire::OpenAiCompat)
     })
@@ -323,15 +313,6 @@ pub fn resolve(provider_type: &str) -> Option<ProviderRoute> {
 /// (`cohere`, `deepseek`, `groq`, ...) return `None`.
 pub fn default_base_url(provider_type: &str) -> Option<&'static str> {
     resolve(provider_type)?.default_base_url
-}
-
-/// Whether a provider requires user message content serialized as a plain
-/// string (rejects structured content arrays).
-pub fn is_string_content_only(provider_type: &str) -> bool {
-    matches!(
-        provider_type,
-        "deepseek" | "baichuan" | "minimax" | "minimax_cn" | "xirang"
-    )
 }
 
 /// Default base URL for a core [`ProviderKind`], sourcing the named rows.
@@ -382,20 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn string_content_only_providers_flagged() {
-        for provider in ["deepseek", "baichuan", "minimax", "minimax_cn", "xirang"] {
-            assert!(is_string_content_only(provider), "{provider}");
-            assert!(resolve(provider).unwrap().string_content_only, "{provider}");
-        }
-    }
-
-    #[test]
-    fn array_capable_providers_not_flagged() {
-        assert!(!is_string_content_only("openai"));
-        assert!(!is_string_content_only("groq"));
-    }
-
-    #[test]
     fn named_routes_golden() {
         let openai = resolve("openai").unwrap();
         assert_eq!(openai.wire, Wire::Responses);
@@ -403,7 +370,6 @@ mod tests {
         assert_eq!(openai.default_base_url, Some("https://api.openai.com/v1"));
         assert_eq!(openai.key_display, Some("OpenAI"));
         assert_eq!(openai.default_api_style, Some("responses"));
-        assert!(!openai.string_content_only);
 
         let anthropic = resolve("anthropic").unwrap();
         assert_eq!(anthropic.wire, Wire::Anthropic);
@@ -449,7 +415,6 @@ mod tests {
         let minimax = resolve("minimax").unwrap();
         assert_eq!(minimax.wire, Wire::OpenAiCompat);
         assert_eq!(minimax.default_api_style, Some("chat_completions"));
-        assert!(minimax.string_content_only);
     }
 
     #[test]
@@ -465,9 +430,6 @@ mod tests {
         assert!(!lmstudio.key_required);
         assert!(lmstudio.local_no_key);
         assert_eq!(lmstudio.default_base_url, Some("http://localhost:1234/v1"));
-
-        let baichuan = resolve("baichuan").unwrap();
-        assert!(baichuan.string_content_only);
     }
 
     #[test]
