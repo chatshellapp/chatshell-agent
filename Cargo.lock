@@ -1114,6 +1114,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rustls-platform-verifier",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
