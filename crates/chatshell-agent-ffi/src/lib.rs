@@ -483,6 +483,10 @@ fn decode_master_key(master_key_b64: &str) -> anyhow::Result<[u8; core::crypto::
 // MCP HTTP transport. rmcp requires a tokio runtime, so async operations are
 // spawned on RUNTIME and results are returned via oneshot channels. The Swift
 // caller sees async functions; the actual work runs on the tokio runtime.
+//
+// Errors carry the full anyhow chain (`{:#}`), not just the outermost
+// context: the Swift side classifies auth failures (HTTP 401, "Auth
+// required") by message, and those details live in the inner causes.
 // ---------------------------------------------------------------------------
 
 /// Connect to an MCP server via HTTP. Returns a handle that can list tools
@@ -501,7 +505,7 @@ pub async fn connect_mcp_server(config: McpHttpConfig) -> Result<Arc<McpConnecti
             message: e.to_string(),
         })?
         .map_err(|e| AgentError::Provider {
-            message: e.to_string(),
+            message: format!("{e:#}"),
         })?;
     Ok(Arc::new(McpConnection {
         inner: parking_lot::Mutex::new(Some(conn)),
@@ -536,7 +540,7 @@ impl McpConnection {
                 message: e.to_string(),
             })?
             .map_err(|e| AgentError::Provider {
-                message: e.to_string(),
+                message: format!("{e:#}"),
             })?;
         Ok(tools.into_iter().map(Into::into).collect())
     }
@@ -565,7 +569,7 @@ impl McpConnection {
                 message: e.to_string(),
             })?
             .map_err(|e| AgentError::Provider {
-                message: e.to_string(),
+                message: format!("{e:#}"),
             })?;
         Ok(result.into())
     }
