@@ -14,8 +14,6 @@
 //! before parsing, references to names not written yet resolve to nothing,
 //! and only complete series and stats are kept, so a block can render while
 //! it streams.
-//!
-//! Design: `internal-docs/features/openui-blocks.md`.
 
 use std::collections::HashMap;
 

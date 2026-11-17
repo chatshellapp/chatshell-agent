@@ -11,9 +11,6 @@
 //! The OpenUI section (`openui_prompt.txt`) is written in the desktop app
 //! next to the component library it renders (`src/lib/openui/prompt.ts`); a
 //! desktop test fails when the two drift apart.
-//!
-//! Design: `internal-docs/features/visual-output-formats.md`,
-//! `internal-docs/features/openui-blocks.md`.
 
 use crate::svg_figure::svg_figure_rules;
 

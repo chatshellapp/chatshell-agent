@@ -471,8 +471,8 @@ fn decode_base64url_utf8(input: &str) -> Option<String> {
         .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
-/// Collect an element's text, skipping Bing slug-icon subtrees. Mirrors
-/// kelivo's DOM removal of `span.algoSlug_icon` before reading captions.
+/// Collect an element's text, skipping Bing slug-icon subtrees: drop
+/// `span.algoSlug_icon` subtrees before reading captions.
 fn bing_text_excluding_slug_icons(element: scraper::ElementRef) -> String {
     fn collect(element: scraper::ElementRef, out: &mut String) {
         for child in element.children() {

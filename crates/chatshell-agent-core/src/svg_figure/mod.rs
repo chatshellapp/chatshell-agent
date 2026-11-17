@@ -10,8 +10,8 @@
 //! - [`prepare_svg_figure`]: repair → theme → sanitize → size, producing a
 //!   self-contained document safe to hand to a web engine.
 //!
-//! Design: `internal-docs/features/svg-figures.md`. The prompt contract,
-//! streaming repair, token substitution and series palette are adapted from
+//! The prompt contract, streaming repair, token substitution and series
+//! palette are adapted from
 //! oh-my-pi (MIT, Copyright (c) 2025 Mario Zechner):
 //! `packages/tui/src/chat/svg-source.ts`, `svg-figure.ts`,
 //! `packages/utils/src/color.ts`.
