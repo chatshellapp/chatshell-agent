@@ -17,6 +17,7 @@
 pub mod delta;
 pub mod engine;
 pub mod evidence;
+pub mod host;
 pub mod log;
 pub mod ruleset;
 pub mod transcript;

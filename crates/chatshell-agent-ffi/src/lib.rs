@@ -1,5 +1,6 @@
 #[cfg(target_os = "android")]
 mod android_tls;
+mod auto_review;
 mod documents;
 
 use std::collections::HashMap;
