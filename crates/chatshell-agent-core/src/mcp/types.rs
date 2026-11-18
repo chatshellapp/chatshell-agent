@@ -13,6 +13,11 @@ pub struct McpToolInfo {
     /// Tool annotations (`title`, `readOnlyHint`, ...) as a JSON string.
     /// Server-supplied and untrusted: descriptive only.
     pub annotations_json: Option<String>,
+    /// `readOnlyHint: true` was declared.
+    pub read_only_hint: bool,
+    /// `destructiveHint: true` was declared (explicitly; the spec default
+    /// is not applied).
+    pub destructive_hint: bool,
 }
 
 impl McpToolInfo {
@@ -30,8 +35,34 @@ impl McpToolInfo {
                 .annotations
                 .as_ref()
                 .and_then(|a| serde_json::to_string(a).ok()),
+            read_only_hint: t
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.read_only_hint == Some(true)),
+            destructive_hint: t
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.destructive_hint == Some(true)),
         }
     }
+}
+
+/// A resource listed by an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// A resource template (RFC 6570 URI template) listed by an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResourceTemplateInfo {
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
 }
 
 /// Result of calling a tool on an MCP server.

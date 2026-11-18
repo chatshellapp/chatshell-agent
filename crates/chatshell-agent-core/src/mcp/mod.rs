@@ -38,6 +38,9 @@ pub use listing::{
     list_all_resource_templates_bounded, list_all_resources_bounded, list_all_tools_bounded,
     paginate, supports_resources,
 };
-pub use resource::{MAX_RESOURCE_BLOB_BYTES, MAX_RESOURCE_TEXT_CHARS, render_read_resource_result};
+pub use resource::{
+    MAX_RESOURCE_BLOB_BYTES, MAX_RESOURCE_TEXT_CHARS, render_read_resource_result,
+    scan_resource_uri,
+};
 pub use result::{MAX_STRUCTURED_CHARS, RenderedToolResult, render_call_tool_result};
-pub use types::{McpToolInfo, McpToolResult};
+pub use types::{McpResourceInfo, McpResourceTemplateInfo, McpToolInfo, McpToolResult};

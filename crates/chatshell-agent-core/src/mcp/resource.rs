@@ -10,7 +10,22 @@ use std::path::Path;
 use base64::Engine;
 use rmcp::model::{ReadResourceResult, ResourceContents};
 
+use crate::path_policy;
+use crate::permission::file_uri_path;
 use crate::tools::SpillTarget;
+
+/// INV-1 for resource reads: scan the URI like an MCP tool argument, and
+/// put a `file://` URI through the read path policy exactly like the
+/// `read` tool (deny-tier paths are refused; ask-tier ones were already
+/// prompted by the permission gate).
+pub fn scan_resource_uri(uri: &str) -> Result<(), String> {
+    path_policy::check_blocked_path(uri)?;
+    if let Some(path) = file_uri_path(uri) {
+        path_policy::check_blocked_path(&path.to_string_lossy())?;
+        path_policy::check_read(&path, None)?;
+    }
+    Ok(())
+}
 
 /// Maximum characters of one text content inlined for the model.
 pub const MAX_RESOURCE_TEXT_CHARS: usize = 64_000;
@@ -143,6 +158,22 @@ mod tests {
 
     fn result(value: serde_json::Value) -> ReadResourceResult {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn plain_uris_pass_the_scan() {
+        assert!(scan_resource_uri("mem://notes/today").is_ok());
+        assert!(scan_resource_uri("https://example.com/doc").is_ok());
+    }
+
+    #[test]
+    fn denied_file_uri_and_blocked_paths_fail_the_scan() {
+        let home = dirs::home_dir().unwrap();
+        let uri = url::Url::from_file_path(home.join(".ssh/id_rsa"))
+            .unwrap()
+            .to_string();
+        assert!(scan_resource_uri(&uri).is_err());
+        assert!(scan_resource_uri("~/.ssh/id_rsa").is_err());
     }
 
     #[test]

@@ -179,6 +179,39 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: Option<String>,
     pub input_schema_json: String,
+    /// JSON Schema of the tool's structured output, if declared.
+    pub output_schema_json: Option<String>,
+    /// Server-declared annotations as JSON (untrusted, descriptive only).
+    pub annotations_json: Option<String>,
+    /// `readOnlyHint: true` was declared.
+    pub read_only_hint: bool,
+    /// `destructiveHint: true` was declared.
+    pub destructive_hint: bool,
+}
+
+/// A resource listed by an MCP server.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// A resource template (URI template) listed by an MCP server.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpResourceTemplateInfo {
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// A server's resources and resource templates.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpResourceCatalog {
+    pub resources: Vec<McpResourceInfo>,
+    pub templates: Vec<McpResourceTemplateInfo>,
 }
 
 /// Result of calling a tool on an MCP server.
@@ -574,6 +607,75 @@ impl McpConnection {
         Ok(result.into())
     }
 
+    /// List the server's resources and templates (empty when the server
+    /// does not support resources).
+    pub async fn list_resources(&self) -> Result<McpResourceCatalog, AgentError> {
+        let conn = self
+            .inner
+            .lock()
+            .clone()
+            .ok_or_else(|| AgentError::Provider {
+                message: "Not connected".to_string(),
+            })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        RUNTIME.spawn(async move {
+            let result = conn.list_resources().await;
+            let _ = tx.send(result);
+        });
+        let (resources, templates) = rx
+            .await
+            .map_err(|e| AgentError::Provider {
+                message: e.to_string(),
+            })?
+            .map_err(|e| AgentError::Provider {
+                message: format!("{e:#}"),
+            })?;
+        Ok(McpResourceCatalog {
+            resources: resources
+                .into_iter()
+                .map(|r| McpResourceInfo {
+                    uri: r.uri,
+                    name: r.name,
+                    description: r.description,
+                    mime_type: r.mime_type,
+                })
+                .collect(),
+            templates: templates
+                .into_iter()
+                .map(|t| McpResourceTemplateInfo {
+                    uri_template: t.uri_template,
+                    name: t.name,
+                    description: t.description,
+                    mime_type: t.mime_type,
+                })
+                .collect(),
+        })
+    }
+
+    /// Read a resource, rendered for the model (text inlined with a cap;
+    /// binary contents described, never inlined). The URI is scanned first.
+    pub async fn read_resource(&self, uri: String) -> Result<String, AgentError> {
+        let conn = self
+            .inner
+            .lock()
+            .clone()
+            .ok_or_else(|| AgentError::Provider {
+                message: "Not connected".to_string(),
+            })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        RUNTIME.spawn(async move {
+            let result = conn.read_resource(&uri).await;
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|e| AgentError::Provider {
+                message: e.to_string(),
+            })?
+            .map_err(|e| AgentError::Provider {
+                message: format!("{e:#}"),
+            })
+    }
+
     /// Disconnect from the MCP server. Safe to call multiple times.
     pub async fn disconnect(&self) {
         *self.inner.lock() = None;
@@ -920,6 +1022,10 @@ impl From<core::McpToolInfo> for McpToolInfo {
             name: value.name,
             description: value.description,
             input_schema_json: value.input_schema_json,
+            output_schema_json: value.output_schema_json,
+            annotations_json: value.annotations_json,
+            read_only_hint: value.read_only_hint,
+            destructive_hint: value.destructive_hint,
         }
     }
 }

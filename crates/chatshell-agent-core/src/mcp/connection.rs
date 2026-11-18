@@ -11,11 +11,16 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::{RoleClient, ServiceExt};
 
+use super::call::read_resource_with_options;
 use super::call::{McpCallOptions, call_tool_with_options};
 use super::handler::ChatShellClientHandler;
-use super::listing::list_all_tools_bounded;
+use super::listing::{
+    list_all_resource_templates_bounded, list_all_resources_bounded, list_all_tools_bounded,
+    supports_resources,
+};
+use super::resource::{render_read_resource_result, scan_resource_uri};
 use super::result::render_call_tool_result;
-use super::types::{McpToolInfo, McpToolResult};
+use super::types::{McpResourceInfo, McpResourceTemplateInfo, McpToolInfo, McpToolResult};
 
 /// A running MCP client session with ChatShell's notification handler.
 pub type McpClientService = RunningService<RoleClient, ChatShellClientHandler>;
@@ -63,6 +68,50 @@ impl McpConnection {
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
         let tools = list_all_tools_bounded(&self.client, &self.label).await?;
         Ok(tools.iter().map(McpToolInfo::from_tool).collect())
+    }
+
+    /// List the server's resources and resource templates (bounded). Empty
+    /// when the server does not advertise the `resources` capability; a
+    /// failing template listing yields no templates.
+    pub async fn list_resources(
+        &self,
+    ) -> Result<(Vec<McpResourceInfo>, Vec<McpResourceTemplateInfo>)> {
+        if !supports_resources(&self.client) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let resources = list_all_resources_bounded(&self.client, &self.label)
+            .await?
+            .into_iter()
+            .map(|r| McpResourceInfo {
+                uri: r.uri.clone(),
+                name: r.name.clone(),
+                description: r.description.clone(),
+                mime_type: r.mime_type.clone(),
+            })
+            .collect();
+        let templates = list_all_resource_templates_bounded(&self.client, &self.label)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| McpResourceTemplateInfo {
+                uri_template: t.uri_template.clone(),
+                name: t.name.clone(),
+                description: t.description.clone(),
+                mime_type: t.mime_type.clone(),
+            })
+            .collect();
+        Ok((resources, templates))
+    }
+
+    /// Read a resource with the default deadline. The URI is scanned first
+    /// ([`scan_resource_uri`]); binary contents are described, not inlined
+    /// (this host has no spill store).
+    pub async fn read_resource(&self, uri: &str) -> Result<String> {
+        scan_resource_uri(uri).map_err(|reason| anyhow::anyhow!("Blocked: {reason}"))?;
+        let result = read_resource_with_options(&self.client, uri, McpCallOptions::default())
+            .await
+            .context("MCP resource read failed")?;
+        Ok(render_read_resource_result(&result, None))
     }
 
     /// Call a tool on the connected MCP server with the default deadline.
