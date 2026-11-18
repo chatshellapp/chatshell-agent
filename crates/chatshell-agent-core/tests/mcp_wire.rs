@@ -207,6 +207,26 @@ async fn run_server(
                             .await;
                         });
                     }
+                    "roots" => {
+                        let log = log.clone();
+                        let request = format!("roots-{id}");
+                        tokio::spawn(async move {
+                            send(json!({"jsonrpc": "2.0", "id": request.clone(),
+                                "method": "roots/list"}))
+                            .await;
+                            let answer = loop {
+                                if let Some(m) = log.lock().await.iter().find(|m| {
+                                    m["id"] == request.as_str() && m.get("method").is_none()
+                                }) {
+                                    break m.clone();
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            };
+                            send(json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "content": [{"type": "text", "text": answer["result"].to_string()}]}}))
+                            .await;
+                        });
+                    }
                     "revoke" => {
                         extra_tool.store(100, Ordering::SeqCst);
                         send(json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -622,4 +642,59 @@ async fn prompts_are_listed_and_rendered_with_arguments() {
         .await
         .unwrap();
     assert_eq!(text, "Review PR 42");
+}
+
+#[tokio::test]
+async fn roots_list_answers_the_current_workspace_without_hanging() {
+    let root = Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+    let provider = {
+        let root = root.clone();
+        Arc::new(move || root.lock().unwrap().clone())
+            as chatshell_agent_core::mcp::McpRootsProvider
+    };
+    let handler = ChatShellClientHandler::new("mock", None).with_roots(provider);
+    let (service, log) = connect_with(false, handler).await;
+    let init = log
+        .lock()
+        .await
+        .iter()
+        .find(|m| m["method"] == "initialize")
+        .cloned()
+        .unwrap();
+    assert!(init["params"]["capabilities"]["roots"].is_object());
+    assert!(
+        init["params"]["capabilities"]["roots"]
+            .get("listChanged")
+            .is_none()
+    );
+
+    // Before any run: an empty list, not a hang.
+    let result = call_tool_with_options(
+        service.peer(),
+        call("roots"),
+        McpCallOptions::default(),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(
+        render_call_tool_result(&result)
+            .text
+            .contains(r#""roots":[]"#)
+    );
+
+    *root.lock().unwrap() = Some(std::path::PathBuf::from("/tmp/project"));
+    let result = call_tool_with_options(
+        service.peer(),
+        call("roots"),
+        McpCallOptions::default(),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let text = render_call_tool_result(&result).text;
+    assert!(text.contains("file:///tmp/project/"), "{text}");
+    assert!(text.contains(r#""name":"project""#), "{text}");
 }

@@ -67,6 +67,25 @@ pub struct ChatShellClientHandler {
     sink: Option<Arc<dyn McpNotificationSink>>,
     list_changed_pending: Arc<AtomicBool>,
     elicitation: Option<Arc<dyn super::elicitation::McpElicitationPrompter>>,
+    roots: Option<McpRootsProvider>,
+}
+
+/// Supplies the directory a server may treat as its root (FR-14): the
+/// workspace of the run that last used the server. `None` before any run.
+pub type McpRootsProvider = Arc<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>;
+
+/// The `roots/list` answer for `root`: one `file://` URI, or none.
+pub fn roots_result(root: Option<&std::path::Path>) -> rmcp::model::ListRootsResult {
+    let roots = root
+        .and_then(|path| {
+            let uri = url::Url::from_directory_path(path).ok()?;
+            let mut entry = rmcp::model::Root::new(uri.to_string());
+            entry.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            Some(entry)
+        })
+        .into_iter()
+        .collect();
+    rmcp::model::ListRootsResult::new(roots)
 }
 
 impl ChatShellClientHandler {
@@ -79,7 +98,19 @@ impl ChatShellClientHandler {
             sink,
             list_changed_pending: Arc::new(AtomicBool::new(false)),
             elicitation: None,
+            roots: None,
         }
+    }
+
+    /// Answer `roots/list` from `provider` and advertise the `roots`
+    /// capability without `listChanged` (the root is fixed per run; a
+    /// server that asks again gets the latest one).
+    pub fn with_roots(mut self, provider: McpRootsProvider) -> Self {
+        let mut capability = rmcp::model::RootsCapabilities::default();
+        capability.list_changed = None;
+        self.info.capabilities.roots = Some(capability);
+        self.roots = Some(provider);
+        self
     }
 
     /// Handle `elicitation/create` with `prompter` and advertise the
@@ -167,6 +198,14 @@ fn log_server_message(server: &str, params: &LoggingMessageNotificationParam) {
 impl ClientHandler for ChatShellClientHandler {
     fn get_info(&self) -> ClientConfig {
         self.info.clone()
+    }
+
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+        let root = self.roots.as_ref().and_then(|provider| provider());
+        Ok(roots_result(root.as_deref()))
     }
 
     async fn create_elicitation(

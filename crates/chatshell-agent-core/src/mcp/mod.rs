@@ -37,8 +37,8 @@ pub use elicitation::{
     scan_answer, validate_form_content,
 };
 pub use handler::{
-    ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, chatshell_client_info,
-    prepare_client_peer,
+    ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, McpRootsProvider,
+    chatshell_client_info, prepare_client_peer, roots_result,
 };
 pub use listing::{
     ListTruncation, MAX_CURSOR_BYTES, MAX_LIST_ITEMS, MAX_LIST_PAGES, Paginated,
