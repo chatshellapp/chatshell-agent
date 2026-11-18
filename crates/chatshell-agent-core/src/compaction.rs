@@ -6,6 +6,11 @@
 //! result.
 
 use crate::context_pruning::estimate_tokens;
+use crate::tools::ask_user::ASK_USER_TOOL_NAME;
+
+fn is_user_answer(tool_name: Option<&str>) -> bool {
+    tool_name == Some(ASK_USER_TOOL_NAME)
+}
 
 /// Newest tokens that must survive compaction verbatim (upstream
 /// `keepRecentTokens` default 20,000).
@@ -191,6 +196,14 @@ pub fn build_transcript(
                     budgets.head_ratio,
                 ),
             },
+            // `ask_user` results are the user's own answers: kept whole, so
+            // the summary can quote them (they are small and bounded).
+            HistoryRole::ToolResult if is_user_answer(item.tool_name.as_deref()) => {
+                TranscriptSection::ToolResult {
+                    name: ASK_USER_TOOL_NAME.to_string(),
+                    output: item.text.trim().to_string(),
+                }
+            }
             HistoryRole::ToolResult => TranscriptSection::ToolResult {
                 name: item.tool_name.clone().unwrap_or_else(|| "tool".into()),
                 output: truncate_head_tail(
@@ -229,6 +242,8 @@ pub fn render_transcript(sections: &[TranscriptSection], dim_tool_noise: bool) -
                 }
             }
             TranscriptSection::ToolResult { name, output } => {
+                // User answers are conversation, not tool noise.
+                let dim_tool_noise = dim_tool_noise && !is_user_answer(Some(name.as_str()));
                 if dim_tool_noise {
                     out.push('\u{000e}');
                 }
@@ -443,6 +458,28 @@ mod tests {
         assert!(out.contains("chars elided"), "{out:.60}");
         // Short text untouched.
         assert_eq!(truncate_head_tail("short", 100, 0.6), "short");
+    }
+
+    #[test]
+    fn ask_user_answers_survive_serialization_whole_and_undimmed() {
+        let answer = format!("The user answered your questions.\n{}", "x".repeat(5_000));
+        let items = vec![HistoryItem {
+            id: "a".into(),
+            role: HistoryRole::ToolResult,
+            text: answer.clone(),
+            tool_name: Some(ASK_USER_TOOL_NAME.into()),
+        }];
+        let sections = build_transcript(&items, &SerializeBudgets::default());
+        assert_eq!(
+            sections[0],
+            TranscriptSection::ToolResult {
+                name: ASK_USER_TOOL_NAME.into(),
+                output: answer.clone(),
+            }
+        );
+        let rendered = render_transcript(&sections, true);
+        assert!(!rendered.contains('\u{000e}'), "answers are not dimmed");
+        assert!(rendered.contains(&answer));
     }
 
     #[test]

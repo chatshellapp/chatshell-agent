@@ -5,6 +5,7 @@
 //! Hosts register the rig `Tool` impls directly (desktop's agent builder) or
 //! surface the schemas to client-side tool callers (iOS).
 
+pub mod ask_user;
 pub mod bash;
 pub mod bash_output;
 pub mod bash_sandbox;
@@ -18,6 +19,10 @@ pub mod read;
 pub mod reference;
 pub mod write;
 
+pub use ask_user::{
+    ASK_USER_TOOL_NAME, AskUserAnswer, AskUserOption, AskUserOutcome, AskUserPrompter,
+    AskUserQuestion, AskUserRequest, AskUserTool,
+};
 pub use bash::{BashArgs, BashError, BashTool, SharedBashSession, TempFileList};
 pub use bash_output::SpillTarget;
 pub use bash_session_manager::BashSessionManager;

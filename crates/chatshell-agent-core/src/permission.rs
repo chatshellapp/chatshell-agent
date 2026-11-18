@@ -140,7 +140,8 @@ impl GateContext {
 #[serde(rename_all = "lowercase")]
 pub enum PermissionTier {
     /// Local read-only retrieval (`read`, `grep`, `glob`, `web_search`,
-    /// `web_fetch`, `skill`, `mcp_schema`, `mcp_resource_read`).
+    /// `web_fetch`, `skill`, `mcp_schema`, `mcp_resource_read`), and
+    /// `ask_user`, which the gate always allows.
     Read,
     /// Local mutations (`edit`, `write`) and remote MCP execution
     /// (`mcp_tool_use`).
@@ -156,7 +157,7 @@ impl PermissionTier {
     pub fn for_tool(tool_name: &str) -> Self {
         match tool_name {
             "read" | "grep" | "glob" | "web_search" | "web_fetch" | "skill" | "mcp_schema"
-            | "mcp_resource_read" => PermissionTier::Read,
+            | "mcp_resource_read" | "ask_user" => PermissionTier::Read,
             "edit" | "write" | "mcp_tool_use" => PermissionTier::Write,
             _ => PermissionTier::Exec,
         }
@@ -601,6 +602,12 @@ pub fn resolve_in(
     args: &Value,
     grants: &SessionGrants,
 ) -> GateDecision {
+    // `ask_user` is an interaction, not an action: the question dialog is
+    // the user's checkpoint. Never prompt for it, never hand it to the
+    // auto-mode judge, never offer a grant — in every mode.
+    if tool_name == crate::tools::ask_user::ASK_USER_TOOL_NAME {
+        return GateDecision::Allow;
+    }
     // Bash is jailed in both prompting modes wherever a backend exists.
     let sandboxed = mode != PermissionMode::Yolo && ctx.sandbox_available;
     let escalation = Escalation {
@@ -1696,6 +1703,26 @@ mod tests {
             judged(&auto(&ctx, "write", json!({ "path": "notes.md" }))),
             Some(JudgmentSource::OutOfWorkspaceWrite)
         );
+    }
+
+    #[test]
+    fn ask_user_is_allowed_in_every_mode_without_judgment_or_grant() {
+        let ws = temp_workspace();
+        let ctx = auto_ctx(&ws, true, false);
+        let args = json!({ "questions": [{ "id": "a", "question": "?" }] });
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+            PermissionMode::Yolo,
+        ] {
+            assert_eq!(
+                resolve_in(mode, &ctx, "ask_user", &args, &SessionGrants::default()),
+                GateDecision::Allow,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(PermissionTier::for_tool("ask_user"), PermissionTier::Read);
+        assert_eq!(grant_scope("ask_user", &args), None);
     }
 
     #[test]

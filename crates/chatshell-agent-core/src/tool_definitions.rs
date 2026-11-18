@@ -49,6 +49,17 @@ pub fn web_search_definition() -> ClientToolDefinition {
     }
 }
 
+/// Definition of the `ask_user` tool. Not part of
+/// [`builtin_tool_definitions`]: a host advertises it only when it can show
+/// the questions to a person (see [`crate::tools::ask_user`]).
+pub fn ask_user_definition() -> ClientToolDefinition {
+    ClientToolDefinition {
+        name: crate::tools::ask_user::ASK_USER_TOOL_NAME.to_string(),
+        description: crate::tools::ask_user::description().to_string(),
+        parameters_json: crate::tools::ask_user::parameters_schema().to_string(),
+    }
+}
+
 pub fn web_fetch_definition() -> ClientToolDefinition {
     ClientToolDefinition {
         name: "web_fetch".to_string(),

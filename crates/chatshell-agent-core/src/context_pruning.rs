@@ -92,7 +92,8 @@ pub struct PrunePolicy {
     pub min_total_savings: usize,
     pub min_result_tokens: usize,
     /// Tool names whose outputs are never pruned (e.g. loaded skill
-    /// instructions — the model cannot re-read them from history).
+    /// instructions — the model cannot re-read them from history — and
+    /// `ask_user` answers, which only the user can reproduce).
     pub protected_tools: Vec<String>,
 }
 
@@ -102,7 +103,10 @@ impl Default for PrunePolicy {
             protect_recent_tokens: DEFAULT_PROTECT_RECENT_TOKENS,
             min_total_savings: DEFAULT_MIN_TOTAL_SAVINGS,
             min_result_tokens: MIN_PRUNE_TOKENS,
-            protected_tools: vec!["skill".to_string()],
+            protected_tools: vec![
+                "skill".to_string(),
+                crate::tools::ask_user::ASK_USER_TOOL_NAME.to_string(),
+            ],
         }
     }
 }
@@ -219,6 +223,24 @@ mod tests {
         // ~3k savings < 20k threshold -> keep everything.
         let plan = plan_prune(&entries, &policy(40_000, 20_000));
         assert!(plan.iter().all(|p| !p));
+    }
+
+    #[test]
+    fn default_policy_never_prunes_ask_user_answers() {
+        let entries = vec![
+            entry("ask_user", 5_000),
+            entry("bash", 1_000),
+            entry("bash", 60_000),
+        ];
+        let plan = plan_prune(
+            &entries,
+            &PrunePolicy {
+                min_total_savings: 500,
+                ..PrunePolicy::default()
+            },
+        );
+        assert!(!plan[0], "user answers are protected");
+        assert!(plan[1]);
     }
 
     #[test]
