@@ -383,6 +383,7 @@ mod tests {
             network_allowed: false,
             scratch_dir: Some(PathBuf::from("/scratch/conv")),
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         }
     }
 
@@ -446,6 +447,7 @@ mod tests {
                 network_allowed: network,
                 scratch_dir: Some(scratch.clone()),
                 cwd_drifted: false,
+                mcp_tool_hints: Default::default(),
             };
             // The bash tool launches with exactly this policy.
             let live = SandboxPolicy::for_bash(Some(&workspace), &scratch, network);

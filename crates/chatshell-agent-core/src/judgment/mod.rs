@@ -52,6 +52,8 @@ pub enum JudgmentSource {
     SensitiveWrite,
     /// Bash deletes an existing path outside the workspace.
     OutsideDeletion,
+    /// The MCP server declares the tool destructive.
+    McpDestructive,
     /// File-tool write outside the workspace.
     OutOfWorkspaceWrite,
     /// MCP tool call not covered by a human-minted grant.
@@ -74,6 +76,7 @@ impl From<ForcedPromptKind> for JudgmentSource {
             ForcedPromptKind::SensitiveRead => JudgmentSource::SensitiveRead,
             ForcedPromptKind::SensitiveWrite => JudgmentSource::SensitiveWrite,
             ForcedPromptKind::OutsideDeletion => JudgmentSource::OutsideDeletion,
+            ForcedPromptKind::McpDestructive => JudgmentSource::McpDestructive,
         }
     }
 }

@@ -571,6 +571,7 @@ fn probe_inputs() -> (Posture, AssembledTranscript, JudgmentRequest) {
         network_allowed: false,
         scratch_dir: None,
         cwd_drifted: false,
+        mcp_tool_hints: Default::default(),
     };
     let command = "rm -rf /Users/demo/Documents/old-drafts";
     let args = serde_json::json!({ "command": command });

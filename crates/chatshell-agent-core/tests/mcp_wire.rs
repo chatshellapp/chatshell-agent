@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use chatshell_agent_core::mcp::{
     ChatShellClientHandler, McpCallOptions, McpNotificationSink, call_tool_with_options,
-    list_all_tools_bounded, render_call_tool_result,
+    list_all_resource_templates_bounded, list_all_resources_bounded, list_all_tools_bounded,
+    read_resource_with_options, render_call_tool_result, render_read_resource_result,
+    supports_resources,
 };
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -55,7 +57,7 @@ async fn run_server(
             "initialize" => {
                 send(json!({"jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {"listChanged": true}},
+                    "capabilities": {"tools": {"listChanged": true}, "resources": {}},
                     "serverInfo": {"name": "mock", "version": "1"}
                 }}))
                 .await
@@ -82,6 +84,40 @@ async fn run_server(
                     result["nextCursor"] = json!(n);
                 }
                 send(json!({"jsonrpc": "2.0", "id": id, "result": result})).await
+            }
+            "resources/list" => {
+                let result = match msg["params"]["cursor"].as_str() {
+                    None => json!({
+                        "resources": [{"uri": "mem://a", "name": "a"}],
+                        "nextCursor": "r2"
+                    }),
+                    _ => json!({"resources": [{"uri": "mem://b", "name": "b"}]}),
+                };
+                send(json!({"jsonrpc": "2.0", "id": id, "result": result})).await
+            }
+            "resources/templates/list" => {
+                send(
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"resourceTemplates": [
+                        {"uriTemplate": "mem://{key}", "name": "by key"}
+                    ]}}),
+                )
+                .await
+            }
+            "resources/read" => {
+                let uri = msg["params"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if uri == "mem://a" {
+                    send(json!({"jsonrpc": "2.0", "id": id, "result": {"contents": [
+                        {"uri": uri, "mimeType": "text/plain", "text": "alpha"}
+                    ]}}))
+                    .await
+                } else {
+                    send(json!({"jsonrpc": "2.0", "id": id, "error": {
+                        "code": -32002, "message": "Resource not found"}}))
+                    .await
+                }
             }
             "tools/call" => {
                 let name = msg["params"]["name"]
@@ -356,4 +392,30 @@ async fn progress_flood_cannot_outlive_the_ceiling() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn resources_are_listed_across_pages_and_read() {
+    let (service, _log) = connect(false, None).await;
+    assert!(supports_resources(service.peer()));
+    let resources = list_all_resources_bounded(service.peer(), "mock")
+        .await
+        .unwrap();
+    let uris: Vec<_> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert_eq!(uris, ["mem://a", "mem://b"]);
+    let templates = list_all_resource_templates_bounded(service.peer(), "mock")
+        .await
+        .unwrap();
+    assert_eq!(templates[0].uri_template, "mem://{key}");
+
+    let read = read_resource_with_options(service.peer(), "mem://a", McpCallOptions::default())
+        .await
+        .unwrap();
+    assert!(render_read_resource_result(&read, None).contains("alpha"));
+
+    let missing = service
+        .peer()
+        .read_resource(ReadResourceRequestParams::new("mem://missing"))
+        .await;
+    assert!(missing.is_err());
 }

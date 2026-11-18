@@ -37,7 +37,7 @@ use crate::net_policy;
 use crate::path_policy::{self, ReadTier};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Conversation-level permission mode for the approval gate.
@@ -81,6 +81,33 @@ pub struct GateContext {
     /// The bash shell has left its launch directory (reported by the
     /// shell after each command): relative write targets are unprovable.
     pub cwd_drifted: bool,
+    /// Server-declared MCP tool annotations, keyed `server/tool` (the
+    /// `mcp_tool_use` arguments). Tools absent here are unannotated.
+    pub mcp_tool_hints: HashMap<String, McpToolHints>,
+}
+
+/// What an MCP server declares about one of its tools, and whether the
+/// user trusts that server's declarations.
+///
+/// Annotations are untrusted input (MCP spec): they may only tighten the
+/// gate on their own. `destructive` forces a prompt on any server;
+/// `read_only` relaxes the gate only when `trusted` (the user enabled
+/// `trust_annotations` for that server).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpToolHints {
+    /// `readOnlyHint: true`.
+    pub read_only: bool,
+    /// `destructiveHint: true` (explicit; the spec default is not applied).
+    pub destructive: bool,
+    /// The user trusts this server's annotations.
+    pub trusted: bool,
+}
+
+impl McpToolHints {
+    /// Key for [`GateContext::mcp_tool_hints`].
+    pub fn key(server: &str, tool: &str) -> String {
+        format!("{server}/{tool}")
+    }
 }
 
 impl GateContext {
@@ -113,7 +140,7 @@ impl GateContext {
 #[serde(rename_all = "lowercase")]
 pub enum PermissionTier {
     /// Local read-only retrieval (`read`, `grep`, `glob`, `web_search`,
-    /// `web_fetch`, `skill`, `mcp_schema`).
+    /// `web_fetch`, `skill`, `mcp_schema`, `mcp_resource_read`).
     Read,
     /// Local mutations (`edit`, `write`) and remote MCP execution
     /// (`mcp_tool_use`).
@@ -128,9 +155,8 @@ impl PermissionTier {
     /// [`PermissionTier::Exec`] — the fail-safe choice.
     pub fn for_tool(tool_name: &str) -> Self {
         match tool_name {
-            "read" | "grep" | "glob" | "web_search" | "web_fetch" | "skill" | "mcp_schema" => {
-                PermissionTier::Read
-            }
+            "read" | "grep" | "glob" | "web_search" | "web_fetch" | "skill" | "mcp_schema"
+            | "mcp_resource_read" => PermissionTier::Read,
             "edit" | "write" | "mcp_tool_use" => PermissionTier::Write,
             _ => PermissionTier::Exec,
         }
@@ -161,6 +187,9 @@ pub enum ForcedPromptKind {
     /// A bash command deletes a path that already exists outside the
     /// workspace. `yolo` (full access) runs these without asking.
     OutsideDeletion,
+    /// An MCP server declares the tool destructive (`destructiveHint`).
+    /// Prompts even under a remembered grant; `yolo` runs it.
+    McpDestructive,
 }
 
 /// A prompt that session grants cannot satisfy, with the detail shown
@@ -327,6 +356,10 @@ pub fn subject_for(tool_name: &str, args: &Value) -> String {
             (Some(server), Some(tool)) => Some(format!("{server}/{tool}")),
             _ => None,
         },
+        "mcp_resource_read" => match (arg("server"), arg("uri")) {
+            (Some(server), Some(uri)) => Some(format!("{server}: {uri}")),
+            _ => None,
+        },
         // Read tier never prompts in v1; this arm feeds the possible
         // middle tier (risk-taxonomy prompts) where fetch URLs would be
         // shown as subjects.
@@ -462,6 +495,15 @@ fn ask_tier_read(path: &str, workspace: Option<&Path>) -> Option<path_policy::Re
         return None;
     }
     blocks.into_iter().find(|block| block.tier == ReadTier::Ask)
+}
+
+/// The local path of a `file://` resource URI, if it is one.
+pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path().ok()
 }
 
 /// Resolve one tool call against the mode and session grants, with no
@@ -702,8 +744,18 @@ pub fn resolve_in(
                 format!("Fetch targets a private or local network address: {url}"),
             );
         }
-        if matches!(tool_name, "read" | "grep" | "glob")
-            && let Some(path) = args.get("path").and_then(Value::as_str)
+        // A `file://` resource is a local read: same ask-tier floor as `read`.
+        let resource_path = (tool_name == "mcp_resource_read")
+            .then(|| args.get("uri").and_then(Value::as_str))
+            .flatten()
+            .and_then(file_uri_path)
+            .and_then(|p| p.to_str().map(str::to_string));
+        let read_path = if matches!(tool_name, "read" | "grep" | "glob") {
+            args.get("path").and_then(Value::as_str).map(str::to_string)
+        } else {
+            resource_path
+        };
+        if let Some(path) = read_path.as_deref()
             && let Some(block) = ask_tier_read(path, workspace)
         {
             return escalation.forced(
@@ -736,9 +788,28 @@ pub fn resolve_in(
         if let (Some(server), Some(tool)) = (
             args.get("server").and_then(Value::as_str),
             args.get("tool").and_then(Value::as_str),
-        ) && grants.server_tool_granted(server, tool)
-        {
-            return GateDecision::Allow;
+        ) {
+            let hints = ctx
+                .mcp_tool_hints
+                .get(&McpToolHints::key(server, tool))
+                .copied()
+                .unwrap_or_default();
+            // Tightening needs no trust: a destructive declaration prompts
+            // past every grant.
+            if hints.destructive {
+                return escalation.forced(
+                    &subject,
+                    ForcedPromptKind::McpDestructive,
+                    format!("The MCP server declares {server}/{tool} as destructive"),
+                );
+            }
+            // Relaxing needs the user's trust in this server.
+            if hints.trusted && hints.read_only {
+                return GateDecision::Allow;
+            }
+            if grants.server_tool_granted(server, tool) {
+                return GateDecision::Allow;
+            }
         }
         return escalation.matrix(subject, JudgmentSource::McpCall);
     }
@@ -786,6 +857,206 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PermissionMode::Auto).unwrap(),
             json!("auto")
+        );
+    }
+
+    fn mcp_ctx(hints: McpToolHints) -> GateContext {
+        let mut ctx = GateContext::default();
+        ctx.mcp_tool_hints
+            .insert(McpToolHints::key("s", "t"), hints);
+        ctx
+    }
+
+    fn mcp_call() -> Value {
+        json!({"server": "s", "tool": "t"})
+    }
+
+    fn mcp_forced_kind(decision: &GateDecision) -> Option<ForcedPromptKind> {
+        match decision {
+            GateDecision::Prompt { forced, .. } => forced.as_ref().map(|f| f.kind),
+            GateDecision::Classify(request) => request.forced.as_ref().map(|f| f.kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn mcp_resource_reads_are_read_tier() {
+        assert_eq!(
+            PermissionTier::for_tool("mcp_resource_read"),
+            PermissionTier::Read
+        );
+        let args = json!({"server": "docs", "uri": "mem://guide"});
+        assert_eq!(
+            resolve_simple(PermissionMode::Ask, "mcp_resource_read", args.clone()),
+            GateDecision::Allow
+        );
+        assert_eq!(subject_for("mcp_resource_read", &args), "docs: mem://guide");
+    }
+
+    #[test]
+    fn file_resource_of_a_sensitive_path_is_a_forced_read_prompt() {
+        let home = dirs::home_dir().unwrap();
+        let uri = url::Url::from_file_path(home.join(".zshrc"))
+            .unwrap()
+            .to_string();
+        let decision = resolve_simple(
+            PermissionMode::Ask,
+            "mcp_resource_read",
+            json!({"server": "fs", "uri": uri}),
+        );
+        assert_eq!(
+            mcp_forced_kind(&decision),
+            Some(ForcedPromptKind::SensitiveRead),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn file_uri_path_only_accepts_file_scheme() {
+        assert_eq!(
+            file_uri_path("file:///tmp/a.txt"),
+            Some(PathBuf::from("/tmp/a.txt"))
+        );
+        assert_eq!(file_uri_path("https://example.com/a"), None);
+        assert_eq!(file_uri_path("mem://a"), None);
+    }
+
+    #[test]
+    fn trusted_read_only_mcp_tool_runs_unprompted() {
+        let ctx = mcp_ctx(McpToolHints {
+            read_only: true,
+            destructive: false,
+            trusted: true,
+        });
+        let grants = SessionGrants::default();
+        for mode in [PermissionMode::Ask, PermissionMode::Auto] {
+            assert_eq!(
+                resolve_in(mode, &ctx, "mcp_tool_use", &mcp_call(), &grants),
+                GateDecision::Allow,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_read_only_mcp_tool_still_prompts() {
+        let ctx = mcp_ctx(McpToolHints {
+            read_only: true,
+            destructive: false,
+            trusted: false,
+        });
+        let decision = resolve_in(
+            PermissionMode::Ask,
+            &ctx,
+            "mcp_tool_use",
+            &mcp_call(),
+            &SessionGrants::default(),
+        );
+        assert!(
+            matches!(decision, GateDecision::Prompt { forced: None, .. }),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn destructive_mcp_tool_prompts_past_grants_on_any_server() {
+        let mut grants = SessionGrants::default();
+        grants.grant_server_tool("s", "t");
+        for trusted in [false, true] {
+            // Contradictory read-only + destructive declarations fail safe.
+            let ctx = mcp_ctx(McpToolHints {
+                read_only: true,
+                destructive: true,
+                trusted,
+            });
+            let ask = resolve_in(
+                PermissionMode::Ask,
+                &ctx,
+                "mcp_tool_use",
+                &mcp_call(),
+                &grants,
+            );
+            assert_eq!(
+                mcp_forced_kind(&ask),
+                Some(ForcedPromptKind::McpDestructive)
+            );
+            let auto = resolve_in(
+                PermissionMode::Auto,
+                &ctx,
+                "mcp_tool_use",
+                &mcp_call(),
+                &grants,
+            );
+            assert!(matches!(auto, GateDecision::Classify(_)), "{auto:?}");
+            assert_eq!(
+                mcp_forced_kind(&auto),
+                Some(ForcedPromptKind::McpDestructive)
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_mcp_tool_runs_in_yolo() {
+        let ctx = mcp_ctx(McpToolHints {
+            read_only: false,
+            destructive: true,
+            trusted: false,
+        });
+        assert_eq!(
+            resolve_in(
+                PermissionMode::Yolo,
+                &ctx,
+                "mcp_tool_use",
+                &mcp_call(),
+                &SessionGrants::default()
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn unannotated_mcp_tool_keeps_grant_behavior() {
+        let ctx = GateContext::default();
+        let mut grants = SessionGrants::default();
+        let prompt = resolve_in(
+            PermissionMode::Ask,
+            &ctx,
+            "mcp_tool_use",
+            &mcp_call(),
+            &grants,
+        );
+        assert!(matches!(prompt, GateDecision::Prompt { forced: None, .. }));
+        grants.grant_server_tool("s", "t");
+        assert_eq!(
+            resolve_in(
+                PermissionMode::Ask,
+                &ctx,
+                "mcp_tool_use",
+                &mcp_call(),
+                &grants
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn hints_for_another_tool_do_not_apply() {
+        let ctx = mcp_ctx(McpToolHints {
+            read_only: true,
+            destructive: false,
+            trusted: true,
+        });
+        let other = json!({"server": "s", "tool": "other"});
+        let decision = resolve_in(
+            PermissionMode::Ask,
+            &ctx,
+            "mcp_tool_use",
+            &other,
+            &SessionGrants::default(),
+        );
+        assert!(
+            matches!(decision, GateDecision::Prompt { .. }),
+            "{decision:?}"
         );
     }
 
@@ -1337,6 +1608,7 @@ mod tests {
             network_allowed: network,
             scratch_dir: None,
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         }
     }
 
@@ -1418,6 +1690,7 @@ mod tests {
             network_allowed: false,
             scratch_dir: None,
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         };
         assert_eq!(
             judged(&auto(&ctx, "write", json!({ "path": "notes.md" }))),
@@ -1984,6 +2257,7 @@ mod tests {
             network_allowed: false,
             scratch_dir: Some(base.join("scratch")),
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         };
         Jail {
             _root: root,

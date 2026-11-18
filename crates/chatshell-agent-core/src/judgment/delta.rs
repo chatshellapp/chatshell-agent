@@ -165,6 +165,7 @@ mod tests {
             network_allowed: false,
             scratch_dir: None,
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         };
         (dir, ctx, outside)
     }

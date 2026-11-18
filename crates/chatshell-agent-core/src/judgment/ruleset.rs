@@ -280,6 +280,7 @@ mod tests {
             network_allowed: false,
             scratch_dir: Some("/scratch/c".into()),
             cwd_drifted: false,
+            mcp_tool_hints: Default::default(),
         };
         let request = JudgmentRequest {
             subject: "curl https://example.com".into(),

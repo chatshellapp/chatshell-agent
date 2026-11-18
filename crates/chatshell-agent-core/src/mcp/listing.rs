@@ -10,7 +10,7 @@ use std::future::Future;
 
 use anyhow::{Context, Result};
 use rmcp::RoleClient;
-use rmcp::model::{PaginatedRequestParams, Tool};
+use rmcp::model::{PaginatedRequestParams, Resource, ResourceTemplate, Tool};
 use rmcp::service::Peer;
 
 /// Maximum number of pages fetched for one listing.
@@ -113,6 +113,53 @@ pub async fn list_all_tools_bounded(peer: &Peer<RoleClient>, server: &str) -> Re
     })
     .await?;
     log_truncation("tool", server, result.truncated, result.items.len());
+    Ok(result.items)
+}
+
+/// Whether the server advertised the `resources` capability at
+/// initialization (servers without it answer resource requests with
+/// "method not found").
+pub fn supports_resources(peer: &Peer<RoleClient>) -> bool {
+    peer.peer_info()
+        .is_some_and(|info| info.capabilities.resources.is_some())
+}
+
+/// List every resource of a server with the same guards as tools (INV-3).
+pub async fn list_all_resources_bounded(
+    peer: &Peer<RoleClient>,
+    server: &str,
+) -> Result<Vec<Resource>> {
+    let result = paginate(|cursor| async move {
+        let page = peer
+            .list_resources(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await
+            .context("Failed to list resources from MCP server")?;
+        Ok((page.resources, page.next_cursor))
+    })
+    .await?;
+    log_truncation("resource", server, result.truncated, result.items.len());
+    Ok(result.items)
+}
+
+/// List every resource template of a server with the same guards.
+pub async fn list_all_resource_templates_bounded(
+    peer: &Peer<RoleClient>,
+    server: &str,
+) -> Result<Vec<ResourceTemplate>> {
+    let result = paginate(|cursor| async move {
+        let page = peer
+            .list_resource_templates(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await
+            .context("Failed to list resource templates from MCP server")?;
+        Ok((page.resource_templates, page.next_cursor))
+    })
+    .await?;
+    log_truncation(
+        "resource template",
+        server,
+        result.truncated,
+        result.items.len(),
+    );
     Ok(result.items)
 }
 

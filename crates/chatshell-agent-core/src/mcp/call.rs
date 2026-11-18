@@ -16,7 +16,8 @@ use rmcp::RoleClient;
 use rmcp::handler::client::progress::ProgressDispatcher;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
-    ClientRequest, ProgressNotificationParam, RequestId, ServerResult,
+    ClientRequest, ProgressNotificationParam, ReadResourceRequest, ReadResourceRequestParams,
+    ReadResourceResult, RequestId, ServerResult,
 };
 use rmcp::service::{Peer, PeerRequestOptions, ServiceError};
 
@@ -114,9 +115,38 @@ pub async fn call_tool_with_options(
     params: CallToolRequestParams,
     options: McpCallOptions,
     dispatcher: Option<&ProgressDispatcher>,
-    mut on_progress: impl FnMut(ProgressNotificationParam) + Send,
+    on_progress: impl FnMut(ProgressNotificationParam) + Send,
 ) -> Result<CallToolResult, ServiceError> {
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    match request_with_options(peer, request, options, dispatcher, on_progress).await? {
+        ServerResult::CallToolResult(r) => Ok(r),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// Read a resource with the same deadline and cancel-on-drop semantics as
+/// a tool call.
+pub async fn read_resource_with_options(
+    peer: &Peer<RoleClient>,
+    uri: &str,
+    options: McpCallOptions,
+) -> Result<ReadResourceResult, ServiceError> {
+    let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
+        ReadResourceRequestParams::new(uri),
+    ));
+    match request_with_options(peer, request, options, None, |_| {}).await? {
+        ServerResult::ReadResourceResult(r) => Ok(r),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+async fn request_with_options(
+    peer: &Peer<RoleClient>,
+    request: ClientRequest,
+    options: McpCallOptions,
+    dispatcher: Option<&ProgressDispatcher>,
+    mut on_progress: impl FnMut(ProgressNotificationParam) + Send,
+) -> Result<ServerResult, ServiceError> {
     let handle = peer
         .send_request_with_option(request, options.to_peer_options())
         .await?;
@@ -158,11 +188,7 @@ pub async fn call_tool_with_options(
     // Answered, timed out (rmcp already sent the cancellation), or the
     // transport failed: nothing left to cancel.
     guard.armed = false;
-
-    match result? {
-        ServerResult::CallToolResult(r) => Ok(r),
-        _ => Err(ServiceError::UnexpectedResponse),
-    }
+    result
 }
 
 #[cfg(test)]
