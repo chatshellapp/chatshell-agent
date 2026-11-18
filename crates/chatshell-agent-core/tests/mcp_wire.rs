@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chatshell_agent_core::mcp::{
-    ChatShellClientHandler, McpCallOptions, McpNotificationSink, call_tool_with_options,
-    list_all_resource_templates_bounded, list_all_resources_bounded, list_all_tools_bounded,
-    prepare_client_peer, read_resource_with_options, render_call_tool_result,
-    render_read_resource_result, supports_resources,
+    ChatShellClientHandler, McpCallOptions, McpElicitationAnswer, McpElicitationPrompter,
+    McpElicitationRequest, McpNotificationSink, call_tool_with_options, get_prompt_text,
+    list_all_prompts_bounded, list_all_resource_templates_bounded, list_all_resources_bounded,
+    list_all_tools_bounded, prepare_client_peer, read_resource_with_options,
+    render_call_tool_result, render_read_resource_result, supports_resources,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
@@ -43,6 +44,10 @@ async fn run_server(
         let Some(id) = msg.get("id").cloned() else {
             continue;
         };
+        // A response from the client (to our elicitation request).
+        if msg.get("method").is_none() {
+            continue;
+        }
         let method = msg["method"].as_str().unwrap_or_default().to_string();
         let write = write.clone();
         let send = move |v: Value| {
@@ -54,14 +59,12 @@ async fn run_server(
             }
         };
         match method.as_str() {
-            "initialize" => {
-                send(json!({"jsonrpc": "2.0", "id": id, "result": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {"listChanged": true}, "resources": {}},
-                    "serverInfo": {"name": "mock", "version": "1"}
-                }}))
-                .await
-            }
+            "initialize" => send(json!({"jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": true}, "resources": {}, "prompts": {}},
+                "serverInfo": {"name": "mock", "version": "1"}
+            }}))
+            .await,
             "tools/list" if extra_tool.load(Ordering::SeqCst) >= 100 => {
                 // Credentials revoked: every list fails from now on.
                 send(json!({"jsonrpc": "2.0", "id": id, "error": {
@@ -102,6 +105,23 @@ async fn run_server(
                     _ => json!({"resources": [{"uri": "mem://b", "name": "b"}]}),
                 };
                 send(json!({"jsonrpc": "2.0", "id": id, "result": result})).await
+            }
+            "prompts/list" => {
+                send(json!({"jsonrpc": "2.0", "id": id, "result": {"prompts": [
+                    {"name": "review", "title": "Code review",
+                     "arguments": [{"name": "pr", "required": true}]}
+                ]}}))
+                .await
+            }
+            "prompts/get" => {
+                let pr = msg["params"]["arguments"]["pr"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string();
+                send(json!({"jsonrpc": "2.0", "id": id, "result": {"messages": [
+                    {"role": "user", "content": {"type": "text", "text": format!("Review PR {pr}")}}
+                ]}}))
+                .await
             }
             "resources/templates/list" => {
                 send(
@@ -163,6 +183,30 @@ async fn run_server(
                             "structuredContent": {"temperature": 22.5}}}))
                         .await
                     }
+                    "ask" => {
+                        let log = log.clone();
+                        tokio::spawn(async move {
+                            send(json!({"jsonrpc": "2.0", "id": "elicit-1",
+                                "method": "elicitation/create", "params": {
+                                    "mode": "form", "message": "Your name?",
+                                    "requestedSchema": {"type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                        "required": ["name"]}}}))
+                            .await;
+                            let answer =
+                                loop {
+                                    if let Some(m) = log.lock().await.iter().find(|m| {
+                                        m["id"] == "elicit-1" && m.get("method").is_none()
+                                    }) {
+                                        break m.clone();
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                };
+                            send(json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "content": [{"type": "text", "text": answer["result"].to_string()}]}}))
+                            .await;
+                        });
+                    }
                     "revoke" => {
                         extra_tool.store(100, Ordering::SeqCst);
                         send(json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -210,6 +254,16 @@ async fn connect(
     rmcp::service::RunningService<rmcp::RoleClient, ChatShellClientHandler>,
     Log,
 ) {
+    connect_with(loop_cursor, ChatShellClientHandler::new("mock", sink)).await
+}
+
+async fn connect_with(
+    loop_cursor: bool,
+    handler: ChatShellClientHandler,
+) -> (
+    rmcp::service::RunningService<rmcp::RoleClient, ChatShellClientHandler>,
+    Log,
+) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let log: Log = Arc::default();
     tokio::spawn(run_server(
@@ -219,10 +273,7 @@ async fn connect(
         Arc::new(AtomicUsize::new(0)),
     ));
     let (r, w) = tokio::io::split(client_io);
-    let service = ChatShellClientHandler::new("mock", sink)
-        .serve((r, w))
-        .await
-        .unwrap();
+    let service = handler.serve((r, w)).await.unwrap();
     prepare_client_peer(service.peer()).await;
     (service, log)
 }
@@ -484,4 +535,91 @@ async fn a_failing_relist_is_an_error_not_a_stale_list() {
             .is_err(),
         "revalidation must see the failure"
     );
+}
+
+struct AnswerAda;
+impl McpElicitationPrompter for AnswerAda {
+    fn prompt(
+        &self,
+        server: String,
+        request: McpElicitationRequest,
+        _dismissed: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'static, McpElicitationAnswer> {
+        assert_eq!(server, "mock");
+        assert!(
+            matches!(request, McpElicitationRequest::Form { ref message, .. } if message == "Your name?")
+        );
+        Box::pin(async { McpElicitationAnswer::Accept(json!({"name": "Ada"})) })
+    }
+}
+
+#[tokio::test]
+async fn elicitation_mid_call_reaches_the_prompter_and_returns_content() {
+    let handler = ChatShellClientHandler::new("mock", None).with_elicitation(Arc::new(AnswerAda));
+    let (service, log) = connect_with(false, handler).await;
+    let init = log
+        .lock()
+        .await
+        .iter()
+        .find(|m| m["method"] == "initialize")
+        .cloned()
+        .unwrap();
+    assert!(init["params"]["capabilities"]["elicitation"]["form"].is_object());
+    assert!(init["params"]["capabilities"]["elicitation"]["url"].is_object());
+
+    let result = call_tool_with_options(
+        service.peer(),
+        call("ask"),
+        McpCallOptions::default(),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let text = render_call_tool_result(&result).text;
+    assert!(text.contains(r#""action":"accept""#), "{text}");
+    assert!(text.contains(r#""name":"Ada""#), "{text}");
+}
+
+#[tokio::test]
+async fn without_a_prompter_elicitation_is_not_advertised_and_is_declined() {
+    let (service, log) = connect(false, None).await;
+    let init = log
+        .lock()
+        .await
+        .iter()
+        .find(|m| m["method"] == "initialize")
+        .cloned()
+        .unwrap();
+    assert!(init["params"]["capabilities"].get("elicitation").is_none());
+    let result = call_tool_with_options(
+        service.peer(),
+        call("ask"),
+        McpCallOptions::default(),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(
+        render_call_tool_result(&result)
+            .text
+            .contains(r#""action":"decline""#)
+    );
+}
+
+#[tokio::test]
+async fn prompts_are_listed_and_rendered_with_arguments() {
+    let (service, _log) = connect(false, None).await;
+    let prompts = list_all_prompts_bounded(service.peer(), "mock")
+        .await
+        .unwrap();
+    assert_eq!(prompts[0].name, "review");
+    assert!(prompts[0].arguments[0].required);
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("pr".to_string(), "42".to_string());
+    let text = get_prompt_text(service.peer(), "review", args)
+        .await
+        .unwrap();
+    assert_eq!(text, "Review PR 42");
 }

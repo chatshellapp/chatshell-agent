@@ -48,9 +48,21 @@ pub struct McpConnection {
 impl McpConnection {
     /// Connect to an MCP server via Streamable HTTP transport.
     pub async fn connect(config: McpHttpConfig) -> Result<Self> {
+        Self::connect_with_elicitation(config, None).await
+    }
+
+    /// Connect, showing the server's elicitation requests with `prompter`
+    /// (the capability is advertised only when one is given).
+    pub async fn connect_with_elicitation(
+        config: McpHttpConfig,
+        prompter: Option<std::sync::Arc<dyn super::elicitation::McpElicitationPrompter>>,
+    ) -> Result<Self> {
         tracing::info!("Connecting to MCP server via HTTP: {}", config.endpoint);
 
-        let handler = ChatShellClientHandler::new(&config.endpoint, None);
+        let mut handler = ChatShellClientHandler::new(&config.endpoint, None);
+        if let Some(prompter) = prompter {
+            handler = handler.with_elicitation(prompter);
+        }
         let running_service = connect_http_service(&config, handler).await?;
         let client = running_service.peer().clone();
 
@@ -112,6 +124,21 @@ impl McpConnection {
             .await
             .context("MCP resource read failed")?;
         Ok(render_read_resource_result(&result, None))
+    }
+
+    /// List the server's prompts (bounded; empty without the capability).
+    pub async fn list_prompts(&self) -> Result<Vec<super::prompt::McpPromptInfo>> {
+        super::prompt::list_all_prompts_bounded(&self.client, &self.label).await
+    }
+
+    /// Fetch one prompt rendered for the composer. Arguments are scanned
+    /// first.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        super::prompt::get_prompt_text(&self.client, name, arguments).await
     }
 
     /// Call a tool on the connected MCP server with the default deadline.

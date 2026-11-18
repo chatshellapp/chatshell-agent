@@ -18,6 +18,8 @@ rustls = ["chatshell-agent-core/rustls"]
 [dependencies]
 zstd.workspace = true
 anyhow.workspace = true
+futures.workspace = true
+uuid.workspace = true
 base64.workspace = true
 chatshell-agent-core = { path = "../chatshell-agent-core", default-features = false }
 parking_lot.workspace = true

@@ -207,6 +207,24 @@ pub struct McpResourceTemplateInfo {
     pub mime_type: Option<String>,
 }
 
+/// One argument an MCP prompt takes.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpPromptArgumentInfo {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+/// A prompt an MCP server offers (FR-13), for the composer.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpPromptInfo {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub arguments: Vec<McpPromptArgumentInfo>,
+}
+
 /// A server's resources and resource templates.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct McpResourceCatalog {
@@ -522,14 +540,125 @@ fn decode_master_key(master_key_b64: &str) -> anyhow::Result<[u8; core::crypto::
 // required") by message, and those details live in the inner causes.
 // ---------------------------------------------------------------------------
 
-/// Connect to an MCP server via HTTP. Returns a handle that can list tools
-/// and call them. Dropping the handle disconnects.
+/// What a server asks the user for during a call (FR-12).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum McpElicitation {
+    /// A form; `schema_json` is the requested JSON Schema (an object with
+    /// primitive-typed properties).
+    Form {
+        message: String,
+        schema_json: String,
+    },
+    /// A page to open in the browser, only on the user's action.
+    Url { message: String, url: String },
+}
+
+/// The user's answer to an elicitation.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum McpElicitationReply {
+    /// Form submitted (`content_json` is the answer object) or link
+    /// opened (`None`). The core validates and scans the content.
+    Accept {
+        content_json: Option<String>,
+    },
+    Decline,
+    Cancel,
+}
+
+/// Hands one elicitation answer back to the waiting call. Answering twice,
+/// or after the request was dismissed, does nothing.
+#[derive(uniffi::Object)]
+pub struct McpElicitationResponder {
+    sender: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<McpElicitationReply>>>,
+}
+
 #[uniffi::export]
-pub async fn connect_mcp_server(config: McpHttpConfig) -> Result<Arc<McpConnection>, AgentError> {
+impl McpElicitationResponder {
+    pub fn respond(&self, reply: McpElicitationReply) {
+        if let Some(sender) = self.sender.lock().take() {
+            let _ = sender.send(reply);
+        }
+    }
+}
+
+/// The client's elicitation dialog. `elicit` must return promptly (show
+/// the dialog and keep `responder`); the user's answer goes through
+/// `responder.respond`. Never answered automatically: the core declines
+/// after a timeout or when the server cancels, and then calls `dismiss`
+/// so the dialog closes.
+#[uniffi::export(with_foreign)]
+pub trait McpElicitationHandler: Send + Sync {
+    fn elicit(
+        &self,
+        request_id: String,
+        server_name: String,
+        request: McpElicitation,
+        responder: Arc<McpElicitationResponder>,
+    );
+    /// The request ended without an answer; close its dialog.
+    fn dismiss(&self, request_id: String);
+}
+
+struct ForeignElicitation(Arc<dyn McpElicitationHandler>);
+
+impl chatshell_agent_core::mcp::McpElicitationPrompter for ForeignElicitation {
+    fn prompt(
+        &self,
+        server: String,
+        request: chatshell_agent_core::mcp::McpElicitationRequest,
+        dismissed: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, chatshell_agent_core::mcp::McpElicitationAnswer> {
+        use chatshell_agent_core::mcp::{McpElicitationAnswer, McpElicitationRequest};
+        let handler = self.0.clone();
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let request = match request {
+            McpElicitationRequest::Form { message, schema } => McpElicitation::Form {
+                message,
+                schema_json: schema.to_string(),
+            },
+            McpElicitationRequest::Url { message, url } => McpElicitation::Url { message, url },
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let responder = Arc::new(McpElicitationResponder {
+            sender: parking_lot::Mutex::new(Some(sender)),
+        });
+        handler.elicit(request_id.clone(), server, request, responder);
+        Box::pin(async move {
+            tokio::select! {
+                reply = receiver => match reply {
+                    Ok(McpElicitationReply::Accept { content_json }) => McpElicitationAnswer::Accept(
+                        content_json
+                            .and_then(|json| serde_json::from_str(&json).ok())
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    Ok(McpElicitationReply::Cancel) => McpElicitationAnswer::Cancel,
+                    Ok(McpElicitationReply::Decline) | Err(_) => McpElicitationAnswer::Decline,
+                },
+                _ = dismissed.cancelled() => {
+                    handler.dismiss(request_id);
+                    McpElicitationAnswer::Decline
+                }
+            }
+        })
+    }
+}
+
+/// Connect to an MCP server via HTTP. Returns a handle that can list tools
+/// and call them. Dropping the handle disconnects. With `elicitation`, the
+/// server may ask the user for input during calls (the capability is
+/// advertised only then).
+#[uniffi::export]
+pub async fn connect_mcp_server(
+    config: McpHttpConfig,
+    elicitation: Option<Arc<dyn McpElicitationHandler>>,
+) -> Result<Arc<McpConnection>, AgentError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let config_inner: core::McpHttpConfig = config.into();
+    let prompter = elicitation.map(|handler| {
+        Arc::new(ForeignElicitation(handler)) as Arc<dyn core::mcp::McpElicitationPrompter>
+    });
     RUNTIME.spawn(async move {
-        let result = core::McpConnection::connect(config_inner).await;
+        let result = core::McpConnection::connect_with_elicitation(config_inner, prompter).await;
         let _ = tx.send(result);
     });
     let conn = rx
@@ -666,6 +795,77 @@ impl McpConnection {
         RUNTIME.spawn(async move {
             let result = conn.read_resource(&uri).await;
             let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|e| AgentError::Provider {
+                message: e.to_string(),
+            })?
+            .map_err(|e| AgentError::Provider {
+                message: format!("{e:#}"),
+            })
+    }
+
+    /// List the server's prompts (empty when it offers none).
+    pub async fn list_prompts(&self) -> Result<Vec<McpPromptInfo>, AgentError> {
+        let conn = self
+            .inner
+            .lock()
+            .clone()
+            .ok_or_else(|| AgentError::Provider {
+                message: "Not connected".to_string(),
+            })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        RUNTIME.spawn(async move {
+            let _ = tx.send(conn.list_prompts().await);
+        });
+        let prompts = rx
+            .await
+            .map_err(|e| AgentError::Provider {
+                message: e.to_string(),
+            })?
+            .map_err(|e| AgentError::Provider {
+                message: format!("{e:#}"),
+            })?;
+        Ok(prompts
+            .into_iter()
+            .map(|p| McpPromptInfo {
+                name: p.name,
+                title: p.title,
+                description: p.description,
+                arguments: p
+                    .arguments
+                    .into_iter()
+                    .map(|a| McpPromptArgumentInfo {
+                        name: a.name,
+                        title: a.title,
+                        description: a.description,
+                        required: a.required,
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Render one prompt for the composer (the user reviews it before
+    /// sending). Arguments are scanned first.
+    pub async fn get_prompt(
+        &self,
+        name: String,
+        arguments: HashMap<String, String>,
+    ) -> Result<String, AgentError> {
+        let conn = self
+            .inner
+            .lock()
+            .clone()
+            .ok_or_else(|| AgentError::Provider {
+                message: "Not connected".to_string(),
+            })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        RUNTIME.spawn(async move {
+            let _ = tx.send(
+                conn.get_prompt(&name, arguments.into_iter().collect())
+                    .await,
+            );
         });
         rx.await
             .map_err(|e| AgentError::Provider {
@@ -1802,4 +2002,94 @@ impl From<core::openui::OpenUiBlock> for OpenUiBlock {
 #[uniffi::export]
 pub fn parse_openui_block(source: String) -> Option<OpenUiBlock> {
     core::openui::parse_openui_block(&source).map(Into::into)
+}
+
+#[cfg(test)]
+mod elicitation_tests {
+    use super::*;
+    use chatshell_agent_core::mcp::{
+        McpElicitationAnswer, McpElicitationPrompter, McpElicitationRequest,
+    };
+
+    /// Answers immediately with `reply`, or keeps the responder unanswered.
+    struct Scripted {
+        reply: Option<McpElicitationReply>,
+        dismissed: parking_lot::Mutex<Vec<String>>,
+        held: parking_lot::Mutex<Vec<Arc<McpElicitationResponder>>>,
+    }
+
+    impl McpElicitationHandler for Scripted {
+        fn elicit(
+            &self,
+            _request_id: String,
+            server_name: String,
+            request: McpElicitation,
+            responder: Arc<McpElicitationResponder>,
+        ) {
+            assert_eq!(server_name, "srv");
+            assert!(matches!(request, McpElicitation::Form { .. }));
+            match &self.reply {
+                Some(reply) => responder.respond(reply.clone()),
+                None => self.held.lock().push(responder),
+            }
+        }
+        fn dismiss(&self, request_id: String) {
+            self.dismissed.lock().push(request_id);
+        }
+    }
+
+    fn scripted(reply: Option<McpElicitationReply>) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            reply,
+            dismissed: Default::default(),
+            held: Default::default(),
+        })
+    }
+
+    fn form() -> McpElicitationRequest {
+        McpElicitationRequest::Form {
+            message: "Name?".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_json_reaches_the_core() {
+        let handler = scripted(Some(McpElicitationReply::Accept {
+            content_json: Some(r#"{"name":"Ada"}"#.into()),
+        }));
+        let answer = ForeignElicitation(handler)
+            .prompt("srv".into(), form(), CancellationToken::new())
+            .await;
+        assert_eq!(
+            answer,
+            McpElicitationAnswer::Accept(serde_json::json!({"name": "Ada"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissal_declines_and_closes_the_dialog() {
+        let handler = scripted(None);
+        let token = CancellationToken::new();
+        token.cancel();
+        let answer = ForeignElicitation(handler.clone())
+            .prompt("srv".into(), form(), token)
+            .await;
+        assert_eq!(answer, McpElicitationAnswer::Decline);
+        assert_eq!(handler.dismissed.lock().len(), 1);
+        // A late answer is ignored.
+        handler.held.lock()[0].respond(McpElicitationReply::Cancel);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_responder_declines() {
+        let handler = scripted(None);
+        let ask = ForeignElicitation(handler.clone()).prompt(
+            "srv".into(),
+            form(),
+            CancellationToken::new(),
+        );
+        handler.held.lock().clear();
+        assert_eq!(ask.await, McpElicitationAnswer::Decline);
+    }
 }

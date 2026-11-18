@@ -66,6 +66,7 @@ pub struct ChatShellClientHandler {
     progress: ProgressDispatcher,
     sink: Option<Arc<dyn McpNotificationSink>>,
     list_changed_pending: Arc<AtomicBool>,
+    elicitation: Option<Arc<dyn super::elicitation::McpElicitationPrompter>>,
 }
 
 impl ChatShellClientHandler {
@@ -77,7 +78,23 @@ impl ChatShellClientHandler {
             progress: ProgressDispatcher::new(),
             sink,
             list_changed_pending: Arc::new(AtomicBool::new(false)),
+            elicitation: None,
         }
+    }
+
+    /// Handle `elicitation/create` with `prompter` and advertise the
+    /// capability (form and URL modes). Without a prompter the capability
+    /// is not advertised and requests are declined.
+    pub fn with_elicitation(
+        mut self,
+        prompter: Arc<dyn super::elicitation::McpElicitationPrompter>,
+    ) -> Self {
+        let mut capability = rmcp::model::ElicitationCapability::new();
+        capability.form = Some(rmcp::model::FormElicitationCapability::new());
+        capability.url = Some(rmcp::model::UrlElicitationCapability::new());
+        self.info.capabilities.elicitation = Some(capability);
+        self.elicitation = Some(prompter);
+        self
     }
 
     /// Report `version` (the app's version) in `clientInfo` instead of the
@@ -150,6 +167,21 @@ fn log_server_message(server: &str, params: &LoggingMessageNotificationParam) {
 impl ClientHandler for ChatShellClientHandler {
     fn get_info(&self) -> ClientConfig {
         self.info.clone()
+    }
+
+    async fn create_elicitation(
+        &self,
+        request: rmcp::model::ElicitRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ElicitResult, rmcp::ErrorData> {
+        Ok(super::elicitation::resolve(
+            self.elicitation.clone(),
+            &self.server,
+            &request,
+            context.ct.clone(),
+            super::elicitation::ELICITATION_TIMEOUT,
+        )
+        .await)
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
