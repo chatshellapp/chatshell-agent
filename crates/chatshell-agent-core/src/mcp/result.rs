@@ -16,10 +16,38 @@ pub struct RenderedToolResult {
     pub is_error: bool,
 }
 
+/// Render an image block as a `data:` line the hosts lift into an image
+/// block. Raster images are decoded and normalized first
+/// ([`crate::image_fit::fit_untrusted_image`]): a defective image passes
+/// our decoders but fails the whole provider request, and an oversized one
+/// exceeds provider limits. An image that cannot be decoded becomes a text
+/// note instead. SVG stays as is (the model reads it as source).
+fn render_image(mime_type: &str, data: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    if mime_type.eq_ignore_ascii_case("image/svg+xml") {
+        return format!("data:{mime_type};base64,{data}");
+    }
+    let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let fitted = STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))
+        .and_then(|bytes| crate::image_fit::fit_untrusted_image(&bytes));
+    match fitted {
+        Ok(image) => format!(
+            "data:{};base64,{}",
+            image.mime_type,
+            STANDARD.encode(&image.bytes)
+        ),
+        Err(reason) => format!(
+            "[The tool returned an image ({mime_type}) that could not be decoded: {reason}]"
+        ),
+    }
+}
+
 fn render_block(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(raw) => Some(raw.text.clone()),
-        ContentBlock::Image(raw) => Some(format!("data:{};base64,{}", raw.mime_type, raw.data)),
+        ContentBlock::Image(raw) => Some(render_image(&raw.mime_type, &raw.data)),
         ContentBlock::Audio(raw) => Some(format!("data:{};base64,{}", raw.mime_type, raw.data)),
         ContentBlock::Resource(raw) => Some(match &raw.resource {
             ResourceContents::TextResourceContents {
@@ -205,17 +233,81 @@ mod tests {
         assert!(r.text.len() < MAX_STRUCTURED_CHARS + 200);
     }
 
+    fn png_base64(width: u32, height: u32) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            height,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut out = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        STANDARD.encode(out)
+    }
+
     #[test]
     fn image_and_resource_blocks() {
         let r = render_call_tool_result(&result(json!({
             "content": [
-                {"type": "image", "data": "AAA", "mimeType": "image/png"},
+                {"type": "image", "data": png_base64(2, 2), "mimeType": "image/png"},
                 {"type": "resource", "resource": {"uri": "file:///a.txt", "mimeType": "text/plain", "text": "hi"}}
             ]
         })));
-        assert_eq!(
-            r.text,
-            "data:image/png;base64,AAA\ndata:text/plain;file:///a.txt:hi"
-        );
+        let (image_line, resource_line) = r.text.split_once('\n').unwrap();
+        assert!(image_line.starts_with("data:image/png;base64,"));
+        assert!(crate::tool_images::split_image_lines(image_line).is_some());
+        assert_eq!(resource_line, "data:text/plain;file:///a.txt:hi");
+    }
+
+    #[test]
+    fn undecodable_images_become_a_note() {
+        let r = render_call_tool_result(&result(json!({
+            "content": [{"type": "image", "data": "AAA", "mimeType": "image/png"}]
+        })));
+        assert!(!r.text.contains("data:image/"), "{}", r.text);
+        assert!(r.text.contains("could not be decoded"));
+    }
+
+    /// PNG chunk CRC (CRC-32/ISO-HDLC), bitwise.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// The MCP reference server's `getTinyImage` PNG has a bad `iCCP` CRC;
+    /// strict providers (xAI) reject it. Set `MCP_TINY_IMAGE_B64` to a file
+    /// holding its base64 to check the rendered image is clean.
+    #[test]
+    fn reference_server_tiny_image_is_rendered_clean() {
+        let Ok(path) = std::env::var("MCP_TINY_IMAGE_B64") else {
+            return;
+        };
+        let data = std::fs::read_to_string(path).unwrap();
+        let r = render_call_tool_result(&result(json!({
+            "content": [{"type": "image", "data": data.trim(), "mimeType": "image/png"}]
+        })));
+        let (_, images) = crate::tool_images::split_image_lines(&r.text).unwrap();
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let bytes = STANDARD.decode(&images[0].base64).unwrap();
+        // Every chunk CRC must verify.
+        let mut i = 8;
+        while i < bytes.len() {
+            let len = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+            let crc = u32::from_be_bytes(bytes[i + 8 + len..i + 12 + len].try_into().unwrap());
+            assert_eq!(crc32(&bytes[i + 4..i + 8 + len]), crc, "chunk at {i}");
+            i += 12 + len;
+        }
     }
 }

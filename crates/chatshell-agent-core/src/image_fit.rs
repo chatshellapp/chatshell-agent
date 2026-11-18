@@ -27,6 +27,9 @@ const JPEG_QUALITIES: [u8; 4] = [85, 70, 55, 40];
 const SCALE_STEP: f64 = 0.75;
 /// Stop shrinking below this longest side.
 const MIN_SIDE: u32 = 200;
+/// Fewest total pixels a provider accepts (xAI rejects images below 512
+/// pixels, e.g. a 20x20 icon); smaller images are upscaled.
+pub const MIN_PIXELS: u64 = 512;
 
 /// An image ready for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +52,33 @@ fn provider_format(format: ImageFormat) -> Option<&'static str> {
     }
 }
 
+/// [`fit_image`] for images from sources we do not control (MCP servers).
+///
+/// `fit_image` passes an image that already fits through byte-for-byte
+/// after reading only its header. Tolerant decoders (ours included) accept
+/// files that strict provider decoders reject, so an untrusted image is
+/// fully decoded, and a PNG is re-encoded: a defect such as a bad
+/// ancillary-chunk CRC (seen in the MCP reference server's `getTinyImage`,
+/// rejected by xAI as "Invalid PNG image") passes every decoder here but
+/// fails the whole provider request. PNG re-encoding is lossless; other
+/// formats pass through once they decode.
+pub fn fit_untrusted_image(bytes: &[u8]) -> Result<FittedImage, String> {
+    let result = fit_image(bytes)?;
+    if result.changed {
+        // Already decoded and re-encoded by `fit_image`.
+        return Ok(result);
+    }
+    let image = image::load_from_memory(&result.bytes)
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    if result.mime_type == "image/png" {
+        return fit_image(&encode_png(&image)?).map(|clean| FittedImage {
+            changed: true,
+            ..clean
+        });
+    }
+    Ok(result)
+}
+
 /// Fit `bytes` to the provider limits. Errors when the bytes are not a
 /// decodable image or cannot be brought under the budget.
 pub fn fit_image(bytes: &[u8]) -> Result<FittedImage, String> {
@@ -61,6 +91,10 @@ pub fn fit_image(bytes: &[u8]) -> Result<FittedImage, String> {
     let (width, height) = reader
         .into_dimensions()
         .map_err(|e| format!("unreadable image: {e}"))?;
+
+    if (width as u64) * (height as u64) < MIN_PIXELS {
+        return upscale_tiny(bytes, format, width, height);
+    }
 
     if let Some(mime) = provider_format(format)
         && width.max(height) <= MAX_SIDE
@@ -107,6 +141,30 @@ pub fn fit_image(bytes: &[u8]) -> Result<FittedImage, String> {
     }
 }
 
+/// Upscale an image below [`MIN_PIXELS`] by the smallest whole factor that
+/// reaches it. Nearest-neighbor keeps icons and pixel art crisp; PNG keeps
+/// it lossless (the result is tiny either way).
+fn upscale_tiny(
+    bytes: &[u8],
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+) -> Result<FittedImage, String> {
+    let pixels = (width as u64) * (height as u64);
+    if pixels == 0 {
+        return Err("image has no pixels".to_string());
+    }
+    let image = image::load_from_memory_with_format(bytes, format)
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    let mut factor: u32 = 2;
+    while pixels * (factor as u64).pow(2) < MIN_PIXELS {
+        factor += 1;
+    }
+    let (w, h) = (width * factor, height * factor);
+    let scaled = image.resize_exact(w, h, image::imageops::FilterType::Nearest);
+    Ok(fitted(encode_png(&scaled)?, "image/png", w, h))
+}
+
 fn fitted(bytes: Vec<u8>, mime: &str, width: u32, height: u32) -> FittedImage {
     FittedImage {
         bytes,
@@ -151,6 +209,73 @@ mod tests {
         let mut out = Vec::new();
         image.write_to(&mut Cursor::new(&mut out), format).unwrap();
         out
+    }
+
+    /// A valid PNG with an ancillary `tEXt` chunk whose CRC is wrong.
+    fn png_with_bad_ancillary_crc() -> Vec<u8> {
+        let png = encode(
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(32, 32, Rgba([1, 2, 3, 128]))),
+            ImageFormat::Png,
+        );
+        // Insert after the 8-byte signature and 25-byte IHDR chunk.
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&5u32.to_be_bytes());
+        chunk.extend_from_slice(b"tEXtk\0abc");
+        chunk.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let mut out = png[..33].to_vec();
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&png[33..]);
+        out
+    }
+
+    #[test]
+    fn tiny_images_are_upscaled_to_the_pixel_minimum() {
+        let tiny = encode(
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(20, 20, Rgb([200, 0, 0]))),
+            ImageFormat::Jpeg,
+        );
+        let fitted = fit_image(&tiny).unwrap();
+        assert!(fitted.changed);
+        assert_eq!((fitted.width, fitted.height), (40, 40));
+        assert_eq!(fitted.mime_type, "image/png");
+        let decoded = image::load_from_memory(&fitted.bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (40, 40));
+
+        let strip = encode(
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 10, Rgba([0, 0, 0, 0]))),
+            ImageFormat::Png,
+        );
+        let fitted = fit_image(&strip).unwrap();
+        assert_eq!((fitted.width, fitted.height), (8, 80));
+        assert!(u64::from(fitted.width * fitted.height) >= MIN_PIXELS);
+    }
+
+    #[test]
+    fn untrusted_png_with_a_bad_chunk_is_reencoded_clean() {
+        let bad = png_with_bad_ancillary_crc();
+        assert!(
+            !fit_image(&bad).unwrap().changed,
+            "fit_image alone passes the defect through"
+        );
+        let clean = fit_untrusted_image(&bad).unwrap();
+        assert!(clean.changed);
+        assert_eq!(clean.mime_type, "image/png");
+        assert_eq!((clean.width, clean.height), (32, 32));
+        assert!(!clean.bytes.windows(4).any(|w| w == b"tEXt"));
+        let decoded = image::load_from_memory(&clean.bytes).unwrap();
+        assert!(decoded.color().has_alpha());
+    }
+
+    #[test]
+    fn untrusted_jpeg_passes_through_and_garbage_errors() {
+        let jpeg = encode(
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 32, Rgb([9, 9, 9]))),
+            ImageFormat::Jpeg,
+        );
+        let fitted = fit_untrusted_image(&jpeg).unwrap();
+        assert!(!fitted.changed);
+        assert_eq!(fitted.bytes, jpeg);
+        assert!(fit_untrusted_image(b"not an image").is_err());
     }
 
     /// Deterministic noise: incompressible enough to exercise the ladder.
@@ -212,7 +337,7 @@ mod tests {
     #[test]
     fn bmp_is_converted_because_providers_reject_it() {
         let bmp = encode(
-            DynamicImage::ImageRgb8(RgbImage::new(10, 10)),
+            DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
             ImageFormat::Bmp,
         );
         let fitted = fit_image(&bmp).unwrap();
