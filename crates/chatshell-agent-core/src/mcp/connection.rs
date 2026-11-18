@@ -184,6 +184,7 @@ pub async fn connect_http_service(
         .serve(transport)
         .await
         .context("Failed to connect to MCP server via HTTP")?;
+    super::handler::prepare_client_peer(running_service.peer()).await;
 
     Ok(running_service)
 }

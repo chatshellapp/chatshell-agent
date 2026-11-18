@@ -55,11 +55,19 @@ fn render_block(block: &ContentBlock) -> Option<String> {
 
 /// Whether some text block already carries `structured` (the spec asks
 /// servers to mirror structured output as serialized JSON text). Compared
-/// as parsed JSON so whitespace and key order do not matter.
+/// as parsed JSON so whitespace and key order do not matter; any JSON value
+/// is allowed (2026-07-28), and a string value also matches its bare text.
 fn text_mirrors_structured(content: &[ContentBlock], structured: &serde_json::Value) -> bool {
     content.iter().any(|block| match block {
-        ContentBlock::Text(raw) => serde_json::from_str::<serde_json::Value>(raw.text.trim())
-            .is_ok_and(|parsed| &parsed == structured),
+        ContentBlock::Text(raw) => {
+            let text = raw.text.trim();
+            // A string value is usually echoed bare, not as a JSON literal.
+            structured
+                .as_str()
+                .is_some_and(|value| value.trim() == text)
+                || serde_json::from_str::<serde_json::Value>(text)
+                    .is_ok_and(|parsed| &parsed == structured)
+        }
         _ => false,
     })
 }
@@ -147,6 +155,24 @@ mod tests {
             "structuredContent": {"a": 1, "b": 2}
         })));
         assert_eq!(r.text, "{ \"b\": 2,\n \"a\": 1 }");
+    }
+
+    #[test]
+    fn non_object_structured_values_are_matched() {
+        for (text, structured) in [
+            ("[1, 2]", json!([1, 2])),
+            ("42", json!(42)),
+            ("\"sunny\"", json!("sunny")),
+            ("sunny", json!("sunny")),
+        ] {
+            let r = render_call_tool_result(&result(json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": structured
+            })));
+            assert_eq!(r.text, text, "{structured}");
+        }
+        let r = render_call_tool_result(&result(json!({"structuredContent": [1, 2]})));
+        assert!(r.text.contains("<structured_content>"));
     }
 
     #[test]

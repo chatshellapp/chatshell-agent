@@ -32,6 +32,7 @@ pub use call::{
 pub use connection::{McpClientService, McpConnection, McpHttpConfig, connect_http_service};
 pub use handler::{
     ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, chatshell_client_info,
+    prepare_client_peer,
 };
 pub use listing::{
     ListTruncation, MAX_CURSOR_BYTES, MAX_LIST_ITEMS, MAX_LIST_PAGES, Paginated,

@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use rmcp::handler::client::progress::ProgressDispatcher;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, Implementation, LoggingLevel, LoggingMessageNotificationParam,
-    ProgressNotificationParam,
+    ClientCapabilities, ClientConfig, Implementation, LoggingLevel,
+    LoggingMessageNotificationParam, ProgressNotificationParam, ProtocolVersion,
 };
 use rmcp::service::NotificationContext;
 use rmcp::{ClientHandler, RoleClient};
@@ -34,16 +34,34 @@ pub trait McpNotificationSink: Send + Sync + 'static {
 }
 
 /// The identity and capabilities every ChatShell MCP client sends.
-pub fn chatshell_client_info() -> ClientInfo {
-    ClientInfo::new(
+///
+/// The requested protocol version is pinned to the newest revision that
+/// still uses the `initialize` handshake (2025-11-25): rmcp 3 would
+/// otherwise request 2026-07-28 even over `initialize`. Moving to the
+/// stateless revision is a deliberate, flag-gated step (FR-16).
+pub fn chatshell_client_info() -> ClientConfig {
+    ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("chatshell", env!("CARGO_PKG_VERSION")),
     )
+    .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+}
+
+/// Settings applied to every client session right after the handshake.
+///
+/// rmcp 3's response cache is turned off: with it on, a failing
+/// `tools/list` re-fetch serves the last cached list (SEP-2549
+/// stale-while-error), which would hide a revoked token from the cached
+/// connection revalidation, and server TTLs would skip that round trip
+/// entirely. Every list is a live request, as it was on rmcp 2.
+pub async fn prepare_client_peer(peer: &rmcp::service::Peer<RoleClient>) {
+    peer.set_response_cache_config(rmcp::ClientCacheConfig::disabled())
+        .await;
 }
 
 #[derive(Clone)]
 pub struct ChatShellClientHandler {
-    info: ClientInfo,
+    info: ClientConfig,
     server: Arc<str>,
     progress: ProgressDispatcher,
     sink: Option<Arc<dyn McpNotificationSink>>,
@@ -130,7 +148,7 @@ fn log_server_message(server: &str, params: &LoggingMessageNotificationParam) {
 }
 
 impl ClientHandler for ChatShellClientHandler {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
 

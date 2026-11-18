@@ -8,8 +8,8 @@ use std::time::Duration;
 use chatshell_agent_core::mcp::{
     ChatShellClientHandler, McpCallOptions, McpNotificationSink, call_tool_with_options,
     list_all_resource_templates_bounded, list_all_resources_bounded, list_all_tools_bounded,
-    read_resource_with_options, render_call_tool_result, render_read_resource_result,
-    supports_resources,
+    prepare_client_peer, read_resource_with_options, render_call_tool_result,
+    render_read_resource_result, supports_resources,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
@@ -62,6 +62,12 @@ async fn run_server(
                 }}))
                 .await
             }
+            "tools/list" if extra_tool.load(Ordering::SeqCst) >= 100 => {
+                // Credentials revoked: every list fails from now on.
+                send(json!({"jsonrpc": "2.0", "id": id, "error": {
+                    "code": -32001, "message": "Unauthorized"}}))
+                .await
+            }
             "tools/list" => {
                 let cursor = msg["params"]["cursor"].as_str().map(str::to_string);
                 let (tools, next) = if loop_cursor {
@@ -79,7 +85,9 @@ async fn run_server(
                         }
                     }
                 };
-                let mut result = json!({"tools": tools});
+                // Cache hints, as a server that supports response caching
+                // sends them (they must never mask a later failure).
+                let mut result = json!({"tools": tools, "ttlMs": 60000, "cacheScope": "public"});
                 if let Some(n) = next {
                     result["nextCursor"] = json!(n);
                 }
@@ -155,6 +163,12 @@ async fn run_server(
                             "structuredContent": {"temperature": 22.5}}}))
                         .await
                     }
+                    "revoke" => {
+                        extra_tool.store(100, Ordering::SeqCst);
+                        send(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "content": [{"type": "text", "text": "revoked"}]}}))
+                        .await;
+                    }
                     "announce" => {
                         extra_tool.fetch_add(1, Ordering::SeqCst);
                         send(json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -209,6 +223,7 @@ async fn connect(
         .serve((r, w))
         .await
         .unwrap();
+    prepare_client_peer(service.peer()).await;
     (service, log)
 }
 
@@ -418,4 +433,55 @@ async fn resources_are_listed_across_pages_and_read() {
         .read_resource(ReadResourceRequestParams::new("mem://missing"))
         .await;
     assert!(missing.is_err());
+}
+
+#[tokio::test]
+async fn initialize_requests_the_2025_11_25_revision() {
+    let (_service, log) = connect(false, None).await;
+    let init = log
+        .lock()
+        .await
+        .iter()
+        .find(|m| m["method"] == "initialize")
+        .cloned()
+        .unwrap();
+    assert_eq!(init["params"]["protocolVersion"], "2025-11-25");
+    assert_eq!(init["params"]["clientInfo"]["name"], "chatshell");
+    let methods: Vec<String> = log
+        .lock()
+        .await
+        .iter()
+        .filter_map(|m| m["method"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !methods.iter().any(|m| m == "server/discover"),
+        "{methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_relist_is_an_error_not_a_stale_list() {
+    let (service, _log) = connect(false, None).await;
+    assert_eq!(
+        list_all_tools_bounded(service.peer(), "mock")
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    call_tool_with_options(
+        service.peer(),
+        call("revoke"),
+        McpCallOptions::default(),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(
+        list_all_tools_bounded(service.peer(), "mock")
+            .await
+            .is_err(),
+        "revalidation must see the failure"
+    );
 }
