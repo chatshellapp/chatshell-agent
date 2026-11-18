@@ -171,6 +171,9 @@ pub struct McpHttpConfig {
     pub endpoint: String,
     pub auth_token: Option<String>,
     pub custom_headers: HashMap<String, String>,
+    /// Try the 2026-07-28 revision first (`server/discover`, falling back
+    /// to `initialize` for older servers). Experimental, off by default.
+    pub prefer_2026_protocol: bool,
 }
 
 /// A tool exposed by an MCP server.
@@ -1212,6 +1215,11 @@ impl From<McpHttpConfig> for core::McpHttpConfig {
             endpoint: value.endpoint,
             auth_token: value.auth_token,
             custom_headers: value.custom_headers,
+            protocol: if value.prefer_2026_protocol {
+                core::mcp::McpProtocolMode::PreferModern
+            } else {
+                core::mcp::McpProtocolMode::Legacy
+            },
         }
     }
 }

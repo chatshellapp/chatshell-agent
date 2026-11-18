@@ -28,7 +28,7 @@ mod result;
 mod types;
 
 pub use call::{
-    DEFAULT_CALL_TIMEOUT_SECS, DEFAULT_MAX_TOTAL_TIMEOUT_SECS, McpCallOptions,
+    DEFAULT_CALL_TIMEOUT_SECS, DEFAULT_MAX_TOTAL_TIMEOUT_SECS, MAX_INPUT_ROUNDS, McpCallOptions,
     call_tool_with_options, read_resource_with_options,
 };
 pub use connection::{McpClientService, McpConnection, McpHttpConfig, connect_http_service};
@@ -37,8 +37,9 @@ pub use elicitation::{
     scan_answer, validate_form_content,
 };
 pub use handler::{
-    ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, McpRootsProvider,
-    chatshell_client_info, prepare_client_peer, roots_result,
+    ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, McpProtocolMode,
+    McpRootsProvider, chatshell_client_info, prepare_client_peer, roots_result, serve_client,
+    start_subscriptions,
 };
 pub use listing::{
     ListTruncation, MAX_CURSOR_BYTES, MAX_LIST_ITEMS, MAX_LIST_PAGES, Paginated,

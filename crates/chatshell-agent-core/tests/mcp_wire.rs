@@ -351,7 +351,7 @@ async fn timeout_fails_and_sends_cancellation() {
     let (service, log) = connect(false, None).await;
     let options = McpCallOptions::from_settings(Some(1), Some(false), None);
     let started = std::time::Instant::now();
-    let err = call_tool_with_options(service.peer(), call("slow"), options, None, |_| {})
+    let err = call_tool_with_options(service.peer(), call("slow"), options, None, None, |_| {})
         .await
         .unwrap_err();
     assert!(matches!(err, rmcp::service::ServiceError::Timeout { .. }));
@@ -365,6 +365,7 @@ async fn timeout_fails_and_sends_cancellation() {
         service.peer(),
         call("structured"),
         McpCallOptions::default(),
+        None,
         None,
         |_| {},
     )
@@ -385,6 +386,7 @@ async fn progress_resets_deadline_and_is_forwarded() {
         call("progress"),
         options,
         Some(service.service().progress_dispatcher()),
+        None,
         move |_| {
             seen2.fetch_add(1, Ordering::SeqCst);
         },
@@ -399,9 +401,16 @@ async fn progress_resets_deadline_and_is_forwarded() {
 async fn progress_without_reset_still_times_out() {
     let (service, _log) = connect(false, None).await;
     let options = McpCallOptions::from_settings(Some(1), Some(false), None);
-    let err = call_tool_with_options(service.peer(), call("progress"), options, None, |_| {})
-        .await
-        .unwrap_err();
+    let err = call_tool_with_options(
+        service.peer(),
+        call("progress"),
+        options,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, rmcp::service::ServiceError::Timeout { .. }));
 }
 
@@ -410,7 +419,15 @@ async fn dropping_the_call_sends_cancellation() {
     let (service, log) = connect(false, None).await;
     let peer = service.peer().clone();
     let task = tokio::spawn(async move {
-        call_tool_with_options(&peer, call("slow"), McpCallOptions::default(), None, |_| {}).await
+        call_tool_with_options(
+            &peer,
+            call("slow"),
+            McpCallOptions::default(),
+            None,
+            None,
+            |_| {},
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     task.abort();
@@ -428,6 +445,7 @@ async fn completed_call_sends_no_cancellation() {
         call("structured"),
         McpCallOptions::default(),
         None,
+        None,
         |_| {},
     )
     .await
@@ -444,6 +462,7 @@ async fn list_changed_is_debounced_and_relist_sees_new_tool() {
         service.peer(),
         call("announce"),
         McpCallOptions::default(),
+        None,
         None,
         |_| {},
     )
@@ -468,6 +487,7 @@ async fn progress_flood_cannot_outlive_the_ceiling() {
         call("flood"),
         options,
         Some(service.service().progress_dispatcher()),
+        None,
         |_| {},
     )
     .await
@@ -494,9 +514,10 @@ async fn resources_are_listed_across_pages_and_read() {
         .unwrap();
     assert_eq!(templates[0].uri_template, "mem://{key}");
 
-    let read = read_resource_with_options(service.peer(), "mem://a", McpCallOptions::default())
-        .await
-        .unwrap();
+    let read =
+        read_resource_with_options(service.peer(), "mem://a", McpCallOptions::default(), None)
+            .await
+            .unwrap();
     assert!(render_read_resource_result(&read, None).contains("alpha"));
 
     let missing = service
@@ -545,6 +566,7 @@ async fn a_failing_relist_is_an_error_not_a_stale_list() {
         call("revoke"),
         McpCallOptions::default(),
         None,
+        None,
         |_| {},
     )
     .await
@@ -592,6 +614,7 @@ async fn elicitation_mid_call_reaches_the_prompter_and_returns_content() {
         call("ask"),
         McpCallOptions::default(),
         None,
+        None,
         |_| {},
     )
     .await
@@ -617,6 +640,7 @@ async fn without_a_prompter_elicitation_is_not_advertised_and_is_declined() {
         call("ask"),
         McpCallOptions::default(),
         None,
+        None,
         |_| {},
     )
     .await
@@ -638,7 +662,7 @@ async fn prompts_are_listed_and_rendered_with_arguments() {
     assert!(prompts[0].arguments[0].required);
     let mut args = std::collections::BTreeMap::new();
     args.insert("pr".to_string(), "42".to_string());
-    let text = get_prompt_text(service.peer(), "review", args)
+    let text = get_prompt_text(service.peer(), "review", args, None)
         .await
         .unwrap();
     assert_eq!(text, "Review PR 42");
@@ -674,6 +698,7 @@ async fn roots_list_answers_the_current_workspace_without_hanging() {
         call("roots"),
         McpCallOptions::default(),
         None,
+        None,
         |_| {},
     )
     .await
@@ -689,6 +714,7 @@ async fn roots_list_answers_the_current_workspace_without_hanging() {
         service.peer(),
         call("roots"),
         McpCallOptions::default(),
+        None,
         None,
         |_| {},
     )

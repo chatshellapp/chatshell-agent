@@ -16,9 +16,11 @@ use rmcp::RoleClient;
 use rmcp::handler::client::progress::ProgressDispatcher;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
-    ClientRequest, ProgressNotificationParam, ReadResourceRequest, ReadResourceRequestParams,
-    ReadResourceResult, RequestId, ServerResult,
+    ClientRequest, InputResponses, ProgressNotificationParam, ReadResourceRequest,
+    ReadResourceRequestParams, ReadResourceResult, RequestId, ServerResult,
 };
+
+use super::handler::ChatShellClientHandler;
 use rmcp::service::{Peer, PeerRequestOptions, ServiceError};
 
 /// Default per-call deadline.
@@ -107,36 +109,129 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Most `input_required` rounds one call may take (FR-17; the SDK default).
+pub const MAX_INPUT_ROUNDS: usize = rmcp::model::DEFAULT_MRTR_MAX_ROUNDS;
+
 /// Call a tool with the given deadline settings. Progress notifications for
 /// this call reach `on_progress` when a `dispatcher` is supplied (the one
-/// owned by the connection's [`super::ChatShellClientHandler`]).
+/// owned by the connection's [`super::ChatShellClientHandler`]). A
+/// 2026-07-28 server may answer `input_required` (MRTR, FR-17): `input`
+/// (the connection's handler) fulfils those rounds; without it, or past
+/// [`MAX_INPUT_ROUNDS`], the call fails.
 pub async fn call_tool_with_options(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
     options: McpCallOptions,
     dispatcher: Option<&ProgressDispatcher>,
-    on_progress: impl FnMut(ProgressNotificationParam) + Send,
+    input: Option<&ChatShellClientHandler>,
+    mut on_progress: impl FnMut(ProgressNotificationParam) + Send,
 ) -> Result<CallToolResult, ServiceError> {
-    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
-    match request_with_options(peer, request, options, dispatcher, on_progress).await? {
-        ServerResult::CallToolResult(r) => Ok(r),
-        _ => Err(ServiceError::UnexpectedResponse),
+    let mut params = params;
+    let mut rounds = InputRounds::default();
+    loop {
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
+        match request_with_options(peer, request, options, dispatcher, &mut on_progress).await? {
+            ServerResult::CallToolResult(r) => return Ok(r),
+            ServerResult::InputRequiredResult(required) => {
+                (params.input_responses, params.request_state) =
+                    rounds.next(input, required).await?;
+            }
+            _ => return Err(ServiceError::UnexpectedResponse),
+        }
     }
 }
 
-/// Read a resource with the same deadline and cancel-on-drop semantics as
-/// a tool call.
+/// Read a resource with the same deadline, cancel-on-drop, and MRTR
+/// handling as a tool call.
 pub async fn read_resource_with_options(
     peer: &Peer<RoleClient>,
     uri: &str,
     options: McpCallOptions,
+    input: Option<&ChatShellClientHandler>,
 ) -> Result<ReadResourceResult, ServiceError> {
-    let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
-        ReadResourceRequestParams::new(uri),
-    ));
-    match request_with_options(peer, request, options, None, |_| {}).await? {
-        ServerResult::ReadResourceResult(r) => Ok(r),
-        _ => Err(ServiceError::UnexpectedResponse),
+    let mut params = ReadResourceRequestParams::new(uri);
+    let mut rounds = InputRounds::default();
+    loop {
+        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(params.clone()));
+        match request_with_options(peer, request, options, None, &mut |_| {}).await? {
+            ServerResult::ReadResourceResult(r) => return Ok(r),
+            ServerResult::InputRequiredResult(required) => {
+                (params.input_responses, params.request_state) =
+                    rounds.next(input, required).await?;
+            }
+            _ => return Err(ServiceError::UnexpectedResponse),
+        }
+    }
+}
+
+/// Get a prompt with the same deadline, cancel-on-drop, and MRTR handling
+/// as a tool call.
+pub async fn get_prompt_with_options(
+    peer: &Peer<RoleClient>,
+    mut params: rmcp::model::GetPromptRequestParams,
+    options: McpCallOptions,
+    input: Option<&ChatShellClientHandler>,
+) -> Result<rmcp::model::GetPromptResult, ServiceError> {
+    let mut rounds = InputRounds::default();
+    loop {
+        let request =
+            ClientRequest::GetPromptRequest(rmcp::model::GetPromptRequest::new(params.clone()));
+        match request_with_options(peer, request, options, None, &mut |_| {}).await? {
+            ServerResult::GetPromptResult(r) => return Ok(r),
+            ServerResult::InputRequiredResult(required) => {
+                (params.input_responses, params.request_state) =
+                    rounds.next(input, required).await?;
+            }
+            _ => return Err(ServiceError::UnexpectedResponse),
+        }
+    }
+}
+
+/// Bookkeeping for the `input_required` rounds of one request.
+#[derive(Default)]
+pub(crate) struct InputRounds {
+    taken: usize,
+    state_only: u32,
+}
+
+impl InputRounds {
+    /// Fulfil one round through `input` and return what the retry carries
+    /// (`inputResponses`, `requestState`). Fails past [`MAX_INPUT_ROUNDS`],
+    /// without a handler, or on an empty round. Rounds that only carry
+    /// server state back off like the SDK (50 ms doubling, capped at 250 ms).
+    pub(crate) async fn next(
+        &mut self,
+        input: Option<&ChatShellClientHandler>,
+        required: rmcp::model::InputRequiredResult,
+    ) -> Result<(Option<InputResponses>, Option<String>), ServiceError> {
+        self.taken += 1;
+        if self.taken >= MAX_INPUT_ROUNDS {
+            return Err(ServiceError::InputRequiredRoundsExceeded {
+                max_rounds: MAX_INPUT_ROUNDS,
+            });
+        }
+        let Some(handler) = input else {
+            return Err(ServiceError::McpError(rmcp::ErrorData::invalid_request(
+                "the server asked for input this client cannot provide here",
+                None,
+            )));
+        };
+        let requests = required.input_requests.unwrap_or_default();
+        if requests.is_empty() {
+            if required.request_state.is_none() {
+                return Err(ServiceError::UnexpectedResponse);
+            }
+            let millis = (50u64 << self.state_only.min(3)).min(250);
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            self.state_only += 1;
+            return Ok((None, required.request_state));
+        }
+        self.state_only = 0;
+        let responses = handler.fulfill_input_requests(requests).await?;
+        Ok((
+            (!responses.is_empty()).then_some(responses),
+            required.request_state,
+        ))
     }
 }
 
@@ -145,7 +240,7 @@ async fn request_with_options(
     request: ClientRequest,
     options: McpCallOptions,
     dispatcher: Option<&ProgressDispatcher>,
-    mut on_progress: impl FnMut(ProgressNotificationParam) + Send,
+    on_progress: &mut (impl FnMut(ProgressNotificationParam) + Send),
 ) -> Result<ServerResult, ServiceError> {
     let handle = peer
         .send_request_with_option(request, options.to_peer_options())

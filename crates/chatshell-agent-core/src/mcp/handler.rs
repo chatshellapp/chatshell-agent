@@ -47,6 +47,105 @@ pub fn chatshell_client_info() -> ClientConfig {
     .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
 }
 
+/// The handshake to use (FR-16).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum McpProtocolMode {
+    /// `initialize`, requesting 2025-11-25 (the default).
+    #[default]
+    Legacy,
+    /// Probe `server/discover` for 2026-07-28 and fall back to `initialize`
+    /// when the server is legacy (rmcp's `ClientLifecycleMode::Auto`, which
+    /// implements the spec's fallback rule: any non-modern error or a 10 s
+    /// timeout means legacy, not one specific error code).
+    PreferModern,
+}
+
+/// Start a session with `handler` over `transport` in `mode`.
+pub async fn serve_client<T, E, A>(
+    handler: ChatShellClientHandler,
+    transport: T,
+    mode: McpProtocolMode,
+) -> Result<
+    rmcp::service::RunningService<RoleClient, ChatShellClientHandler>,
+    rmcp::service::ClientInitializeError,
+>
+where
+    T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use rmcp::ServiceExt;
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+    match mode {
+        McpProtocolMode::Legacy => handler.serve(transport).await,
+        McpProtocolMode::PreferModern => {
+            handler
+                .serve_with_lifecycle(
+                    transport,
+                    ClientLifecycleMode::Auto {
+                        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                        legacy_version: Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
+                    },
+                )
+                .await
+        }
+    }
+}
+
+/// On a 2026-07-28 session, receive `tools/list_changed` through
+/// `subscriptions/listen` (FR-18). Subscribed notifications bypass the
+/// handler callbacks, so each one is handled exactly once: here for modern
+/// sessions, in `on_tool_list_changed` for older ones.
+pub async fn start_subscriptions(
+    service: &rmcp::service::RunningService<RoleClient, ChatShellClientHandler>,
+) {
+    let peer = service.peer().clone();
+    let modern = peer
+        .peer_info()
+        .is_some_and(|info| info.protocol_version == ProtocolVersion::V_2026_07_28);
+    if !modern {
+        return;
+    }
+    let handler = service.service().clone();
+    if handler.sink.is_none() {
+        return;
+    }
+    let filter = rmcp::model::SubscriptionFilter::builder()
+        .tools_list_changed()
+        .build();
+    let mut subscription = match peer.listen(filter).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            tracing::warn!(
+                "MCP server '{}' did not accept subscriptions/listen: {e}",
+                handler.server
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match subscription.next().await {
+                Ok(Some(rmcp::model::ServerNotification::ToolListChangedNotification(_))) => {
+                    handler.schedule_list_changed();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::info!(
+                        "MCP subscription for '{}' ended: {:?}",
+                        handler.server,
+                        subscription.end()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("MCP subscription for '{}' failed: {e}", handler.server);
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Settings applied to every client session right after the handshake.
 ///
 /// rmcp 3's response cache is turned off: with it on, a failing
@@ -135,6 +234,49 @@ impl ChatShellClientHandler {
         self
     }
 
+    /// Fulfil an MRTR round (FR-17): elicitation through the same dialog
+    /// and rules as a server-initiated request, roots from the provider.
+    /// Sampling is not offered (OQ-2: declined), so such a request fails
+    /// the call.
+    pub async fn fulfill_input_requests(
+        &self,
+        requests: rmcp::model::InputRequests,
+    ) -> Result<rmcp::model::InputResponses, rmcp::service::ServiceError> {
+        use rmcp::model::InputRequest;
+        use rmcp::service::ServiceError;
+        let mut responses = rmcp::model::InputResponses::new();
+        for (key, request) in requests {
+            let value = match request {
+                InputRequest::Elicitation(request) => {
+                    let result = super::elicitation::resolve(
+                        self.elicitation.clone(),
+                        &self.server,
+                        &request.params,
+                        tokio_util::sync::CancellationToken::new(),
+                        super::elicitation::ELICITATION_TIMEOUT,
+                    )
+                    .await;
+                    serde_json::to_value(result)
+                }
+                InputRequest::ListRoots(_) => {
+                    let root = self.roots.as_ref().and_then(|provider| provider());
+                    serde_json::to_value(roots_result(root.as_deref()))
+                }
+                _ => {
+                    return Err(ServiceError::McpError(rmcp::ErrorData::invalid_request(
+                        "the server asked for sampling, which ChatShell does not offer",
+                        None,
+                    )));
+                }
+            }
+            .map_err(|e| {
+                ServiceError::McpError(rmcp::ErrorData::internal_error(e.to_string(), None))
+            })?;
+            responses.insert(key, value);
+        }
+        Ok(responses)
+    }
+
     /// Routes progress notifications to in-flight calls
     /// (see [`super::call_tool_with_options`]).
     pub fn progress_dispatcher(&self) -> &ProgressDispatcher {
@@ -145,7 +287,7 @@ impl ChatShellClientHandler {
         &self.server
     }
 
-    fn schedule_list_changed(&self) {
+    pub(crate) fn schedule_list_changed(&self) {
         let Some(sink) = self.sink.clone() else {
             return;
         };

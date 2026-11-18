@@ -145,11 +145,13 @@ pub fn render_prompt(result: &GetPromptResult) -> String {
     text
 }
 
-/// Fetch and render one prompt. Arguments are scanned first.
+/// Fetch and render one prompt. Arguments are scanned first; MRTR rounds
+/// are fulfilled through `input` (FR-17).
 pub async fn get_prompt_text(
     peer: &Peer<RoleClient>,
     name: &str,
     arguments: BTreeMap<String, String>,
+    input: Option<&super::handler::ChatShellClientHandler>,
 ) -> Result<String> {
     scan_prompt_arguments(&arguments).map_err(|reason| anyhow::anyhow!("Blocked: {reason}"))?;
     let mut params = GetPromptRequestParams::new(name);
@@ -161,10 +163,14 @@ pub async fn get_prompt_text(
                 .collect(),
         );
     }
-    let result = peer
-        .get_prompt(params)
-        .await
-        .context("Failed to get prompt from MCP server")?;
+    let result = super::call::get_prompt_with_options(
+        peer,
+        params,
+        super::call::McpCallOptions::default(),
+        input,
+    )
+    .await
+    .context("Failed to get prompt from MCP server")?;
     Ok(render_prompt(&result))
 }
 

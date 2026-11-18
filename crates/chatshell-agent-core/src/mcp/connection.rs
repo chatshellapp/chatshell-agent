@@ -9,7 +9,7 @@ use rmcp::service::{Peer, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::RoleClient;
 
 use super::call::read_resource_with_options;
 use super::call::{McpCallOptions, call_tool_with_options};
@@ -33,6 +33,9 @@ pub struct McpHttpConfig {
     pub auth_token: Option<String>,
     /// Additional HTTP headers to send with every request.
     pub custom_headers: HashMap<String, String>,
+    /// Handshake (FR-16): legacy `initialize` unless the user opted this
+    /// server into the 2026-07-28 revision.
+    pub protocol: super::handler::McpProtocolMode,
 }
 
 /// An active connection to an MCP server. Clone is cheap (Arc-based) -
@@ -120,9 +123,14 @@ impl McpConnection {
     /// (this host has no spill store).
     pub async fn read_resource(&self, uri: &str) -> Result<String> {
         scan_resource_uri(uri).map_err(|reason| anyhow::anyhow!("Blocked: {reason}"))?;
-        let result = read_resource_with_options(&self.client, uri, McpCallOptions::default())
-            .await
-            .context("MCP resource read failed")?;
+        let result = read_resource_with_options(
+            &self.client,
+            uri,
+            McpCallOptions::default(),
+            Some(self.running_service.service()),
+        )
+        .await
+        .context("MCP resource read failed")?;
         Ok(render_read_resource_result(&result, None))
     }
 
@@ -138,7 +146,13 @@ impl McpConnection {
         name: &str,
         arguments: std::collections::BTreeMap<String, String>,
     ) -> Result<String> {
-        super::prompt::get_prompt_text(&self.client, name, arguments).await
+        super::prompt::get_prompt_text(
+            &self.client,
+            name,
+            arguments,
+            Some(self.running_service.service()),
+        )
+        .await
     }
 
     /// Call a tool on the connected MCP server with the default deadline.
@@ -159,6 +173,7 @@ impl McpConnection {
             params,
             McpCallOptions::default(),
             Some(self.running_service.service().progress_dispatcher()),
+            Some(self.running_service.service()),
             |_| {},
         )
         .await
@@ -207,11 +222,11 @@ pub async fn connect_http_service(
 
     let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
 
-    let running_service = handler
-        .serve(transport)
+    let running_service = super::handler::serve_client(handler, transport, config.protocol)
         .await
         .context("Failed to connect to MCP server via HTTP")?;
     super::handler::prepare_client_peer(running_service.peer()).await;
+    super::handler::start_subscriptions(&running_service).await;
 
     Ok(running_service)
 }
