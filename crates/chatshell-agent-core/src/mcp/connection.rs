@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rmcp::RoleClient;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::RoleClient;
 
 use super::call::read_resource_with_options;
 use super::call::{McpCallOptions, call_tool_with_options};
