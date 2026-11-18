@@ -173,7 +173,10 @@ fn create_agent(
                 .http_client(http_client)
                 .build()
                 .map_err(provider_error)?;
-            let model = client.completion_model(model);
+            // Tool results must be text on this wire; images move out.
+            let model = crate::tool_images::ToolResultImagesAsUserContent::new(
+                client.completion_model(model),
+            );
             build_provider_agent(kind, model, system_prompt, parameters)
         }
         ProviderKind::Ollama => {
@@ -188,7 +191,10 @@ fn create_agent(
                 .http_client(http_client)
                 .build()
                 .map_err(provider_error)?;
-            let model = client.completion_model(model);
+            // Tool results must be text on this wire; images move out.
+            let model = crate::tool_images::ToolResultImagesAsUserContent::new(
+                client.completion_model(model),
+            );
             build_provider_agent(kind, model, system_prompt, parameters)
         }
     }

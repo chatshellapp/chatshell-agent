@@ -112,9 +112,207 @@ pub fn tool_result_text(content: &[ToolResultContent]) -> String {
     lines.join("\n")
 }
 
+/// Move image blocks out of tool results into the user content that
+/// follows them, in place.
+///
+/// Chat Completions-style wires (OpenAI-compatible endpoints, OpenRouter,
+/// Ollama, xAI, Azure, ...) only accept text in `tool` messages, and rig
+/// rejects the whole request when a tool result carries an image. Those
+/// wires do accept images in `user` messages, and rig splits one user
+/// message into its `tool` messages followed by a single `user` message for
+/// the remaining content. So each image is appended to the same message,
+/// after a label naming the call it came from, and the tool result keeps
+/// its text (with a placeholder if no text is left). Returns whether
+/// anything moved.
+pub fn move_tool_result_images(messages: &mut [rig::message::Message]) -> bool {
+    use rig::message::{Message, UserContent};
+    let mut moved = false;
+    for message in messages.iter_mut() {
+        let Message::User { content } = message else {
+            continue;
+        };
+        let mut lifted: Vec<UserContent> = Vec::new();
+        for block in content.iter_mut() {
+            let UserContent::ToolResult(result) = block else {
+                continue;
+            };
+            if !result
+                .content
+                .iter()
+                .any(|c| matches!(c, ToolResultContent::Image(_)))
+            {
+                continue;
+            }
+            let (images, mut rest): (Vec<_>, Vec<_>) = std::mem::take(&mut result.content)
+                .into_iter()
+                .partition(|c| matches!(c, ToolResultContent::Image(_)));
+            if rest.is_empty() {
+                rest.push(ToolResultContent::text(IMAGE_PLACEHOLDER));
+            }
+            result.content = rest;
+            let source = if result.name.is_empty() {
+                format!("tool call {}", result.wire_call_id())
+            } else {
+                format!("`{}` (call {})", result.name, result.wire_call_id())
+            };
+            lifted.push(UserContent::text(format!(
+                "[Image output of {source}, attached here because tool results cannot carry images on this provider]"
+            )));
+            lifted.extend(images.into_iter().filter_map(|c| match c {
+                ToolResultContent::Image(image) => Some(UserContent::Image(image)),
+                _ => None,
+            }));
+        }
+        if !lifted.is_empty() {
+            content.extend(lifted);
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Completion model wrapper for wires that reject images in tool results:
+/// applies [`move_tool_result_images`] to every request before the inner
+/// model converts it.
+#[derive(Clone)]
+pub struct ToolResultImagesAsUserContent<M> {
+    inner: M,
+}
+
+impl<M> ToolResultImagesAsUserContent<M> {
+    pub fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel
+    for ToolResultImagesAsUserContent<M>
+{
+    async fn completion(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> Result<rig::completion::CompletionResponse, rig::completion::CompletionError> {
+        move_tool_result_images(&mut request.chat_history);
+        self.inner.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> Result<rig::streaming::StreamingCompletionResponse, rig::completion::CompletionError> {
+        move_tool_result_images(&mut request.chat_history);
+        self.inner.stream(request).await
+    }
+
+    fn capabilities(&self) -> rig::completion::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_result_message(content: Vec<ToolResultContent>) -> rig::message::Message {
+        rig::message::Message::User {
+            content: vec![rig::message::UserContent::tool_result(
+                "tc_1", "shot", content,
+            )],
+        }
+    }
+
+    #[test]
+    fn tool_result_images_move_after_the_results() {
+        use rig::message::{Message, UserContent};
+        let content = tool_result_content("[Image: PNG]\ndata:image/png;base64,AAAA").unwrap();
+        let mut messages = vec![tool_result_message(content)];
+        assert!(move_tool_result_images(&mut messages));
+        let Message::User { content } = &messages[0] else {
+            panic!("expected a user message");
+        };
+        assert_eq!(content.len(), 3, "tool result, label, image");
+        let UserContent::ToolResult(result) = &content[0] else {
+            panic!("tool result should stay first");
+        };
+        assert!(
+            result
+                .content
+                .iter()
+                .all(|c| matches!(c, ToolResultContent::Text(_)))
+        );
+        assert!(matches!(&content[1], UserContent::Text(t) if t.text.contains("`shot`")));
+        assert!(matches!(content[2], UserContent::Image(_)));
+    }
+
+    #[test]
+    fn image_only_tool_result_keeps_a_text_placeholder() {
+        use rig::message::{Message, UserContent};
+        let image = ToolResultContent::image_base64("AAAA", Some(ImageMediaType::PNG), None);
+        let mut messages = vec![tool_result_message(vec![image])];
+        assert!(move_tool_result_images(&mut messages));
+        let Message::User { content } = &messages[0] else {
+            panic!("expected a user message");
+        };
+        let UserContent::ToolResult(result) = &content[0] else {
+            panic!("tool result should stay first");
+        };
+        assert!(
+            matches!(&result.content[..], [ToolResultContent::Text(t)] if t.text == IMAGE_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn text_only_tool_results_are_untouched() {
+        let mut messages = vec![tool_result_message(vec![ToolResultContent::text("ok")])];
+        let before = messages.clone();
+        assert!(!move_tool_result_images(&mut messages));
+        assert_eq!(messages, before);
+    }
+
+    #[test]
+    fn moved_images_convert_on_the_chat_completions_wire() {
+        use rig::providers::openai::completion::{
+            Message as WireMessage, user_content_to_messages,
+        };
+        let content = tool_result_content("[Image: PNG]\ndata:image/png;base64,AAAA").unwrap();
+        let mut messages = vec![tool_result_message(content)];
+        move_tool_result_images(&mut messages);
+        let rig::message::Message::User { content } = messages.remove(0) else {
+            panic!("expected a user message");
+        };
+        let wire = user_content_to_messages(content).expect("converts without error");
+        assert_eq!(wire.len(), 2, "one tool message, then one user message");
+        assert!(matches!(wire[0], WireMessage::ToolResult { .. }));
+        assert!(matches!(wire[1], WireMessage::User { .. }));
+    }
+
+    #[test]
+    fn moved_images_convert_on_the_openrouter_wire() {
+        // rig keys OpenRouter's request conversion on this shared type.
+        use rig::providers::openai::completion::CompletionRequest as OpenrouterCompletionRequest;
+        let content = tool_result_content("[Image: PNG]\ndata:image/png;base64,AAAA").unwrap();
+        let request = |chat_history| rig::completion::CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history,
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let mut messages = vec![tool_result_message(content)];
+        assert!(
+            OpenrouterCompletionRequest::try_from(("m", request(messages.clone()))).is_err(),
+            "OpenRouter rejects images inside tool results"
+        );
+        move_tool_result_images(&mut messages);
+        OpenrouterCompletionRequest::try_from(("m", request(messages)))
+            .expect("converts once the images moved out");
+    }
 
     #[test]
     fn image_lines_split_out_and_leave_a_placeholder() {

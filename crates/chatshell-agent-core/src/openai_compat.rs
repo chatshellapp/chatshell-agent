@@ -4,8 +4,11 @@
 //! wire adapter already handles streaming, `reasoning_content` deltas
 //! (DeepSeek-style), fragmented tool calls, and error envelopes.
 //!
-//! One behavior is specific to ChatShell's provider fleet:
-//! - custom base URLs for arbitrary OpenAI-compatible endpoints.
+//! Behaviors specific to ChatShell's provider fleet:
+//! - custom base URLs for arbitrary OpenAI-compatible endpoints;
+//! - tool-result images move into the following user content, since
+//!   `tool` messages on this wire must be text
+//!   ([`crate::tool_images::move_tool_result_images`]).
 
 use rig::client::{BearerAuth, Client, Provider, ProviderBuilder};
 use rig::completion::{CompletionError, CompletionRequest};
@@ -108,16 +111,18 @@ impl CompletionModel {
 impl rig::completion::CompletionModel for CompletionModel {
     async fn completion(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> Result<rig::completion::CompletionResponse, CompletionError> {
+        crate::tool_images::move_tool_result_images(&mut request.chat_history);
         let generic = self.generic();
         generic.completion(request).await
     }
 
     async fn stream(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> Result<rig::streaming::StreamingCompletionResponse, CompletionError> {
+        crate::tool_images::move_tool_result_images(&mut request.chat_history);
         let generic = self.generic();
         generic.stream(request).await
     }
