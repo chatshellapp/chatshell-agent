@@ -69,6 +69,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# In-memory duplex transport for the MCP wire tests (tests/mcp_wire.rs).
+rmcp = { workspace = true, features = ["transport-async-rw"] }
 eventsource-stream = "0.2"
 bytes = "1"
 flate2 = "1"

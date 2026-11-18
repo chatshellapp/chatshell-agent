@@ -4,14 +4,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, ContentBlock};
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use rmcp::{RoleClient, ServiceExt};
 
+use super::call::{McpCallOptions, call_tool_with_options};
+use super::handler::ChatShellClientHandler;
+use super::listing::list_all_tools_bounded;
+use super::result::render_call_tool_result;
 use super::types::{McpToolInfo, McpToolResult};
+
+/// A running MCP client session with ChatShell's notification handler.
+pub type McpClientService = RunningService<RoleClient, ChatShellClientHandler>;
 
 /// Configuration for connecting to an MCP server via HTTP.
 pub struct McpHttpConfig {
@@ -29,7 +36,8 @@ pub struct McpHttpConfig {
 #[derive(Clone)]
 pub struct McpConnection {
     client: Peer<RoleClient>,
-    _running_service: Arc<RunningService<RoleClient, ClientInfo>>,
+    running_service: Arc<McpClientService>,
+    label: Arc<str>,
 }
 
 impl McpConnection {
@@ -37,71 +45,53 @@ impl McpConnection {
     pub async fn connect(config: McpHttpConfig) -> Result<Self> {
         tracing::info!("Connecting to MCP server via HTTP: {}", config.endpoint);
 
-        let running_service = connect_http_service(&config).await?;
+        let handler = ChatShellClientHandler::new(&config.endpoint, None);
+        let running_service = connect_http_service(&config, handler).await?;
         let client = running_service.peer().clone();
 
         tracing::info!("Connected to MCP server");
 
         Ok(Self {
             client,
-            _running_service: Arc::new(running_service),
+            label: Arc::from(config.endpoint.as_str()),
+            running_service: Arc::new(running_service),
         })
     }
 
-    /// List all tools exposed by the connected MCP server.
+    /// List all tools exposed by the connected MCP server, following
+    /// pagination (bounded, see [`super::listing`]).
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
-        let tools = self
-            .client
-            .list_all_tools()
-            .await
-            .context("Failed to list tools from MCP server")?;
-
-        let tools = tools
-            .into_iter()
-            .map(|t| McpToolInfo {
-                name: t.name.to_string(),
-                description: t.description.map(|d| d.to_string()),
-                input_schema_json: serde_json::to_string(&t.input_schema)
-                    .unwrap_or_else(|_| "{}".to_string()),
-            })
-            .collect();
-
-        Ok(tools)
+        let tools = list_all_tools_bounded(&self.client, &self.label).await?;
+        Ok(tools.iter().map(McpToolInfo::from_tool).collect())
     }
 
-    /// Call a tool on the connected MCP server.
+    /// Call a tool on the connected MCP server with the default deadline.
     ///
     /// `arguments_json` is a JSON object string (e.g. `{"query":"hello"}`).
-    /// Non-text content in the result is skipped; only text is returned.
+    /// The result is rendered by [`render_call_tool_result`] (content blocks
+    /// plus `structuredContent`).
     pub async fn call_tool(&self, name: &str, arguments_json: &str) -> Result<McpToolResult> {
         let arguments: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(arguments_json).unwrap_or_default();
 
         tracing::info!("Calling MCP tool: {}", name);
 
-        let result = self
-            .client
-            .call_tool({
-                let mut params = CallToolRequestParams::new(name.to_string());
-                params.arguments = Some(arguments);
-                params
-            })
-            .await
-            .context("MCP tool call failed")?;
+        let mut params = CallToolRequestParams::new(name.to_string());
+        params.arguments = Some(arguments);
+        let result = call_tool_with_options(
+            &self.client,
+            params,
+            McpCallOptions::default(),
+            Some(self.running_service.service().progress_dispatcher()),
+            |_| {},
+        )
+        .await
+        .context("MCP tool call failed")?;
 
-        let content: String = result
-            .content
-            .into_iter()
-            .filter_map(|c| match c {
-                ContentBlock::Text(raw) => Some(raw.text.to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
+        let rendered = render_call_tool_result(&result);
         Ok(McpToolResult {
-            content,
-            is_error: result.is_error.unwrap_or(false),
+            content: rendered.text,
+            is_error: rendered.is_error,
         })
     }
 }
@@ -113,7 +103,8 @@ impl McpConnection {
 /// clients, headers, auth, and client identity.
 pub async fn connect_http_service(
     config: &McpHttpConfig,
-) -> Result<RunningService<RoleClient, ClientInfo>> {
+    handler: ChatShellClientHandler,
+) -> Result<McpClientService> {
     let http_client = if config.custom_headers.is_empty() {
         reqwest::Client::new()
     } else {
@@ -140,12 +131,7 @@ pub async fn connect_http_service(
 
     let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
 
-    let client_info = ClientInfo::new(
-        ClientCapabilities::default(),
-        rmcp::model::Implementation::new("chatshell", env!("CARGO_PKG_VERSION")),
-    );
-
-    let running_service = client_info
+    let running_service = handler
         .serve(transport)
         .await
         .context("Failed to connect to MCP server via HTTP")?;

@@ -1,16 +1,39 @@
-//! MCP (Model Context Protocol) HTTP transport - shared across desktop and iOS.
+//! MCP (Model Context Protocol) client layer shared across desktop and iOS.
 //!
-//! Extracted from desktop's `src-tauri/src/mcp/manager.rs`. Only the HTTP
-//! (Streamable HTTP) transport is shared; STDIO transport stays desktop-only
-//! (iOS cannot spawn child processes). OAuth flow stays platform-specific
-//! (desktop uses system browser + callback server, iOS uses ASWebAuthenticationSession).
+//! Only the HTTP (Streamable HTTP) transport is constructed here; STDIO stays
+//! desktop-only (iOS cannot spawn child processes) but reuses the handler,
+//! listing, call, and result helpers. OAuth flow stays platform-specific
+//! (desktop uses system browser + callback server, iOS uses
+//! ASWebAuthenticationSession).
 //!
-//! The shared module handles: HTTP connection, tool listing, tool calling.
-//! Auth token (bearer) is passed in via `McpHttpConfig` - the caller is
+//! Shared pieces:
+//! - [`ChatShellClientHandler`]: client identity + server notifications
+//!   (`tools/list_changed` debounced, progress routing, server logs).
+//! - [`list_all_tools_bounded`]: cursor-following listing with guards.
+//! - [`call_tool_with_options`]: deadline, progress, cancel-on-drop.
+//! - [`render_call_tool_result`]: content + `structuredContent` rendering.
+//!
+//! Auth token (bearer) is passed in via `McpHttpConfig`; the caller is
 //! responsible for obtaining it (plaintext, keychain, OAuth, etc.).
 
+mod call;
 mod connection;
+mod handler;
+mod listing;
+mod result;
 mod types;
 
-pub use connection::{McpConnection, McpHttpConfig, connect_http_service};
+pub use call::{
+    DEFAULT_CALL_TIMEOUT_SECS, DEFAULT_MAX_TOTAL_TIMEOUT_SECS, McpCallOptions,
+    call_tool_with_options,
+};
+pub use connection::{McpClientService, McpConnection, McpHttpConfig, connect_http_service};
+pub use handler::{
+    ChatShellClientHandler, LIST_CHANGED_DEBOUNCE, McpNotificationSink, chatshell_client_info,
+};
+pub use listing::{
+    ListTruncation, MAX_CURSOR_BYTES, MAX_LIST_ITEMS, MAX_LIST_PAGES, Paginated,
+    list_all_tools_bounded, paginate,
+};
+pub use result::{MAX_STRUCTURED_CHARS, RenderedToolResult, render_call_tool_result};
 pub use types::{McpToolInfo, McpToolResult};
