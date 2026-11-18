@@ -1537,6 +1537,10 @@ impl From<core::sync_crypto::SyncCryptoError> for SyncCryptoError {
             core::sync_crypto::SyncCryptoError::InvalidPassphrase(m) => {
                 SyncCryptoError::Failed { message: m }
             }
+            // Doc contract of `unlock_from_artifact`: a wrong passphrase is
+            // typed, not collapsed into `Failed` (which hosts treat as a
+            // generic error and cannot rate-limit on).
+            core::sync_crypto::SyncCryptoError::WrongPassphrase => SyncCryptoError::WrongPassphrase,
             other => SyncCryptoError::Failed {
                 message: other.to_string(),
             },
